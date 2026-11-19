@@ -2,7 +2,7 @@
 Arckad-D for Android.
 Files · Recent ("Where was I?") · Send · Receive — works with Arckad-D on Linux and Windows.
 """
-__version__ = "3.8.0"          # GitHub replaces this with APP_VERSION from arckad-d.py when it builds
+__version__ = "3.8.1"          # GitHub replaces this with APP_VERSION from arckad-d.py when it builds
 
 import os
 import secrets
@@ -23,14 +23,13 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
-from kivy.uix.modalview import ModalView
 from kivy.uix.progressbar import ProgressBar
 from kivy.uix.recycleview import RecycleView
 from kivy.uix.recycleview.views import RecycleDataViewBehavior
 from kivy.uix.screenmanager import NoTransition, Screen, ScreenManager
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
-from kivy.uix.switch import Switch
+from kivy.uix.widget import Widget
 from kivy.uix.textinput import TextInput
 from kivy.utils import escape_markup, platform
 
@@ -271,6 +270,7 @@ KV = """
             size: self.size
 
 <Btn>:
+    opacity: 0.4 if self.disabled else 1
     color: (1, 1, 1, 1) if self.primary else app.c_text
     font_size: sp(15)
     bold: self.primary
@@ -284,6 +284,23 @@ KV = """
             pos: self.pos
             size: self.size
             radius: [dp(12)]
+
+<ToggleSwitch>:
+    size_hint: None, None
+    size: dp(62), dp(36)
+    pos_hint: {"center_y": .5}
+    canvas:
+        Color:
+            rgba: app.c_accent if self.active else app.c_line
+        RoundedRectangle:
+            pos: self.x, self.center_y - dp(15)
+            size: self.width, dp(30)
+            radius: [dp(15)]
+        Color:
+            rgba: 1, 1, 1, 1
+        Ellipse:
+            pos: (self.right - dp(28) if self.active else self.x + dp(4)), self.center_y - dp(12)
+            size: dp(24), dp(24)
 
 <Card>:
     orientation: "vertical"
@@ -461,6 +478,55 @@ class Card(BoxLayout):
     pass
 
 
+class ToggleSwitch(ButtonBehavior, Widget):
+    """An on/off switch that flips on any tap (Kivy's own Switch ignores taps when the finger moves a little)."""
+    active = BooleanProperty(False)
+
+    def on_release(self):
+        self.active = not self.active
+
+
+class Overlay(FloatLayout):
+    """A dialog layer: dims the screen, keeps the card in the top part (above the keyboard)."""
+
+    def __init__(self, app, card, dismissable=True, on_dismiss=None, **kw):
+        super().__init__(**kw)
+        self.app, self.card, self.dismissable, self.on_dismiss_cb = app, card, dismissable, on_dismiss
+        with self.canvas.before:
+            Color(0, 0, 0, 0.5)
+            self._shade = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=lambda w, v: setattr(self._shade, "pos", v), size=lambda w, v: setattr(self._shade, "size", v))
+        card.size_hint = (0.9, None)
+        card.pos_hint = {"center_x": 0.5, "top": 0.9}
+        self.add_widget(card)
+
+    def on_touch_down(self, touch):
+        if not super().on_touch_down(touch) and self.dismissable and not self.card.collide_point(*touch.pos):
+            self.dismiss()
+        return True                       # nothing underneath reacts while a dialog is open
+
+    def on_touch_move(self, touch):
+        super().on_touch_move(touch)
+        return True
+
+    def on_touch_up(self, touch):
+        super().on_touch_up(touch)
+        return True
+
+    def open(self):
+        self.app.root.add_widget(self)
+        self.app.overlays.append(self)
+        return self
+
+    def dismiss(self):
+        if self.parent:
+            self.parent.remove_widget(self)
+        if self in self.app.overlays:
+            self.app.overlays.remove(self)
+            if self.on_dismiss_cb:
+                self.on_dismiss_cb()
+
+
 class NavButton(ButtonBehavior, BoxLayout):
     icon = StringProperty("")
     text = StringProperty("")
@@ -491,7 +557,7 @@ class LongPressMixin:
         return super().on_touch_down(touch)
 
     def on_touch_move(self, touch):
-        if touch.ud.get(f"lp{id(self)}") and (abs(touch.dx) > dp(6) or abs(touch.dy) > dp(6)):
+        if touch.ud.get(f"lp{id(self)}") and (abs(touch.x - touch.ox) > dp(12) or abs(touch.y - touch.oy) > dp(12)):
             self._cancel_lp()
             touch.ud[f"lp{id(self)}"] = False
         return super().on_touch_move(touch)
@@ -790,7 +856,7 @@ class SendScreen(Screen):
         self.link_state = self._lbl("Off", 14, muted=True)
         row.add_widget(self.link_state)
         row.add_widget(self.link_minutes)
-        self.link_switch = Switch(size_hint_x=None, width=dp(84))
+        self.link_switch = ToggleSwitch()
         self.link_switch.bind(active=lambda w, v: app.toggle_link(v))
         row.add_widget(self.link_switch)
         link.add_widget(row)
@@ -869,7 +935,7 @@ class ReceiveScreen(Screen):
         self.minutes = Spinner(text="10 min", values=[f"{m} min" for m in core.SHARE_MINUTES],
                                size_hint_x=None, width=dp(100))
         row.add_widget(self.minutes)
-        self.switch = Switch(size_hint_x=None, width=dp(84))
+        self.switch = ToggleSwitch()
         self.switch.bind(active=lambda w, v: app.toggle_receive(v))
         row.add_widget(self.switch)
         card.add_widget(row)
@@ -998,6 +1064,8 @@ class ArckadApp(App):
             self._toast_bg = RoundedRectangle(radius=[dp(18)])
         self.toast_lbl.bind(pos=self._place_toast, size=self._place_toast)
         root.add_widget(self.toast_lbl)
+        self.overlays = []
+        Window.softinput_mode = "below_target"          # keep the typed-in box visible above the keyboard
         Window.bind(on_keyboard=self.on_key)
         Clock.schedule_interval(self.tick, 1)
         Clock.schedule_once(lambda dt: self.start(), 0)
@@ -1351,6 +1419,11 @@ class ArckadApp(App):
 
     def on_key(self, window, key, *args):
         if key == 27:                    # Android back button
+            if self.overlays:
+                top = self.overlays[-1]
+                if top.dismissable:
+                    top.dismiss()
+                return True
             return self.back()
         return False
 
@@ -1419,17 +1492,14 @@ class ArckadApp(App):
         self.menu("Arckad-D", items)
 
     def menu(self, title, items):
-        view = ModalView(size_hint=(.86, None), background="", background_color=(0, 0, 0, 0),
-                         overlay_color=(0, 0, 0, .45))
-        card = Card(padding=dp(10), spacing=dp(4))
+        card = Card(padding=dp(10), spacing=dp(6))
         card.add_widget(Label(text=f"[b]{title}[/b]", markup=True, color=self.c_text, size_hint_y=None,
                               height=dp(40), font_size=sp(16)))
+        view = Overlay(self, card)
         for label, cb, enabled in items:
             b = Btn(text=label, disabled=not enabled)
             b.bind(on_release=lambda _b, cb=cb: (view.dismiss(), cb()))
             card.add_widget(b)
-        view.add_widget(card)
-        card.bind(height=lambda w, v: setattr(view, "height", v))
         view.open()
 
     def set_sort(self, by):
@@ -1443,9 +1513,8 @@ class ArckadApp(App):
         self.open_folder(self.cwd, push=False)
 
     def ask_text(self, title, initial, on_ok, ok_text="OK"):
-        view = ModalView(size_hint=(.88, None), height=dp(200), background="", background_color=(0, 0, 0, 0),
-                         overlay_color=(0, 0, 0, .45), auto_dismiss=True)
         card = Card(padding=dp(16), spacing=dp(12))
+        view = Overlay(self, card, dismissable=False)
         card.add_widget(Label(text=f"[b]{title}[/b]", markup=True, color=self.c_text, size_hint_y=None,
                               height=dp(30), font_size=sp(16)))
         ti = TextInput(text=initial, multiline=False)
@@ -1455,14 +1524,12 @@ class ArckadApp(App):
         b1.bind(on_release=lambda *_: view.dismiss())
         b2.bind(on_release=lambda *_: (view.dismiss(), on_ok(ti.text.strip())))
         card.add_widget(btn_row(b1, b2))
-        view.add_widget(card)
         view.open()
         Clock.schedule_once(lambda dt: setattr(ti, "focus", True), 0.2)
 
-    def confirm(self, title, text, ok_text, on_ok):
-        view = ModalView(size_hint=(.88, None), height=dp(220), background="", background_color=(0, 0, 0, 0),
-                         overlay_color=(0, 0, 0, .45))
+    def confirm(self, title, text, ok_text, on_ok, on_dismiss=None):
         card = Card(padding=dp(16), spacing=dp(12))
+        view = Overlay(self, card, dismissable=False, on_dismiss=on_dismiss)
         card.add_widget(Label(text=f"[b]{title}[/b]", markup=True, color=self.c_text, size_hint_y=None,
                               height=dp(30), font_size=sp(16)))
         msg = Label(text=text, markup=True, color=self.c_muted, size_hint_y=None, halign="left")
@@ -1473,8 +1540,6 @@ class ArckadApp(App):
         b1.bind(on_release=lambda *_: view.dismiss())
         b2.bind(on_release=lambda *_: (view.dismiss(), on_ok()))
         card.add_widget(btn_row(b1, b2))
-        view.add_widget(card)
-        card.bind(height=lambda w, v: setattr(view, "height", v))
         view.open()
         return view
 
@@ -1738,8 +1803,8 @@ class ArckadApp(App):
 
         view = self.confirm(f"{req['from']} wants to send you {n} file{'s' if n != 1 else ''}",
                             f"{core.human_size(req['total'])} from {rich(req['from'])} ({req['os']})\n\n{listing}",
-                            "Accept", lambda: answer(True))
-        view.bind(on_dismiss=lambda *_: Clock.schedule_once(lambda dt: answer(False), 0.1))
+                            "Accept", lambda: answer(True),
+                            on_dismiss=lambda: Clock.schedule_once(lambda dt: answer(False), 0.1))
         Clock.schedule_once(lambda dt: (answer(False), view.dismiss()) if not answered["done"] else None, 60)
 
     def on_progress(self, req):
