@@ -1,0 +1,91 @@
+name: Build installers
+
+on:
+  workflow_dispatch:          # "Run workflow" button on the Actions tab
+  push:
+    branches: [main, master]
+    tags: ["v*"]              # a tag like v3.2.0 also publishes a Release
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows installer (.exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 with GTK 3 and Python
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-adwaita-icon-theme
+            mingw-w64-ucrt-x86_64-librsvg
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-python-pip
+
+      - name: Install PyInstaller and the QR-code library
+        shell: msys2 {0}
+        run: |
+          pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-pyinstaller || {
+            pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc
+            python -m pip install --break-system-packages pyinstaller
+          }
+          python -m pip install --break-system-packages qrcode
+
+      - name: Build Arckad-D.exe
+        shell: msys2 {0}
+        run: pyinstaller --noconfirm --clean windows/arckad-d.spec
+
+      - name: Self-test the built app
+        shell: msys2 {0}
+        run: |
+          ./dist/Arckad-D/Arckad-D.exe --selftest selftest.txt || true
+          cat selftest.txt
+          grep -q "SELFTEST OK" selftest.txt
+
+      - name: Make the installer and portable zip
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path arckad-d.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=$version" windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Compress-Archive -Path dist\Arckad-D\* -DestinationPath "installer-output\Arckad-D-$version-portable-windows.zip"
+          Get-ChildItem installer-output
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Arckad-D-Windows
+          path: installer-output/*
+
+      - name: Attach to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer-output/*
+
+  linux:
+    name: Linux package (.deb)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install icon tools
+        run: sudo apt-get update && sudo apt-get install -y librsvg2-bin
+      - name: Build the .deb
+        run: bash linux/build-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Arckad-D-Linux
+          path: build/*.deb
+      - name: Attach to the GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.deb
