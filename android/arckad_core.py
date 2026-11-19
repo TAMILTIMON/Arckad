@@ -828,6 +828,39 @@ def qr_matrix(text):
     return qr.get_matrix()
 
 
+# ---------------------------------------------------------------- updates from GitHub Releases
+UPDATE_REPO = "TAMILTIMON/Arckad"
+
+
+def version_tuple(v):
+    import re
+    nums = [int(x) for x in re.findall(r"\d+", str(v))[:4]]
+    return tuple(nums + [0] * (3 - len(nums))) if nums else (0, 0, 0)
+
+
+def fetch_latest_release(app_version, timeout=15):
+    """Newest release: (version, page url, apk url or None)."""
+    import urllib.error
+    import urllib.request
+    agent = {"User-Agent": f"Arckad-D-Android/{app_version}"}
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                                     headers=dict(agent, Accept="application/vnd.github+json"))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            rel = json.loads(resp.read().decode("utf-8"))
+        apk = next((a["browser_download_url"] for a in rel.get("assets", []) if a.get("name", "").endswith(".apk")), None)
+        return rel.get("tag_name", "").lstrip("vV"), rel.get("html_url"), apk
+    except urllib.error.HTTPError as ex:
+        if ex.code not in (403, 429):
+            raise
+    with urllib.request.urlopen(urllib.request.Request(
+            f"https://github.com/{UPDATE_REPO}/releases/latest", headers=agent), timeout=timeout) as resp:
+        page = resp.geturl()
+    tag = page.rstrip("/").rsplit("/", 1)[-1]
+    ver = tag.lstrip("vV")
+    return ver, page, f"https://github.com/{UPDATE_REPO}/releases/download/{tag}/Arckad-D-{ver}.apk"
+
+
 def load_json(path, default):
     try:
         with open(path, encoding="utf-8") as f:

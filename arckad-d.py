@@ -30,7 +30,10 @@ import tarfile
 import tempfile
 import threading
 import time
+import re
+import urllib.error
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter, OrderedDict
@@ -50,8 +53,9 @@ except (ImportError, ValueError):
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.8.0"
 APP_ID = "io.github.arckadd"
+UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
 FROZEN = bool(getattr(sys, "frozen", False))                  # built into an .exe
 SCRIPT = Path(__file__).resolve()
@@ -689,6 +693,84 @@ def compress_archive(paths, dest, fmt="zip", level=6, password=None, progress=la
 
 def compress_to_zip(paths, dest_zip, progress=lambda done, total: None):
     return compress_archive(paths, dest_zip, "zip", 6, None, progress)
+
+
+# ---------------------------------------------------------------- updates from GitHub Releases
+def version_tuple(v):
+    nums = [int(x) for x in re.findall(r"\d+", str(v))[:4]]
+    return tuple(nums + [0] * (3 - len(nums))) if nums else (0, 0, 0)
+
+
+def fetch_latest_release(timeout=15):
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                                     headers={"Accept": "application/vnd.github+json",
+                                              "User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as ex:
+        if ex.code not in (403, 429):          # GitHub's lookup limit reached: use the plain web page instead
+            raise
+    req = urllib.request.Request(f"https://github.com/{UPDATE_REPO}/releases/latest",
+                                 headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        final_url = resp.geturl()                # .../releases/tag/v3.8.0
+    tag = final_url.rstrip("/").rsplit("/", 1)[-1]
+    if "/tag/" not in final_url or not tag:
+        raise OSError("no release found")
+    ver = tag.lstrip("vV")
+    base = f"https://github.com/{UPDATE_REPO}/releases/download/{tag}/"
+    names = [f"Arckad-D-Setup-{ver}.exe", f"arckad-d_{ver}_all.deb", f"Arckad-D-{ver}.apk"]
+    return {"tag_name": tag, "html_url": final_url,
+            "assets": [{"name": n, "browser_download_url": base + n} for n in names]}
+
+
+def pick_asset(release, kind):
+    for a in release.get("assets", []):
+        name = a.get("name", "")
+        if kind == "windows" and name.startswith("Arckad-D-Setup") and name.endswith(".exe"):
+            return a
+        if kind == "deb" and name.endswith("_all.deb"):
+            return a
+        if kind == "apk" and name.endswith(".apk"):
+            return a
+    return None
+
+
+def install_kind():
+    """How this copy was installed, which decides how it can update itself."""
+    if IS_WIN:
+        installed = FROZEN and os.path.exists(os.path.join(os.path.dirname(sys.executable), "unins000.exe"))
+        return "windows" if installed else "manual"
+    return "deb" if INSTALLED and shutil.which("pkexec") else "manual"
+
+
+def download_asset(asset, dest, progress=lambda done, total: None, cancelled=lambda: False):
+    req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+    total, done = int(asset.get("size") or 0), 0
+    h = hashlib.sha256()
+    tmp = str(dest) + ".part"
+    with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as f:
+        while True:
+            if cancelled():
+                raise InterruptedError
+            chunk = resp.read(1 << 18)
+            if not chunk:
+                break
+            f.write(chunk)
+            h.update(chunk)
+            done += len(chunk)
+            progress(done, total or done)
+    if total and done != total:
+        os.remove(tmp)
+        raise OSError("the download was incomplete")
+    digest = str(asset.get("digest") or "")
+    if digest.startswith("sha256:") and digest[7:].lower() != h.hexdigest():
+        os.remove(tmp)
+        raise OSError("the download didn't match GitHub's checksum")
+    os.replace(tmp, dest)
+    return dest
+
 
 def plan_organize(folder, by):
     plan = []
@@ -4226,6 +4308,8 @@ class MainWindow(Gtk.ApplicationWindow):
             self.new_tab(self.right_nb, loc, switch=False)
         self.show_all()
         self.infobar.set_revealed(False)
+        self.update_bar.set_revealed(False)
+        self.latest = None
         self.right_nb.set_visible(self.cfg["dual"])
         self.dual_btn.set_active(self.cfg["dual"])
         self.preview_btn.set_active(self.cfg["preview"])
@@ -4239,6 +4323,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.on_index_updated()
         self.apply_autosort(startup=True)
         self.find_last_file(show=True)
+        if time.time() - self.cfg.get("update_checked", 0) > 86400:      # quietly, once a day
+            GLib.timeout_add_seconds(8, lambda: self.check_updates(manual=False) or False)
 
     # ---------- UI construction
     def icon_btn(self, icon, tip, cb):
@@ -4305,6 +4391,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Keyboard shortcuts", lambda: self.info(SHORTCUTS, mono=True)),
             ("Change logo…", self.choose_logo),
             ("Use the default logo", self.reset_logo),
+            ("Check for updates…", lambda: self.check_updates(manual=True)),
             (f"About {APP_NAME}", self.show_about),
         ]))
         hb.pack_end(self._theme_button())
@@ -4369,6 +4456,14 @@ class MainWindow(Gtk.ApplicationWindow):
         self.infobar.add_button("Where was I?", 3)
         self.infobar.connect("response", self.on_infobar)
         outer.add(self.infobar)
+        self.update_bar = Gtk.InfoBar(show_close_button=True)
+        self.update_bar.set_message_type(Gtk.MessageType.OTHER)
+        self.update_label = Gtk.Label(xalign=0, wrap=True)
+        self.update_bar.get_content_area().add(self.update_label)
+        self.update_bar.add_button("Update now", 1)
+        self.update_bar.add_button("What's new", 2)
+        self.update_bar.connect("response", self.on_update_bar)
+        outer.add(self.update_bar)
 
         main = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         main.set_position(220)
@@ -4413,6 +4508,125 @@ class MainWindow(Gtk.ApplicationWindow):
         nb.connect("switch-page", self.on_switch_page)
         nb.connect("page-removed", lambda *_: self.update_tab_closers())
         return nb
+
+    # ---------- updates
+    def check_updates(self, manual=True):
+        if manual and self.active:
+            self.active.flash("Checking for updates…")
+
+        def work():
+            try:
+                rel, err = fetch_latest_release(), None
+            except Exception as ex:                       # offline, private repository, GitHub busy…
+                rel, err = None, str(getattr(ex, "reason", None) or ex)
+            GLib.idle_add(self._got_release, rel, err, manual)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _got_release(self, rel, err, manual):
+        self.cfg["update_checked"] = time.time()
+        if err or not rel:
+            if manual:
+                self.error(f"Couldn't check for updates.\n\n{err}\n\nCheck your internet connection. "
+                           f"(Updates come from github.com/{UPDATE_REPO}, which must be public.)")
+            return False
+        latest = rel.get("tag_name", "").lstrip("vV")
+        if version_tuple(latest) <= version_tuple(APP_VERSION):
+            if manual:
+                self.info(f"You're up to date. {APP_NAME} {APP_VERSION} is the newest version.")
+            return False
+        self.latest = rel
+        how = {"windows": "It installs quietly and reopens by itself.",
+               "deb": "You'll be asked for your password once."}.get(install_kind(), "")
+        self.update_label.set_markup(f"<b>{APP_NAME} {esc(latest)} is available</b> (you have {APP_VERSION}). "
+                                     f"{esc(how)}")
+        self.update_bar.set_revealed(True)
+        return False
+
+    def on_update_bar(self, bar, resp):
+        if resp == 1:
+            self.start_update()
+        elif resp == 2 and self.latest:
+            open_default(self.latest.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest")
+            return
+        bar.set_revealed(False)
+
+    def start_update(self):
+        rel = self.latest
+        if not rel:
+            return
+        kind = install_kind()
+        asset = pick_asset(rel, kind) if kind != "manual" else None
+        if asset is None:
+            self.info("This copy can't update itself (it isn't installed from the installer / .deb), "
+                      "so the download page will open instead.")
+            open_default(rel.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest")
+            return
+        dest = Path(tempfile.gettempdir()) / asset["name"]
+        dlg = Gtk.Dialog(title=f"Updating {APP_NAME}", transient_for=self, modal=True)
+        dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        box = dlg.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        label = Gtk.Label(label=f"Downloading {asset['name']}…", xalign=0)
+        bar = Gtk.ProgressBar(show_text=True)
+        bar.set_size_request(380, -1)
+        box.add(label)
+        box.add(bar)
+        state = {"cancel": False}
+        dlg.connect("response", lambda *_: state.update(cancel=True))
+        dlg.show_all()
+
+        def progress(done, total):
+            GLib.idle_add(lambda: (bar.set_fraction(done / total if total else 0),
+                                   bar.set_text(f"{human_size(done)} of {human_size(total)}")) and False)
+
+        def work():
+            try:
+                download_asset(asset, dest, progress, lambda: state["cancel"])
+                GLib.idle_add(self._install_update, dlg, kind, dest, label)
+            except InterruptedError:
+                GLib.idle_add(dlg.destroy)
+            except Exception as ex:
+                msg = str(ex)
+                GLib.idle_add(lambda: (dlg.destroy(), self.error(f"The update couldn't be downloaded: {msg}")) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _install_update(self, dlg, kind, path, label):
+        if kind == "windows":
+            label.set_text("Installing… Arckad-D will close and reopen by itself.")
+            GLib.timeout_add(800, lambda: self._run_windows_setup(path) or False)
+            return False
+        label.set_text("Installing… enter your password if asked.")
+
+        def work():
+            try:
+                proc = subprocess.run(["pkexec", "apt-get", "install", "-y", "--allow-downgrades", str(path)],
+                                      capture_output=True, text=True)
+                ok, msg = proc.returncode == 0, (proc.stderr or proc.stdout).strip()[-500:]
+            except OSError as ex:
+                ok, msg = False, str(ex)
+            GLib.idle_add(self._deb_installed, dlg, ok, msg, path)
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def _run_windows_setup(self, path):
+        subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
+                         creationflags=0x00000008 | 0x00000200)       # detached, so it outlives this window
+        self.on_close()
+        self.get_application().quit()
+
+    def _deb_installed(self, dlg, ok, msg, path):
+        dlg.destroy()
+        self.update_bar.set_revealed(False)
+        if not ok:
+            self.error("The update wasn't installed (maybe the password prompt was cancelled).\n\n"
+                       f"You can install it yourself with:\n  sudo apt install {path}\n\n{msg}")
+            return False
+        if self.confirm(f"{APP_NAME} was updated. Restart it now to use the new version?"):
+            subprocess.Popen(["arckad-d"], start_new_session=True)
+            self.on_close()
+            self.get_application().quit()
+        return False
 
     # ---------- light / dark theme
     THEMES = [("system", "🖥", "Follow system"), ("light", "☀", "Light"), ("dark", "🌙", "Dark")]

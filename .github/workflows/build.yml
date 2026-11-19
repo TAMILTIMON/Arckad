@@ -125,7 +125,18 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('android/buildozer.spec') }}
       - name: Build the APK (first time takes about 30 minutes)
         working-directory: android
-        run: yes | buildozer android debug
+        run: |
+          set -o pipefail
+          yes | buildozer android debug 2>&1 | tee build.log
+      - name: Show the end of the Android build log
+        if: failure()
+        run: tail -n 120 android/build.log
+      - name: Keep the full Android build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: android/build.log
       - name: Name the APK
         run: |
           mkdir -p apk-out

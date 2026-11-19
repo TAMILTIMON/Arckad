@@ -7,7 +7,7 @@ source.include_exts = py,png,ttf,json
 source.exclude_dirs = bin,.buildozer,signing
 version.regex = __version__ = ["'](.*)["']
 version.filename = %(source.dir)s/main.py
-requirements = python3,kivy==2.3.0,pillow,pyjnius,android,qrcode
+requirements = python3,kivy,pillow,pyjnius,android,qrcode
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
 presplash.color = #F6F5F4

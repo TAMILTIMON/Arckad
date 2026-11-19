@@ -35,3 +35,13 @@ android/                       Android app (main.py, arckad_core.py, buildozer.s
 * **Windows:** run the Setup .exe. If SmartScreen appears: *More info → Run anyway*.
 * **Android:** open the .apk on the phone and allow "Install unknown apps" for your browser or Files app
   when asked. On first start, Arckad-D asks for *Allow access to manage all files*.
+
+## Updates inside the app
+
+Every version checks this repository's latest release once a day (and from the menu: **Check for updates**).
+The repository must stay **public**, and its name is set in `UPDATE_REPO` (in `arckad-d.py` and
+`android/arckad_core.py`).
+
+* **Windows (installed with Setup):** downloads the new Setup and installs it silently, then reopens.
+* **Linux (.deb):** downloads the new .deb and installs it after one password prompt.
+* **Android:** downloads the new .apk; tap it and choose **Update** (Android always asks once).

@@ -2,7 +2,7 @@
 Arckad-D for Android.
 Files · Recent ("Where was I?") · Send · Receive — works with Arckad-D on Linux and Windows.
 """
-__version__ = "3.7.0"          # GitHub replaces this with APP_VERSION from arckad-d.py when it builds
+__version__ = "3.8.0"          # GitHub replaces this with APP_VERSION from arckad-d.py when it builds
 
 import os
 import secrets
@@ -136,6 +136,16 @@ def open_with(path):
     intent.setDataAndType(Uri.fromFile(JFile(path)), mime)
     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK)
     activity().startActivity(Intent.createChooser(intent, "Open with"))
+
+
+def open_url(url):
+    if platform == "android":
+        intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        activity().startActivity(intent)
+    else:
+        import webbrowser
+        webbrowser.open(url)
 
 
 def share_files(paths):
@@ -1003,6 +1013,8 @@ class ArckadApp(App):
         self.go_tab("files")
         self.open_folder(self.cwd, push=False)
         self.load_recent()
+        if time.time() - self.cfg.get("update_checked", 0) > 86400:        # quietly, once a day
+            Clock.schedule_once(lambda dt: self.check_updates(manual=False), 6)
 
     def check_permission(self):
         if has_storage_access():
@@ -1402,6 +1414,7 @@ class ArckadApp(App):
                  ("New folder", self.new_folder, True),
                  ("Received files", lambda: self.open_folder(core.received_dir()), True),
                  ("Theme: follow phone / light / dark", self.cycle_theme, True),
+                 ("Check for updates", lambda: self.check_updates(manual=True), True),
                  (f"About Arckad-D {__version__}", lambda: self.toast(f"Arckad-D {__version__} for Android"), True)]
         self.menu("Arckad-D", items)
 
@@ -1511,6 +1524,35 @@ class ArckadApp(App):
                 self.toast(f"Couldn't create it: {ex.strerror}")
             self.open_folder(self.cwd, push=False)
         self.ask_text("New folder", "New folder", do, "Create")
+
+    # ---------- updates
+    def check_updates(self, manual=True):
+        if manual:
+            self.toast("Checking for updates…")
+
+        def work():
+            try:
+                result, err = core.fetch_latest_release(__version__), None
+            except Exception as ex:
+                result, err = None, str(getattr(ex, "reason", None) or ex)
+            Clock.schedule_once(lambda dt: self._got_release(result, err, manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _got_release(self, result, err, manual):
+        self.set_cfg("update_checked", time.time())
+        if err or not result:
+            if manual:
+                self.toast("Couldn't check for updates. Are you online?")
+            return
+        latest, page, apk = result
+        if core.version_tuple(latest) <= core.version_tuple(__version__):
+            if manual:
+                self.toast(f"You're up to date ({__version__})")
+            return
+        self.confirm(f"Arckad-D {latest} is available",
+                     f"You have {__version__}.\n\nTap [b]Download[/b]: your browser downloads the update. When it "
+                     "finishes, tap the downloaded file and choose [b]Update[/b]. Your settings stay.",
+                     "Download", lambda: self.safe(open_url, apk or page))
 
     # ---------- recent / where was I
     def load_recent(self):
