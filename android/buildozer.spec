@@ -7,19 +7,22 @@ source.include_exts = py,png,ttf,json
 source.exclude_dirs = bin,.buildozer,signing
 version.regex = __version__ = ["'](.*)["']
 version.filename = %(source.dir)s/main.py
-requirements = python3,kivy,pillow,pyjnius,android,qrcode
+requirements = python3,kivy==2.3.0,pillow,pyjnius,android,qrcode
 icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
 presplash.color = #F6F5F4
 orientation = portrait
 fullscreen = 0
 android.permissions = INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE, CHANGE_WIFI_MULTICAST_STATE, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE
-android.api = 34
+android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
+android.ndk = 25b
 android.accept_sdk_license = True
 android.allow_backup = True
 android.debug_artifact = apk
+# a fixed, proven release of the Android build tools (their newest code changes too often)
+p4a.branch = v2024.01.21
 
 [buildozer]
 log_level = 2

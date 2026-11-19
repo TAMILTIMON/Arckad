@@ -107,10 +107,11 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git zip unzip autoconf automake libtool pkg-config \
-            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
+          sudo apt-get install -y build-essential git zip unzip autoconf automake libtool libltdl-dev pkg-config \
+            zlib1g-dev libncurses-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
           python -m pip install --upgrade pip
-          python -m pip install buildozer "Cython==0.29.37" setuptools
+          # versions that belong together (buildozer 1.5 + python-for-android 2024.01.21)
+          python -m pip install "buildozer==1.5.0" "Cython==0.29.36" "setuptools<70" wheel
       - name: Use the version from arckad-d.py and the fixed signing key
         run: |
           sed -i 's/^__version__ = .*/__version__ = "${{ needs.version.outputs.version }}"/' android/main.py
@@ -128,9 +129,15 @@ jobs:
         run: |
           set -o pipefail
           yes | buildozer android debug 2>&1 | tee build.log
-      - name: Show the end of the Android build log
+      - name: Show the Android build errors
         if: failure()
-        run: tail -n 120 android/build.log
+        run: |
+          sed 's/\x1b\[[0-9;]*m//g' android/build.log > clean.log
+          echo "=== error lines ==="
+          grep -n -E "ERROR:|Error:|error:|Command failed|No such file|not found" clean.log \
+            | grep -v -E "performance hint|warning|Dependency for .* not resolved" | tail -n 40 || true
+          echo "=== last lines before the settings list ==="
+          grep -v -E '^#     ' clean.log | tail -n 80
       - name: Keep the full Android build log
         if: failure()
         uses: actions/upload-artifact@v4
