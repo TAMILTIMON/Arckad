@@ -50,7 +50,7 @@ except (ImportError, ValueError):
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.6"
+APP_VERSION = "3.7.0"
 APP_ID = "io.github.arckadd"
 IS_WIN = sys.platform == "win32"
 FROZEN = bool(getattr(sys, "frozen", False))                  # built into an .exe
@@ -3784,19 +3784,26 @@ class ShareWindow(Gtk.Window):
         self.connect("delete-event", lambda *_: self.hide() or True)   # keeps sharing in the background
         self.connect("map", lambda *_: self.on_mapped())
         self.connect("unmap", lambda *_: self.nearby.stop_scan())
-        hb = Gtk.HeaderBar(show_close_button=True, title="Share",
-                           subtitle="Send files to computers and phones on your Wi-Fi")
+        hb = Gtk.HeaderBar(show_close_button=True, title="Send & Receive",
+                           subtitle="Share files with computers and phones on your Wi-Fi")
         self.set_titlebar(hb)
+        self.tabs = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vhomogeneous=False)
+        hb.set_custom_title(Gtk.StackSwitcher(stack=self.tabs))
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         Gtk.Window.add(self, scroll)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, border_width=14)
-        scroll.add(box)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, border_width=14)
+        scroll.add(outer)
+        outer.add(self.tabs)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)          # Send tab
+        recv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)         # Receive tab
+        self.tabs.add_titled(box, "send", "📤  Send")
+        self.tabs.add_titled(recv, "receive", "📥  Receive")
 
         # ---- files
         head = Gtk.Box(spacing=6)
         lbl = Gtk.Label(xalign=0, hexpand=True)
-        lbl.set_markup("<b>Files</b>")
+        lbl.set_markup("<b>Files to send</b>")
         head.pack_start(lbl, True, True, 0)
         add_sel = Gtk.Button(label="Add selected")
         add_sel.set_tooltip_text("Add the files selected in Arckad-D")
@@ -3832,16 +3839,22 @@ class ShareWindow(Gtk.Window):
         # ---- how to send: tabs
         self.pages = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
         switcher = Gtk.StackSwitcher(stack=self.pages, halign=Gtk.Align.CENTER, margin_top=6)
+        box.add(Gtk.Label(label="Send to:", xalign=0, margin_top=4))
         box.add(switcher)
         box.add(self.pages)
-        self.pages.add_titled(self._nearby_page(), "nearby", "📡  Nearby Arckad-D")
-        self.pages.add_titled(self._link_page(), "link", "🔗  Link & QR code")
+        self.pages.add_titled(self._nearby_page(), "nearby", "📡  Arckad-D devices")
+        self.pages.add_titled(self._link_page(), "link", "🔗  Any browser (link & QR)")
 
-        # ---- receiving
-        box.add(Gtk.Separator(margin_top=6))
-        rhead = Gtk.Box(spacing=10)
+        # ---- receiving (its own tab)
+        box = recv
+        big = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, margin_top=6)
+        big.set_markup("<big><b>Receive files</b></big>\nTurn this on, then send from Arckad-D on another "
+                       "computer or phone. You'll be asked before anything is saved.")
+        box.add(big)
+        rhead = Gtk.Box(spacing=10, margin_top=6)
         rl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
-        rl.set_markup("<b>Receive</b>\n<small>Let nearby Arckad-D computers find me and send me files</small>")
+        rl.set_markup("<b>Let nearby devices find me</b>\n<small>Stays on for the time you choose, "
+                      "then turns itself off</small>")
         rhead.pack_start(rl, True, True, 0)
         self.vis_minutes = Gtk.ComboBoxText()
         for m in SHARE_MINUTES:
@@ -3861,13 +3874,14 @@ class ShareWindow(Gtk.Window):
         self.name_entry = Gtk.Entry(text=self.nearby.name(), hexpand=True)
         self.name_entry.connect("changed", self.on_name_changed)
         name_row.pack_start(self.name_entry, True, True, 0)
-        open_recv = Gtk.Button(label="Received files")
+        open_recv = Gtk.Button(label="Open received files")
         open_recv.set_tooltip_text(short(received_dir()))
         open_recv.connect("clicked", lambda *_: self.win.open_path(str(received_dir())))
         name_row.add(open_recv)
         box.add(name_row)
+        box = outer
 
-        # ---- activity
+        # ---- activity (shared by both tabs)
         lbl2 = Gtk.Label(xalign=0, margin_top=6)
         lbl2.set_markup("<b>Activity</b>")
         box.add(lbl2)
@@ -4168,7 +4182,7 @@ Ctrl+H  hidden files      F5  refresh
 Ctrl+Shift+D  switch theme (system / light / dark)
 Alt+← / Alt+→ / Alt+↑  back, forward, up
 Middle-click a folder  open it in a new tab
-Share button  send to nearby Arckad-D, or share a link / QR code"""
+Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
 
 
 class MainWindow(Gtk.ApplicationWindow):
@@ -4300,19 +4314,32 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
             ("Compare selected files…", self.compare_selected),
             ("Auto-sort Downloads…", self.autosort_dialog),
-            ("Share on Wi-Fi…", lambda: self.open_share()),
+            ("Send files…", lambda: self.open_share(self.active.selected_paths() or None, "nearby")),
+            ("Receive files…", lambda: self.open_share(None, "receive")),
             None,
             ("Update search index now", INDEX.rebuild),
         ]))
+        pair = Gtk.Box()
+        pair.get_style_context().add_class("linked")
         self.share_btn = Gtk.Button()
         sb = Gtk.Box(spacing=6)
         sb.add(Gtk.Image.new_from_icon_name("send-to-symbolic", Gtk.IconSize.BUTTON))
-        self.share_label = Gtk.Label(label="Share")
+        self.share_label = Gtk.Label(label="Send")
         sb.add(self.share_label)
         self.share_btn.add(sb)
-        self.share_btn.set_tooltip_text("Send files to nearby Arckad-D computers, or share a link / QR code (up to 10 min)")
-        self.share_btn.connect("clicked", lambda *_: self.open_share(self.active.selected_paths() or None))
-        hb.pack_end(self.share_btn)
+        self.share_btn.set_tooltip_text("Send the selected files to a nearby Arckad-D, or share a link / QR code")
+        self.share_btn.connect("clicked", lambda *_: self.open_share(self.active.selected_paths() or None, "nearby"))
+        pair.add(self.share_btn)
+        self.recv_btn = Gtk.Button()
+        rb = Gtk.Box(spacing=6)
+        rb.add(Gtk.Image.new_from_icon_name("folder-download-symbolic", Gtk.IconSize.BUTTON))
+        self.recv_label = Gtk.Label(label="Receive")
+        rb.add(self.recv_label)
+        self.recv_btn.add(rb)
+        self.recv_btn.set_tooltip_text("Let nearby Arckad-D devices send files to this computer")
+        self.recv_btn.connect("clicked", lambda *_: self.open_share(None, "receive"))
+        pair.add(self.recv_btn)
+        hb.pack_end(pair)
         self.undo_btn = self.icon_btn("edit-undo-symbolic", "Undo last organize / auto-sort", self.on_undo)
         self.undo_btn.set_sensitive(bool(read_json(UNDO_FILE, [])))
         hb.pack_end(self.undo_btn)
@@ -4324,7 +4351,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.preview_btn.set_tooltip_text("Show the preview panel (Space)")
         self.preview_btn.connect("toggled", self.on_preview_toggled)
         hb.pack_end(self.preview_btn)
-        self.dual_btn = Gtk.ToggleButton(label="Dual pane")
+        self.dual_btn = Gtk.ToggleButton(label="Dual")
         self.dual_btn.set_tooltip_text("Two folders side by side (F3)")
         self.dual_btn.connect("toggled", self.on_dual_toggled)
         hb.pack_end(self.dual_btn)
@@ -5479,7 +5506,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self.share_win.update_state()
         if paths:
             self.share_win.add_paths(paths)
-        if page:
+        if page == "receive":
+            self.share_win.tabs.set_visible_child_name("receive")
+        elif page:
+            self.share_win.tabs.set_visible_child_name("send")
             self.share_win.pages.set_visible_child_name(page)
         self.share_win.present()
 
@@ -5619,6 +5649,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.firewall_on():
             self.share_win.log_line("⚠ Ubuntu's firewall (ufw) is on. If other devices can't connect, run:  "
                                     "sudo ufw allow 8765:8767/tcp")
+        self.share_win.tabs.set_visible_child_name("send")
         self.share_win.pages.set_visible_child_name("link")
         GLib.timeout_add_seconds(1, self.share_tick)
         self.update_share_button()
@@ -5649,15 +5680,19 @@ class MainWindow(Gtk.ApplicationWindow):
         ctx = self.share_btn.get_style_context()
         if self.share.active():
             left = self.share.remaining()
-            self.share_label.set_text(f"Sharing {left // 60}:{left % 60:02d}")
-            ctx.add_class("suggested-action")
-        elif self.nearby.visible():
-            left = self.nearby.remaining()
-            self.share_label.set_text(f"Visible {left // 60}:{left % 60:02d}")
+            self.share_label.set_text(f"Link {left // 60}:{left % 60:02d}")
             ctx.add_class("suggested-action")
         else:
-            self.share_label.set_text("Share")
+            self.share_label.set_text("Send")
             ctx.remove_class("suggested-action")
+        rctx = self.recv_btn.get_style_context()
+        if self.nearby.visible():
+            left = self.nearby.remaining()
+            self.recv_label.set_text(f"Receiving {left // 60}:{left % 60:02d}")
+            rctx.add_class("suggested-action")
+        else:
+            self.recv_label.set_text("Receive")
+            rctx.remove_class("suggested-action")
 
     def on_share_event(self, client, text):
         if self.share_win:

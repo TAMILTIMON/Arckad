@@ -1,49 +1,37 @@
 # Arckad-D
 
-A file manager that remembers what you worked on. Runs on **Linux** (Ubuntu, Mint, Debian…) and **Windows 10/11**.
+A file manager that remembers what you worked on. Runs on **Linux**, **Windows 10/11** and **Android**,
+and they can send files to each other over Wi-Fi.
 
-## Get the installers (built automatically by GitHub)
+## How releases work (automatic)
 
-Every time you upload a change, GitHub builds:
+1. Change the version near the top of `arckad-d.py`, for example `APP_VERSION = "3.8.0"`.
+2. `git add -A && git commit -m "Arckad-D 3.8.0" && git push`
+3. About 15–40 minutes later the **Releases** page has **Arckad-D 3.8.0** with:
 
 | File | For |
 |---|---|
 | `Arckad-D-Setup-<version>.exe` | Windows installer |
 | `Arckad-D-<version>-portable-windows.zip` | Windows, no install needed |
 | `arckad-d_<version>_all.deb` | Ubuntu / Debian-based Linux |
+| `Arckad-D-<version>.apk` | Android phones (64-bit) |
 
-**Download them:** open the repository → **Actions** tab → click the latest
-**Build installers** run with a green ✓ → scroll to **Artifacts** →
-download **Arckad-D-Windows** and/or **Arckad-D-Linux** (each is a .zip; unzip it).
-
-**Build again by hand:** Actions → **Build installers** → **Run workflow**.
-
-**Make a public download page (Release):** create a tag that starts with `v`
-(Releases → *Draft a new release* → *Choose a tag* → type `v3.6.0` → *Publish*).
-The installers are attached to that release automatically after a few minutes.
-
-## Releasing a new version
-
-1. Change `APP_VERSION = "…"` near the top of `arckad-d.py`.
-2. Upload the new `arckad-d.py` (Add file → Upload files).
-3. Wait about 10 minutes, then download from the Actions tab as above.
+You don't need to draft releases yourself. Pushing again with the **same** version replaces the files in
+that release; a **new** version makes a new release. Progress is on the **Actions** tab.
 
 ## Project layout
 
 ```
-arckad-d.py                    the app (same file for Linux and Windows)
-windows/arckad-d.spec          PyInstaller recipe (makes Arckad-D.exe)
-windows/installer.iss          Inno Setup recipe (makes the Setup .exe)
-windows/arckad-d.ico, .png     app icon
+arckad-d.py                    desktop app (Linux + Windows)  ← APP_VERSION is here
+windows/                       Windows build recipe, installer script, icon
 linux/build-deb.sh             makes the .deb
-.github/workflows/build.yml    tells GitHub how to build everything
+android/                       Android app (main.py, arckad_core.py, buildozer.spec)
+.github/workflows/build.yml    tells GitHub how to build and release everything
 ```
 
-## Notes for Windows
+## Installing
 
-* The first time you start the installer, Windows SmartScreen may say
-  "Windows protected your PC" because the app isn't signed with a paid certificate.
-  Click **More info → Run anyway**.
-* The first time you use **Quick Share**, Windows asks about the firewall:
-  allow Arckad-D on **Private networks**.
-* PDF page previews are Linux-only for now; on Windows the preview shows the file icon and details.
+* **Linux:** `cp arckad-d_*.deb /tmp/ && sudo apt install /tmp/arckad-d_*_all.deb`
+* **Windows:** run the Setup .exe. If SmartScreen appears: *More info → Run anyway*.
+* **Android:** open the .apk on the phone and allow "Install unknown apps" for your browser or Files app
+  when asked. On first start, Arckad-D asks for *Allow access to manage all files*.

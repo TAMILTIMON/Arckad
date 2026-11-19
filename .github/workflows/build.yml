@@ -1,15 +1,27 @@
 name: Build installers
 
+# Push to main  ->  builds Windows .exe, Linux .deb and Android .apk
+#               ->  creates (or updates) the release "v<APP_VERSION>" with all of them.
+# APP_VERSION lives near the top of arckad-d.py, for example  APP_VERSION = "3.7.0"
 on:
   workflow_dispatch:          # "Run workflow" button on the Actions tab
   push:
     branches: [main, master]
-    tags: ["v*"]              # a tag like v3.2.0 also publishes a Release
 
 permissions:
   contents: write
 
 jobs:
+  version:
+    name: Read version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: echo "version=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' arckad-d.py)" >> "$GITHUB_OUTPUT"
+
   windows:
     name: Windows installer (.exe)
     runs-on: windows-latest
@@ -65,12 +77,6 @@ jobs:
           name: Arckad-D-Windows
           path: installer-output/*
 
-      - name: Attach to the GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: installer-output/*
-
   linux:
     name: Linux package (.deb)
     runs-on: ubuntu-latest
@@ -84,8 +90,67 @@ jobs:
         with:
           name: Arckad-D-Linux
           path: build/*.deb
-      - name: Attach to the GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+
+  android:
+    name: Android app (.apk)
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          files: build/*.deb
+          python-version: "3.11"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git zip unzip autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
+          python -m pip install --upgrade pip
+          python -m pip install buildozer "Cython==0.29.37" setuptools
+      - name: Use the version from arckad-d.py and the fixed signing key
+        run: |
+          sed -i 's/^__version__ = .*/__version__ = "${{ needs.version.outputs.version }}"/' android/main.py
+          mkdir -p ~/.android
+          cp android/signing/debug.keystore ~/.android/debug.keystore
+      - name: Reuse downloaded Android tools from earlier builds
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            android/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('android/buildozer.spec') }}
+      - name: Build the APK (first time takes about 30 minutes)
+        working-directory: android
+        run: yes | buildozer android debug
+      - name: Name the APK
+        run: |
+          mkdir -p apk-out
+          cp android/bin/*.apk "apk-out/Arckad-D-${{ needs.version.outputs.version }}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Arckad-D-Android
+          path: apk-out/*.apk
+
+  release:
+    name: Publish release
+    needs: [version, windows, linux, android]
+    if: ${{ !cancelled() && needs.linux.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: List files
+        run: ls -la release-files
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: Arckad-D ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          make_latest: true
+          files: release-files/*
