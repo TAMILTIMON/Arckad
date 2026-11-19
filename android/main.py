@@ -2,7 +2,7 @@
 Arckad-D for Android.
 Files · Recent ("Where was I?") · Send · Receive — works with Arckad-D on Linux and Windows.
 """
-__version__ = "3.8.1"          # GitHub replaces this with APP_VERSION from arckad-d.py when it builds
+__version__ = "3.8.2"          # GitHub replaces this with APP_VERSION from arckad-d.py when it builds
 
 import os
 import secrets
@@ -124,17 +124,54 @@ def system_dark():
     return False
 
 
+def jtext(s):
+    """Android wants titles as CharSequence; a plain Python string makes the call fail."""
+    String = autoclass("java.lang.String")
+    return cast("java.lang.CharSequence", String(s))
+
+
+def mime_of(path):
+    ext = core.ext_of(path)
+    try:
+        MimeTypeMap = autoclass("android.webkit.MimeTypeMap")
+        m = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+        if m:
+            return str(m)
+    except Exception:
+        pass
+    import mimetypes
+    return mimetypes.guess_type(path)[0] or "*/*"
+
+
+def content_uri(path):
+    """A content:// link from Android's own file index, which other apps are allowed to read.
+    Falls back to a plain file link for files Android hasn't indexed yet."""
+    try:
+        Files = autoclass("android.provider.MediaStore$Files")
+        ContentUris = autoclass("android.content.ContentUris")
+        base = Files.getContentUri("external")
+        cursor = activity().getContentResolver().query(base, ["_id"], "_data=?", [path], None)
+        if cursor is not None:
+            try:
+                if cursor.moveToFirst():
+                    return ContentUris.withAppendedId(base, cursor.getLong(0))
+            finally:
+                cursor.close()
+    except Exception:
+        pass
+    media_scan([path])                     # index it, so it works next time too
+    return Uri.fromFile(JFile(path))
+
+
 def open_with(path):
     if platform != "android":
         import subprocess
         subprocess.Popen(["xdg-open", path])
         return
-    import mimetypes
-    mime = mimetypes.guess_type(path)[0] or "*/*"
     intent = Intent(Intent.ACTION_VIEW)
-    intent.setDataAndType(Uri.fromFile(JFile(path)), mime)
+    intent.setDataAndType(content_uri(path), mime_of(path))
     intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK)
-    activity().startActivity(Intent.createChooser(intent, "Open with"))
+    activity().startActivity(Intent.createChooser(intent, jtext("Open with")))
 
 
 def open_url(url):
@@ -153,12 +190,17 @@ def share_files(paths):
     ArrayList = autoclass("java.util.ArrayList")
     uris = ArrayList()
     for p in paths:
-        uris.add(Uri.fromFile(JFile(p)))
-    intent = Intent(Intent.ACTION_SEND_MULTIPLE)
-    intent.setType("*/*")
-    intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
-    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    activity().startActivity(Intent.createChooser(intent, "Share"))
+        uris.add(content_uri(p))
+    if len(paths) == 1:
+        intent = Intent(Intent.ACTION_SEND)
+        intent.setType(mime_of(paths[0]))
+        intent.putExtra(Intent.EXTRA_STREAM, cast("android.os.Parcelable", uris.get(0)))
+    else:
+        intent = Intent(Intent.ACTION_SEND_MULTIPLE)
+        intent.setType("*/*")
+        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK)
+    activity().startActivity(Intent.createChooser(intent, jtext("Share")))
 
 
 def media_scan(paths):
@@ -1121,7 +1163,20 @@ class ArckadApp(App):
         try:
             fn(*args)
         except Exception as ex:
-            self.toast(f"Couldn't do that: {ex}")
+            self.show_error(ex)
+
+    def show_error(self, ex):
+        """Readable error text, including errors coming from Android (Java) code."""
+        cls = getattr(ex, "classname", None)
+        msg = getattr(ex, "innermessage", None)
+        if cls:
+            name = str(cls).replace("/", ".").rsplit(".", 1)[-1]
+            text = f"{name}: {msg}" if msg else name
+            if "ActivityNotFound" in name:
+                text = "No app on this phone can open this kind of file."
+        else:
+            text = str(ex) or type(ex).__name__
+        self.confirm("Couldn't do that", escape_markup(text[:400]), "OK", lambda: None)
 
     def toast(self, text, seconds=2.6):
         from kivy.animation import Animation
