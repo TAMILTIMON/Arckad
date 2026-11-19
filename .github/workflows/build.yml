@@ -127,8 +127,11 @@ jobs:
       - name: Build the APK (first time takes about 30 minutes)
         working-directory: android
         run: |
-          set -o pipefail
+          set +e
           yes | buildozer android debug 2>&1 | tee build.log
+          status=${PIPESTATUS[1]}          # buildozer's own result ("yes" always ends with a harmless broken pipe)
+          ls -la bin/ || true
+          exit $status
       - name: Show the Android build errors
         if: failure()
         run: |
