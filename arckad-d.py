@@ -50,7 +50,7 @@ except (ImportError, ValueError):
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.5"
+APP_VERSION = "3.6"
 APP_ID = "io.github.arckadd"
 IS_WIN = sys.platform == "win32"
 FROZEN = bool(getattr(sys, "frozen", False))                  # built into an .exe
@@ -478,6 +478,8 @@ def _extract_zip(path, out, password, progress):
                         dst.write(chunk)
                         done += len(chunk)
                         progress(done, total)
+            except NotImplementedError:
+                raise                            # AES / unusual method: extract_archive retries with 7-Zip
             except RuntimeError as ex:
                 if "password" in str(ex).lower() or "encrypted" in str(ex).lower():
                     raise NeedPassword(wrong=bool(password))
@@ -589,7 +591,24 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
         raise
 
 
-def compress_to_zip(paths, dest_zip, progress=lambda done, total: None):
+# (key, extension, label, needs 7-Zip, single file only)
+COMPRESS_FORMATS = [
+    ("zip", ".zip", "ZIP: opens on every computer", False, False),
+    ("7z", ".7z", "7Z: smallest size (needs 7-Zip)", True, False),
+    ("tar.gz", ".tar.gz", "TAR.GZ: common on Linux, fast", False, False),
+    ("tar.xz", ".tar.xz", "TAR.XZ: very small, slower", False, False),
+    ("tar.bz2", ".tar.bz2", "TAR.BZ2: small, slower", False, False),
+    ("tar", ".tar", "TAR: bundle only, no compression", False, False),
+    ("gz", ".gz", "GZ: one file only", False, True),
+    ("xz", ".xz", "XZ: one file only", False, True),
+    ("bz2", ".bz2", "BZ2: one file only", False, True),
+]
+COMPRESS_LEVELS = [("Fast", 1), ("Normal", 6), ("Best (smallest)", 9)]
+PASSWORD_FORMATS = {"zip", "7z"}
+
+
+def _gather(paths):
+    """[(source, name inside the archive, size, is_dir)] for files and whole folders."""
     entries = []
     for p in paths:
         if os.path.isdir(p):
@@ -599,25 +618,77 @@ def compress_to_zip(paths, dest_zip, progress=lambda done, total: None):
                 entries.append((str(fp), os.path.relpath(fp, base), 0 if is_dir else st.st_size, is_dir))
         elif os.path.isfile(p):
             entries.append((p, os.path.basename(p), os.path.getsize(p), False))
-    total, done = sum(e[2] for e in entries) or 1, 0
-    tmp = str(dest_zip) + ".part"
+    return entries
+
+
+def _run_7z(args):
+    tool = archive_tool()
+    if not tool:
+        hint = "Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip"
+        raise ExtractError(f"This needs 7-Zip. {hint}")
+    extra = {"creationflags": 0x08000000} if IS_WIN else {}
+    proc = subprocess.run([tool] + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, **extra)
+    if proc.returncode != 0:
+        raise ExtractError("7-Zip couldn't create the archive:\n" + (proc.stderr or proc.stdout).strip()[-600:])
+
+
+def compress_archive(paths, dest, fmt="zip", level=6, password=None, progress=lambda done, total: None):
+    """Creates an archive at dest in the chosen format. Returns its Path."""
+    dest = Path(dest)
+    ext = next(e for k, e, *_ in COMPRESS_FORMATS if k == fmt)
+    tmp = dest.with_name(f".arckad-{secrets.token_hex(4)}{ext}")    # finished file appears in one step
     try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-            for src, arc, size, is_dir in entries:
-                arc = arc.replace(os.sep, "/")
-                if is_dir:
-                    zf.write(src, arc + "/")
-                else:
-                    zf.write(src, arc)
+        if fmt == "7z" or (fmt == "zip" and password):
+            args = ["a", "-y", "-t7z" if fmt == "7z" else "-tzip", f"-mx={level}"]
+            if password:
+                args.append(f"-p{password}")
+                args.append("-mhe=on" if fmt == "7z" else "-mem=AES256")
+            _run_7z(args + [str(tmp)] + [str(p) for p in paths])
+        elif fmt == "zip":
+            entries = _gather(paths)
+            total, done = sum(e[2] for e in entries) or 1, 0
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=level, allowZip64=True) as zf:
+                for src, arc, size, is_dir in entries:
+                    arc = arc.replace(os.sep, "/")
+                    zf.write(src, arc + "/" if is_dir else arc)
                     done += size
                     progress(done, total)
-        os.replace(tmp, dest_zip)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        raise
-    return Path(dest_zip)
+        elif fmt.startswith("tar"):
+            total = sum(e[2] for e in _gather(paths)) or 1
+            done = [0]
 
+            def count(info):
+                done[0] += info.size
+                progress(min(done[0], total), total)
+                return info
+            comp = fmt.split(".")[1] if "." in fmt else ""
+            kwargs = {"preset": level} if comp == "xz" else ({"compresslevel": level} if comp else {})
+            with tarfile.open(tmp, "w:" + comp if comp else "w", **kwargs) as tf:
+                for p in paths:
+                    tf.add(p, arcname=os.path.basename(p.rstrip("/\\")), filter=count)
+        else:                                       # gz / xz / bz2 of a single file
+            if len(paths) != 1 or not os.path.isfile(paths[0]):
+                raise ExtractError(f".{fmt} can only hold one file. Choose ZIP, 7Z or TAR for folders "
+                                   "or several files.")
+            opener = {"gz": lambda f: gzip.open(f, "wb", compresslevel=level),
+                      "bz2": lambda f: bz2.open(f, "wb", compresslevel=level),
+                      "xz": lambda f: lzma.open(f, "wb", preset=level)}[fmt]
+            total, done = os.path.getsize(paths[0]) or 1, 0
+            with open(paths[0], "rb") as src, opener(tmp) as dst:
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    dst.write(chunk)
+                    done += len(chunk)
+                    progress(done, total)
+        os.replace(tmp, dest)
+        return dest
+    except BaseException:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+
+
+def compress_to_zip(paths, dest_zip, progress=lambda done, total: None):
+    return compress_archive(paths, dest_zip, "zip", 6, None, progress)
 
 def plan_organize(folder, by):
     plan = []
@@ -2040,7 +2111,7 @@ class FilePane(Gtk.Box):
             elif all(archive_kind(p) for p in paths):
                 add("Extract next to the archive", lambda: win.extract(self, paths, None))
                 add("Extract to…", lambda: win.extract_to(self, paths))
-            add("Compress to ZIP", lambda: win.compress(self, paths))
+            add("Compress…", lambda: win.compress(self, paths))
             if not in_folder:
                 add("Show in folder", lambda: self.show_in_folder(first))
             menu.append(Gtk.SeparatorMenuItem())
@@ -5168,25 +5239,128 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def compress(self, pane, paths):
         folder = pane.location if pane.mode == "folder" else os.path.dirname(paths[0])
-        default = (os.path.basename(paths[0].rstrip("/\\")) if len(paths) == 1 else "Archive")
-        default = os.path.splitext(default)[0] if os.path.isfile(paths[0]) and len(paths) == 1 else default
-        name = self.ask_text("Compress to ZIP", "Name of the ZIP file:", default + ".zip", select_stem=True)
-        if not name:
+        single_file = len(paths) == 1 and os.path.isfile(paths[0])
+        base = os.path.basename(paths[0].rstrip("/\\")) if len(paths) == 1 else "Archive"
+        if single_file:
+            base = os.path.splitext(base)[0] or base
+        has_7z = archive_tool() is not None
+        total = sum(e[2] for e in _gather(paths))
+
+        dlg = Gtk.Dialog(title="Compress", transient_for=self, modal=True)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Create", Gtk.ResponseType.OK)
+        ok = dlg.get_widget_for_response(Gtk.ResponseType.OK)
+        ok.get_style_context().add_class("suggested-action")
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, border_width=16)
+        dlg.get_content_area().add(grid)
+        n = len(paths)
+        summary = Gtk.Label(xalign=0, wrap=True)
+        summary.set_markup(f"<b>{n} item{'s' if n != 1 else ''}</b> · {human_size(total)} before compressing")
+        grid.attach(summary, 0, 0, 2, 1)
+
+        grid.attach(Gtk.Label(label="Name:", xalign=1), 0, 1, 1, 1)
+        name_entry = Gtk.Entry(hexpand=True, activates_default=True, width_chars=36)
+        grid.attach(name_entry, 1, 1, 1, 1)
+
+        grid.attach(Gtk.Label(label="Format:", xalign=1), 0, 2, 1, 1)
+        store = Gtk.ListStore(str, str, bool)          # key, label, usable
+        for key, ext, label, needs_7z, single in COMPRESS_FORMATS:
+            usable = (has_7z or not needs_7z) and (single_file or not single)
+            note = "" if usable else ("  (install 7-Zip)" if needs_7z and not has_7z else "  (one file only)")
+            store.append([key, label + note, usable])
+        fmt_combo = Gtk.ComboBox(model=store)
+        cell = Gtk.CellRendererText()
+        fmt_combo.pack_start(cell, True)
+        fmt_combo.add_attribute(cell, "text", 1)
+        fmt_combo.add_attribute(cell, "sensitive", 2)
+        grid.attach(fmt_combo, 1, 2, 1, 1)
+
+        grid.attach(Gtk.Label(label="Compression:", xalign=1), 0, 3, 1, 1)
+        level_combo = Gtk.ComboBoxText()
+        for label, _ in COMPRESS_LEVELS:
+            level_combo.append_text(label)
+        level_combo.set_active(self.cfg.get("compress_level", 1))
+        grid.attach(level_combo, 1, 3, 1, 1)
+
+        grid.attach(Gtk.Label(label="Password:", xalign=1), 0, 4, 1, 1)
+        pw_box = Gtk.Box(spacing=6)
+        pw_entry = Gtk.Entry(visibility=False, hexpand=True, placeholder_text="optional", activates_default=True)
+        pw_box.pack_start(pw_entry, True, True, 0)
+        show = Gtk.CheckButton(label="Show")
+        show.connect("toggled", lambda b: pw_entry.set_visibility(b.get_active()))
+        pw_box.add(show)
+        grid.attach(pw_box, 1, 4, 1, 1)
+        hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        hint.get_style_context().add_class("dim-label")
+        grid.attach(hint, 1, 5, 1, 1)
+
+        def ext_of_fmt(key):
+            return next(e for k, e, *_ in COMPRESS_FORMATS if k == key)
+
+        def current_key():
+            it = fmt_combo.get_active_iter()
+            return store[it][0] if it else "zip"
+
+        def strip_ext(text):
+            low = text.lower()
+            for _k, e, *_ in sorted(COMPRESS_FORMATS, key=lambda f: -len(f[1])):
+                if low.endswith(e):
+                    return text[:-len(e)]
+            return text
+
+        def on_format(*_):
+            it = fmt_combo.get_active_iter()
+            if it is not None and not store[it][2]:            # not usable: fall back to ZIP
+                fmt_combo.set_active(0)
+                return
+            key = current_key()
+            name_entry.set_text(strip_ext(name_entry.get_text() or base) + ext_of_fmt(key))
+            can_pw = key in PASSWORD_FORMATS and has_7z
+            pw_box.set_sensitive(can_pw)
+            if not can_pw:
+                pw_entry.set_text("")
+            if key in PASSWORD_FORMATS and not has_7z:
+                hint.set_markup("<small>Passwords need 7-Zip installed"
+                                + (" (7-zip.org)." if IS_WIN else ":  sudo apt install 7zip") + "</small>")
+            elif key in PASSWORD_FORMATS:
+                hint.set_markup("<small>With a password, the archive is encrypted with AES-256.</small>")
+            else:
+                hint.set_markup("<small>Passwords are available for ZIP and 7Z.</small>")
+        fmt_combo.connect("changed", on_format)
+        keys = [f[0] for f in COMPRESS_FORMATS]
+        last = self.cfg.get("compress_format", "zip")
+        idx = keys.index(last) if last in keys else 0
+        fmt_combo.set_active(idx if store[idx][2] else 0)
+        name_entry.set_text(base + ext_of_fmt(current_key()))
+        on_format()
+        dlg.show_all()
+        name_entry.grab_focus()
+        name_entry.select_region(0, len(strip_ext(name_entry.get_text())))
+        resp = dlg.run()
+        key, name = current_key(), name_entry.get_text().strip()
+        level = COMPRESS_LEVELS[level_combo.get_active()][1]
+        password = pw_entry.get_text() or None
+        self.cfg["compress_format"], self.cfg["compress_level"] = key, level_combo.get_active()
+        dlg.destroy()
+        if resp != Gtk.ResponseType.OK or not name:
             return
-        if not name.lower().endswith(".zip"):
-            name += ".zip"
+        if not name.lower().endswith(ext_of_fmt(key)):
+            name = strip_ext(name) + ext_of_fmt(key)
         target = unique_target(Path(folder) / name)
         self.spinner.start()
-        last = [0.0]
+        pane.flash(f"Compressing to {target.name}…")
+        last_t = [0.0]
 
-        def progress(done, total):
-            if time.time() - last[0] > 0.25:
-                last[0] = time.time()
-                GLib.idle_add(pane.flash, f"Compressing… {int(done * 100 / total)}%")
+        def progress(done, total_):
+            if time.time() - last_t[0] > 0.25:
+                last_t[0] = time.time()
+                GLib.idle_add(pane.flash, f"Compressing… {int(done * 100 / total_)}%")
 
         def work():
             try:
-                result, err = compress_to_zip(paths, target, progress), None
+                result, err = compress_archive(paths, target, key, level, password, progress), None
+            except ExtractError as ex:
+                result, err = None, str(ex)
             except OSError as ex:
                 result, err = None, ex.strerror or str(ex)
             GLib.idle_add(done, result, err)
@@ -5194,9 +5368,11 @@ class MainWindow(Gtk.ApplicationWindow):
         def done(result, err):
             self.update_spinner()
             if err:
-                self.error(f"Couldn't create the ZIP file: {err}")
+                self.error(f"Couldn't create {target.name}.\n\n{err}")
             else:
-                pane.flash(f"Created {result.name} ({human_size(result.stat().st_size)})")
+                size = result.stat().st_size
+                saved = f", {int((1 - size / total) * 100)}% smaller" if total and size < total else ""
+                pane.flash(f"Created {result.name} ({human_size(size)}{saved})")
                 if pane.mode == "folder" and str(result.parent) == pane.location:
                     pane.pending_select = [str(result)]
                     pane.refresh()
