@@ -84,7 +84,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.8), python3-gi, gir1.2-gtk-3.0, gir1.2-gdkpixbuf-2.0, librsvg2-common
-Recommends: qrencode, poppler-utils, ffmpegthumbnailer
+Recommends: qrencode, poppler-utils, ffmpegthumbnailer, 7zip | p7zip-full
 Installed-Size: $(du -sk "$PKG" --exclude=DEBIAN | cut -f1)
 Maintainer: Arckad-D <arckad-d@users.noreply.local>
 Description: File manager that remembers what you worked on

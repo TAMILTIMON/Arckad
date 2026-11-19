@@ -19,7 +19,7 @@ download **Arckad-D-Windows** and/or **Arckad-D-Linux** (each is a .zip; unzip i
 **Build again by hand:** Actions → **Build installers** → **Run workflow**.
 
 **Make a public download page (Release):** create a tag that starts with `v`
-(Releases → *Draft a new release* → *Choose a tag* → type `v3.2.0` → *Publish*).
+(Releases → *Draft a new release* → *Choose a tag* → type `v3.5.0` → *Publish*).
 The installers are attached to that release automatically after a few minutes.
 
 ## Releasing a new version

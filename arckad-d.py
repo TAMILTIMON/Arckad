@@ -9,10 +9,13 @@ Background auto-sort:  python3 arckad-d.py --autosort   (started for you when en
 Uses only what Ubuntu desktop already ships with (Python 3 + GTK 3).
 Optional, for richer previews:  sudo apt install poppler-utils ffmpegthumbnailer
 """
+import bz2
 import difflib
+import gzip
 import hashlib
 import html as htmlmod
 import json
+import lzma
 import mimetypes
 import os
 import secrets
@@ -23,6 +26,7 @@ import sqlite3
 import stat as statmod
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -46,7 +50,7 @@ except (ImportError, ValueError):
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.2"
+APP_VERSION = "3.5"
 APP_ID = "io.github.arckadd"
 IS_WIN = sys.platform == "win32"
 FROZEN = bool(getattr(sys, "frozen", False))                  # built into an .exe
@@ -386,6 +390,233 @@ def unique_target(dest):
         if not cand.exists():
             return cand
         i += 1
+
+
+# ---------------------------------------------------------------- archives: extract & compress
+
+TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz", ".tar")
+SINGLE_SUFFIXES = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}
+TOOL_SUFFIXES = (".7z", ".rar")
+
+
+class NeedPassword(Exception):
+    def __init__(self, wrong=False):
+        super().__init__("password needed")
+        self.wrong = wrong
+
+
+class ExtractError(Exception):
+    pass
+
+
+def archive_kind(path):
+    name = os.path.basename(str(path)).lower()
+    if name.endswith(".zip"):
+        return "zip"
+    if name.endswith(TAR_SUFFIXES):
+        return "tar"
+    if name.endswith(TOOL_SUFFIXES):
+        return "tool"
+    if os.path.splitext(name)[1] in SINGLE_SUFFIXES:
+        return "single"
+    return None
+
+
+def archive_stem(path):
+    name = os.path.basename(str(path))
+    low = name.lower()
+    for suf in TAR_SUFFIXES + (".zip",) + TOOL_SUFFIXES + tuple(SINGLE_SUFFIXES):
+        if low.endswith(suf) and len(name) > len(suf):
+            return name[:-len(suf)]
+    return os.path.splitext(name)[0] or name
+
+
+def archive_tool():
+    """An installed 7-Zip (handles .7z, .rar and unusual .zip files)."""
+    for exe in ("7z", "7zz", "7za"):
+        found = shutil.which(exe)
+        if found:
+            return found
+    if IS_WIN:
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")):
+            exe = os.path.join(base, "7-Zip", "7z.exe")
+            if os.path.exists(exe):
+                return exe
+    return None
+
+
+def _inside(base, target):
+    base, target = os.path.realpath(base), os.path.realpath(target)
+    return target == base or target.startswith(base + os.sep)
+
+
+def _extract_zip(path, out, password, progress):
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile:
+        raise ExtractError("This isn't a valid ZIP file (it may be damaged or incomplete).")
+    with zf:
+        infos = zf.infolist()
+        if password:
+            zf.setpassword(password.encode("utf-8"))
+        elif any(i.flag_bits & 0x1 for i in infos):
+            raise NeedPassword()
+        total, done = sum(i.file_size for i in infos) or 1, 0
+        for info in infos:
+            name = info.filename.replace("\\", "/")
+            target = os.path.join(out, *[p for p in name.split("/") if p not in ("", ".", "..")])
+            if not _inside(out, target):
+                continue
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            try:
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    for chunk in iter(lambda: src.read(1 << 20), b""):
+                        dst.write(chunk)
+                        done += len(chunk)
+                        progress(done, total)
+            except RuntimeError as ex:
+                if "password" in str(ex).lower() or "encrypted" in str(ex).lower():
+                    raise NeedPassword(wrong=bool(password))
+                raise ExtractError(str(ex))
+            except zipfile.BadZipFile as ex:
+                raise NeedPassword(wrong=True) if password else ExtractError(str(ex))
+            mode = (info.external_attr >> 16) & 0o777
+            if not IS_WIN and mode & 0o111:
+                os.chmod(target, mode | 0o600)
+            try:
+                ts = time.mktime(info.date_time + (0, 0, -1))
+                os.utime(target, (ts, ts))
+            except (OverflowError, ValueError, OSError):
+                pass
+
+
+def _extract_tar(path, out, progress):
+    try:
+        tf = tarfile.open(path, "r:*")
+    except (tarfile.TarError, OSError) as ex:
+        raise ExtractError(f"Can't read this archive: {ex}")
+    with tf:
+        members = tf.getmembers()
+        total, done = sum(m.size for m in members) or 1, 0
+        safe_filter = getattr(tarfile, "data_filter", None)
+        for m in members:
+            if safe_filter is not None:
+                try:
+                    tf.extract(m, out, filter="data")
+                except tarfile.FilterError:
+                    continue                      # skips anything that would escape the folder
+            else:                                 # older Python: plain files and folders only
+                target = os.path.join(out, m.name)
+                if not _inside(out, target):
+                    continue
+                if m.isdir():
+                    os.makedirs(target, exist_ok=True)
+                elif m.isfile():
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with tf.extractfile(m) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1 << 20)
+            done += m.size
+            progress(done, total)
+
+
+def _extract_single(path, out, progress):
+    opener = SINGLE_SUFFIXES[os.path.splitext(path)[1].lower()]
+    total, done = os.path.getsize(path) or 1, 0
+    try:
+        with opener(path, "rb") as src, open(os.path.join(out, archive_stem(path)), "wb") as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                dst.write(chunk)
+                done += len(chunk)
+                progress(min(done, total), total)
+    except (OSError, EOFError, lzma.LZMAError) as ex:
+        raise ExtractError(f"Can't decompress this file: {ex}")
+
+
+def _extract_tool(path, out, password):
+    tool = archive_tool()
+    if not tool:
+        hint = ("Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip")
+        raise ExtractError(f"Opening .7z and .rar files needs 7-Zip. {hint}")
+    extra = {"creationflags": 0x08000000} if IS_WIN else {}       # no console window
+    proc = subprocess.run([tool, "x", "-y", f"-o{out}", f"-p{password or ''}", path],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, **extra)
+    text = (proc.stdout + proc.stderr).lower()
+    if proc.returncode != 0:
+        if "password" in text or "encrypted" in text:
+            raise NeedPassword(wrong=bool(password))
+        raise ExtractError("7-Zip couldn't extract it:\n" + (proc.stderr or proc.stdout).strip()[-600:])
+
+
+def extract_archive(path, dest_dir, password=None, progress=lambda done, total: None):
+    """Extracts into dest_dir. A single top-level item lands directly in dest_dir; several items
+    go into a new folder named after the archive, so files never spill everywhere.
+    Returns the path of what was created."""
+    kind = archive_kind(path)
+    if kind is None:
+        raise ExtractError("This file type isn't an archive Arckad-D can extract.")
+    work = tempfile.mkdtemp(prefix=".arckad-extract-", dir=dest_dir)
+    try:
+        if kind == "zip":
+            try:
+                _extract_zip(path, work, password, progress)
+            except NotImplementedError:              # AES-encrypted or rare compression: use 7-Zip
+                shutil.rmtree(work, ignore_errors=True)
+                os.makedirs(work)
+                _extract_tool(path, work, password)
+        elif kind == "tar":
+            _extract_tar(path, work, progress)
+        elif kind == "single":
+            _extract_single(path, work, progress)
+        else:
+            _extract_tool(path, work, password)
+        items = os.listdir(work)
+        if not items:
+            raise ExtractError("The archive is empty.")
+        if len(items) == 1:
+            final = unique_target(Path(dest_dir) / items[0])
+            os.replace(os.path.join(work, items[0]), final)
+            shutil.rmtree(work, ignore_errors=True)
+        else:
+            final = unique_target(Path(dest_dir) / archive_stem(path))
+            os.replace(work, final)
+        return final
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+
+
+def compress_to_zip(paths, dest_zip, progress=lambda done, total: None):
+    entries = []
+    for p in paths:
+        if os.path.isdir(p):
+            base = os.path.dirname(p.rstrip("/\\"))
+            entries.append((p, os.path.relpath(p, base), 0, True))
+            for fp, st, is_dir in walk_entries(p, hidden=True):
+                entries.append((str(fp), os.path.relpath(fp, base), 0 if is_dir else st.st_size, is_dir))
+        elif os.path.isfile(p):
+            entries.append((p, os.path.basename(p), os.path.getsize(p), False))
+    total, done = sum(e[2] for e in entries) or 1, 0
+    tmp = str(dest_zip) + ".part"
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for src, arc, size, is_dir in entries:
+                arc = arc.replace(os.sep, "/")
+                if is_dir:
+                    zf.write(src, arc + "/")
+                else:
+                    zf.write(src, arc)
+                    done += size
+                    progress(done, total)
+        os.replace(tmp, dest_zip)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    return Path(dest_zip)
 
 
 def plan_organize(folder, by):
@@ -1650,7 +1881,8 @@ class FilePane(Gtk.Box):
         return False
 
     def refresh(self):
-        self.pending_select = self.selected_paths()
+        if not self.pending_select:
+            self.pending_select = self.selected_paths()
         self.pending_scroll = (self.gadj if self.view_mode == "grid" else self.vadj).get_value()
         self.load_location()
 
@@ -1678,22 +1910,23 @@ class FilePane(Gtk.Box):
     def select_paths(self, wanted):
         if self.sorted is None:
             return
-        wanted, first = set(wanted), None
+        wanted = set(wanted)
         grid = self.view_mode == "grid"
+        rows = [row.path for row in self.sorted if row[C_PATH] in wanted]
         sel = self.tree.get_selection()
         self.icons.unselect_all()
         sel.unselect_all()
-        for row in self.sorted:
-            if row[C_PATH] in wanted:
-                (self.icons.select_path if grid else sel.select_path)(row.path)
-                first = first or row.path
-        if first is not None:
-            if grid:
-                self.icons.set_cursor(first, None, False)
-                self.icons.scroll_to_path(first, True, 0.3, 0.0)
-            else:
-                self.tree.set_cursor(first, None, False)
-                self.tree.scroll_to_cell(first, None, True, 0.3, 0.0)
+        if not rows:
+            return
+        # moving the cursor resets the selection, so do it first, then select every row
+        if grid:
+            self.icons.set_cursor(rows[0], None, False)
+            self.icons.scroll_to_path(rows[0], True, 0.3, 0.0)
+        else:
+            self.tree.set_cursor(rows[0], None, False)
+            self.tree.scroll_to_cell(rows[0], None, True, 0.3, 0.0)
+        for path in rows:
+            (self.icons.select_path if grid else sel.select_path)(path)
 
     def on_selection_changed(self, *_):
         self.update_status()
@@ -1714,6 +1947,9 @@ class FilePane(Gtk.Box):
             loose = sum(1 for r in self.store if not r[C_ISDIR])
             if loose >= CLUTTER_LIMIT:
                 text += f"  ·  {loose} loose files here, try Organize"
+        msg, until = getattr(self, "flash_msg", ("", 0))
+        if msg and time.time() < until and msg != extra:
+            text += f"  ·  {msg}"
         if extra:
             text += f"  ·  {extra}"
         self.status.set_text(text)
@@ -1721,7 +1957,8 @@ class FilePane(Gtk.Box):
             self.win.update_organize_hint()
 
     def flash(self, message):
-        self.update_status(message)
+        self.flash_msg = (message, time.time() + 6)      # stays visible through a refresh
+        self.update_status()
 
     # ---------- actions
     def activate_row(self, tree_path):
@@ -1797,6 +2034,13 @@ class FilePane(Gtk.Box):
                 add("Open in other pane", lambda: win.open_in_other(first), other is not None)
             else:
                 add("Open with…", lambda: win.open_with(first))
+            if all(archive_kind(p) for p in paths) and self.mode == "folder":
+                add("Extract here", lambda: win.extract(self, paths, self.location))
+                add("Extract to…", lambda: win.extract_to(self, paths))
+            elif all(archive_kind(p) for p in paths):
+                add("Extract next to the archive", lambda: win.extract(self, paths, None))
+                add("Extract to…", lambda: win.extract_to(self, paths))
+            add("Compress to ZIP", lambda: win.compress(self, paths))
             if not in_folder:
                 add("Show in folder", lambda: self.show_in_folder(first))
             menu.append(Gtk.SeparatorMenuItem())
@@ -1816,7 +2060,8 @@ class FilePane(Gtk.Box):
             tag_item.set_submenu(sub)
             menu.append(tag_item)
             add("Compare these two…", lambda: win.compare(paths[0], paths[1]), len(paths) == 2)
-            add("Quick share on Wi-Fi…", lambda: win.open_share(paths))
+            add("Send to nearby Arckad-D…", lambda: win.open_share(paths, "nearby"))
+            add("Share as link / QR code…", lambda: win.open_share(paths, "link"))
             menu.append(Gtk.SeparatorMenuItem())
             add("Copy (Ctrl+C)", lambda: win.set_clipboard(paths, False))
             add("Cut (Ctrl+X)", lambda: win.set_clipboard(paths, True))
@@ -3067,40 +3312,609 @@ class QuickShare:
             GLib.idle_add(self.on_event, client, text)
 
 
+# ---------------------------------------------------------------- Nearby: Arckad-D finds Arckad-D
+NEARBY_UDP_PORT = 47820
+NEARBY_TCP_PORTS = (47821, 47822, 47823, 0)
+OS_NAME = "Windows" if IS_WIN else "Linux"
+BAD_NAME_CHARS = set('<>:"|?*\\')
+
+
+def received_dir():
+    d = downloads_dir() / "Arckad-D Received"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def safe_rel_parts(rel):
+    """Cleans a relative path sent by another computer, so it can't escape the received folder."""
+    clean = []
+    for part in str(rel).replace("\\", "/").split("/"):
+        if part in ("", ".", ".."):
+            return None
+        part = "".join("_" if (c in BAD_NAME_CHARS or ord(c) < 32) else c for c in part).strip().rstrip(".")
+        if not part:
+            return None
+        clean.append(part[:200])
+    return clean or None
+
+
+def files_for_sending(paths):
+    """[(source path, relative name, size)] — folders are sent file by file, keeping their structure."""
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            base = os.path.dirname(p.rstrip("/\\"))
+            for fp, st, is_dir in walk_entries(p, hidden=True):
+                if not is_dir:
+                    out.append((str(fp), os.path.relpath(fp, base).replace(os.sep, "/"), st.st_size))
+        elif os.path.isfile(p):
+            out.append((p, os.path.basename(p), os.path.getsize(p)))
+    return out
+
+
+def plan_destinations(files):
+    base = received_dir()
+    roots, claimed, out = {}, set(), []
+    for parts, _size in files:
+        key = parts[0] if len(parts) > 1 else None
+        if key is not None and key in roots:
+            root = roots[key]
+        else:
+            root = unique_target(base / parts[0])
+            while str(root) in claimed:
+                root = unique_target(root.with_name(root.stem + " (1)" + root.suffix))
+            claimed.add(str(root))
+            if key is not None:
+                roots[key] = root
+        out.append(root.joinpath(*parts[1:]) if len(parts) > 1 else root)
+    return out
+
+
+def make_nearby_handler(nb):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Arckad-D"
+
+        def log_message(self, *args):
+            pass
+
+        def _json(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_POST(self):
+            try:
+                self._post()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def do_PUT(self):
+            try:
+                self._put()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
+        def _post(self):
+            parts = [p for p in self.path.split("/") if p]
+            if parts == ["offer"]:
+                if not nb.visible():
+                    return self._json(403, {"ok": False, "reason": "not visible right now"})
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 5_000_000:
+                    return self._json(413, {"ok": False, "reason": "offer too large"})
+                try:
+                    offer = json.loads(self.rfile.read(length))
+                except ValueError:
+                    return self._json(400, {"ok": False, "reason": "bad offer"})
+                files = []
+                for f in (offer.get("files") or [])[:20000]:
+                    rel, size = safe_rel_parts(f.get("path", "")), f.get("size")
+                    if rel is None or not isinstance(size, int) or size < 0:
+                        return self._json(400, {"ok": False, "reason": "bad file name"})
+                    files.append((rel, size))
+                if not files:
+                    return self._json(400, {"ok": False, "reason": "no files"})
+                req = {"from": str(offer.get("name") or "Unknown computer")[:40],
+                       "os": str(offer.get("os") or "")[:10], "ip": self.client_address[0],
+                       "files": files, "total": sum(s for _, s in files),
+                       "event": threading.Event(), "accepted": False}
+                GLib.idle_add(nb.win.ask_incoming, req)
+                req["event"].wait(90)
+                if not req["accepted"]:
+                    return self._json(403, {"ok": False, "reason": "declined"})
+                req["dest"] = plan_destinations(files)
+                req["received"], req["done_files"] = 0, 0
+                token = secrets.token_hex(12)
+                nb.transfers[token] = req
+                return self._json(200, {"ok": True, "token": token})
+            if len(parts) == 2 and parts[0] == "done":
+                req = nb.transfers.pop(parts[1], None)
+                if not req:
+                    return self._json(404, {"ok": False})
+                GLib.idle_add(nb.win.on_nearby_received, req)
+                return self._json(200, {"ok": True})
+            return self._json(404, {"ok": False})
+
+        def _put(self):
+            parts = [p for p in self.path.split("/") if p]
+            if len(parts) != 3 or parts[0] != "upload" or not parts[2].isdigit():
+                return self._json(404, {"ok": False})
+            req, i = nb.transfers.get(parts[1]), int(parts[2])
+            if not req or i >= len(req["files"]):
+                return self._json(404, {"ok": False})
+            size = req["files"][i][1]
+            if int(self.headers.get("Content-Length") or -1) != size:
+                return self._json(400, {"ok": False, "reason": "size mismatch"})
+            dest = req["dest"][i]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dest.with_name(dest.name + ".part")
+            remaining = size
+            with open(tmp, "wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1 << 18, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+                    req["received"] += len(chunk)
+            if remaining:
+                tmp.unlink()
+                return self._json(400, {"ok": False, "reason": "incomplete"})
+            os.replace(tmp, dest)
+            req["done_files"] += 1
+            GLib.idle_add(nb.win.on_nearby_progress, req)
+            return self._json(200, {"ok": True})
+    return Handler
+
+
+class Nearby:
+    def __init__(self, win):
+        self.win = win
+        if not win.cfg.get("device_id"):
+            win.cfg["device_id"] = secrets.token_hex(8)
+        self.id = win.cfg["device_id"]
+        self.peers = {}
+        self.lock = threading.Lock()
+        self.udp = None
+        self.scanning = False
+        self.server = None
+        self.port = 0
+        self.visible_until = 0
+        self.transfers = {}
+        self._ips = ([], 0)
+        self.last_beacon = self.last_probe = self.last_expire = 0
+
+    def name(self):
+        return (self.win.cfg.get("device_name") or socket.gethostname() or "My computer").strip()[:40]
+
+    def visible(self):
+        return self.server is not None and time.time() < self.visible_until
+
+    def remaining(self):
+        return max(0, int(self.visible_until - time.time())) if self.server else 0
+
+    def ips(self):
+        lst, ts = self._ips
+        if time.time() - ts > 30:
+            lst = lan_addresses()
+            self._ips = (lst, time.time())
+        return lst
+
+    # ---------- being visible (receiving)
+    def set_visible(self, minutes):
+        if self.server is None:
+            for port in NEARBY_TCP_PORTS:
+                try:
+                    self.server = ThreadingHTTPServer(("0.0.0.0", port), make_nearby_handler(self))
+                    break
+                except OSError:
+                    continue
+            if self.server is None:
+                raise OSError("no free network port")
+            self.server.daemon_threads = True
+            self.port = self.server.server_address[1]
+            threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.visible_until = time.time() + min(10, max(1, minutes)) * 60
+        self._ensure_udp()
+        self.last_beacon = 0
+
+    def hide(self, force=False):
+        self.visible_until = 0
+        if self.transfers and not force:
+            return False                   # finish receiving first; closed later by the timer
+        srv, self.server = self.server, None
+        if srv:
+            self._send({"type": "bye"})
+
+            def close():
+                srv.shutdown()
+                srv.server_close()
+            threading.Thread(target=close, daemon=True).start()
+        self._maybe_close_udp()
+        return True
+
+    # ---------- looking for others
+    def start_scan(self):
+        self.scanning = True
+        self._ensure_udp()
+        self.last_probe = 0
+
+    def stop_scan(self):
+        self.scanning = False
+        self._maybe_close_udp()
+
+    def peer_list(self):
+        with self.lock:
+            return sorted(self.peers.values(), key=lambda p: p["name"].lower())
+
+    # ---------- UDP discovery
+    def _ensure_udp(self):
+        if self.udp:
+            return
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.bind(("", NEARBY_UDP_PORT))
+        s.settimeout(0.5)
+        self.udp = s
+        threading.Thread(target=self._loop, args=(s,), daemon=True).start()
+
+    def _maybe_close_udp(self):
+        if self.udp and not self.scanning and self.server is None:
+            s, self.udp = self.udp, None
+            try:
+                s.close()
+            except OSError:
+                pass
+            with self.lock:
+                self.peers.clear()
+
+    def _send(self, msg, target=None):
+        s = self.udp
+        if not s:
+            return
+        msg = dict(msg, app="arckad-d", v=1, id=self.id, name=self.name(), os=OS_NAME, port=self.port)
+        data = json.dumps(msg).encode()
+        targets = {target} if target else (
+            {"255.255.255.255"} | {ip.rsplit(".", 1)[0] + ".255" for ip in self.ips() if ip.count(".") == 3})
+        for t in targets:
+            try:
+                s.sendto(data, (t, NEARBY_UDP_PORT))
+            except OSError:
+                pass
+
+    def _loop(self, s):
+        while self.udp is s:
+            try:
+                data, addr = s.recvfrom(8192)
+            except socket.timeout:
+                data = None
+            except OSError:
+                break
+            if data:
+                self._handle(data, addr[0])
+            self._tick()
+
+    def _handle(self, data, ip):
+        try:
+            msg = json.loads(data.decode("utf-8"))
+        except ValueError:
+            return
+        if not isinstance(msg, dict) or msg.get("app") != "arckad-d" or msg.get("id") == self.id:
+            return
+        kind, pid = msg.get("type"), str(msg.get("id"))[:40]
+        changed = False
+        if kind == "hello" and isinstance(msg.get("port"), int) and msg["port"] > 0:
+            with self.lock:
+                old = self.peers.get(pid)
+                self.peers[pid] = {"id": pid, "name": str(msg.get("name") or "Unknown")[:40],
+                                   "os": str(msg.get("os") or "")[:10], "ip": ip, "port": msg["port"],
+                                   "seen": time.time()}
+                changed = old is None or old["name"] != self.peers[pid]["name"]
+        elif kind == "probe" and self.visible():
+            self._send({"type": "hello"}, ip)
+        elif kind == "bye":
+            with self.lock:
+                changed = self.peers.pop(pid, None) is not None
+        if changed:
+            GLib.idle_add(self.win.on_peers_changed)
+
+    def _tick(self):
+        now = time.time()
+        if self.visible() and now - self.last_beacon > 2:
+            self.last_beacon = now
+            self._send({"type": "hello"})
+        if self.scanning and now - self.last_probe > 3:
+            self.last_probe = now
+            self._send({"type": "probe"})
+        if now - self.last_expire > 2:
+            self.last_expire = now
+            with self.lock:
+                gone = [k for k, p in self.peers.items() if now - p["seen"] > 8]
+                for k in gone:
+                    del self.peers[k]
+            if gone:
+                GLib.idle_add(self.win.on_peers_changed)
+
+    # ---------- sending
+    def send(self, peer, paths, progress, done):
+        def work():
+            try:
+                result = self._send_files(peer, files_for_sending(paths), progress)
+            except (OSError, ValueError, KeyError) as ex:
+                result = (f"Couldn't reach {peer['name']}. Check that both computers are on the same Wi-Fi "
+                          f"and that its firewall allows Arckad-D. ({ex})")
+            GLib.idle_add(done, peer, result)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _send_files(self, peer, files, progress):
+        import http.client
+        if not files:
+            return "There are no files to send (empty folders are skipped)."
+        total = sum(f[2] for f in files)
+        offer = {"name": self.name(), "os": OS_NAME, "id": self.id,
+                 "files": [{"path": rel, "size": size} for _, rel, size in files]}
+        GLib.idle_add(progress, 0, total, f"Waiting for {peer['name']} to accept…")
+        conn = http.client.HTTPConnection(peer["ip"], peer["port"], timeout=100)
+        conn.request("POST", "/offer", json.dumps(offer).encode(), {"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        reply = json.loads(resp.read() or b"{}")
+        conn.close()
+        if not reply.get("ok"):
+            if reply.get("reason") == "declined":
+                return f"{peer['name']} declined or didn't answer."
+            return f"{peer['name']} couldn't receive: {reply.get('reason', 'unknown reason')}."
+        token, sent, last = reply["token"], 0, 0
+        for i, (src, rel, size) in enumerate(files):
+            conn = http.client.HTTPConnection(peer["ip"], peer["port"], timeout=60)
+            conn.putrequest("PUT", f"/upload/{token}/{i}")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders()
+            remaining = size
+            with open(src, "rb") as f:
+                while remaining > 0:
+                    chunk = f.read(min(1 << 18, remaining))
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+                    remaining -= len(chunk)
+                    sent += len(chunk)
+                    if time.time() - last > 0.2:
+                        last = time.time()
+                        GLib.idle_add(progress, sent, total, f"Sending {rel}…")
+            r = conn.getresponse()
+            r.read()
+            conn.close()
+            if r.status != 200 or remaining:
+                return f"Sending stopped at {rel}."
+        conn = http.client.HTTPConnection(peer["ip"], peer["port"], timeout=30)
+        conn.request("POST", f"/done/{token}", b"")
+        conn.getresponse().read()
+        conn.close()
+        GLib.idle_add(progress, total, total, "Done")
+        return None
+
+
+# ---------------------------------------------------------------- the Share window
 class ShareWindow(Gtk.Window):
     def __init__(self, win):
-        super().__init__(title="Quick Share", transient_for=win)
-        self.set_default_size(560, 760)
-        self.win = win
-        self.share = win.share
+        super().__init__(title="Share", transient_for=win)
+        self.set_default_size(600, 860)
+        self.win, self.share, self.nearby = win, win.share, win.nearby
+        self.sending = False
         self.connect("delete-event", lambda *_: self.hide() or True)   # keeps sharing in the background
-        hb = Gtk.HeaderBar(show_close_button=True, title="Quick Share",
-                           subtitle="Share files with devices on your Wi-Fi")
+        self.connect("map", lambda *_: self.on_mapped())
+        self.connect("unmap", lambda *_: self.nearby.stop_scan())
+        hb = Gtk.HeaderBar(show_close_button=True, title="Share",
+                           subtitle="Send files to computers and phones on your Wi-Fi")
         self.set_titlebar(hb)
         scroll = Gtk.ScrolledWindow()
         scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        self.add(scroll)
+        Gtk.Window.add(self, scroll)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, border_width=14)
         scroll.add(box)
 
-        top = Gtk.Box(spacing=12)
-        title = Gtk.Label(xalign=0, hexpand=True)
-        title.set_markup("<big><b>Sharing</b></big>")
-        top.pack_start(title, True, True, 0)
-        top.add(Gtk.Label(label="Stop after"))
+        # ---- files
+        head = Gtk.Box(spacing=6)
+        lbl = Gtk.Label(xalign=0, hexpand=True)
+        lbl.set_markup("<b>Files</b>")
+        head.pack_start(lbl, True, True, 0)
+        add_sel = Gtk.Button(label="Add selected")
+        add_sel.set_tooltip_text("Add the files selected in Arckad-D")
+        add_sel.connect("clicked", lambda *_: self.add_paths(self.win.active.selected_paths()))
+        head.add(add_sel)
+        add_files = Gtk.Button(label="Add files…")
+        add_files.connect("clicked", self.on_add_files)
+        head.add(add_files)
+        remove = Gtk.Button(label="Remove")
+        remove.connect("clicked", self.on_remove)
+        head.add(remove)
+        box.add(head)
+        self.store = Gtk.ListStore(Gio.Icon, str, str, str)    # icon, name, size, path
+        self.view = Gtk.TreeView(model=self.store, headers_visible=False)
+        self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        col = Gtk.TreeViewColumn()
+        ir = Gtk.CellRendererPixbuf()
+        col.pack_start(ir, False)
+        col.add_attribute(ir, "gicon", 0)
+        tr = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
+        col.pack_start(tr, True)
+        col.add_attribute(tr, "text", 1)
+        col.set_expand(True)
+        self.view.append_column(col)
+        self.view.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(xalign=1), text=2))
+        fs = Gtk.ScrolledWindow()
+        fs.set_size_request(-1, 120)
+        fs.add(self.view)
+        frame = Gtk.Frame()
+        frame.add(fs)
+        box.add(frame)
+
+        # ---- how to send: tabs
+        self.pages = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        switcher = Gtk.StackSwitcher(stack=self.pages, halign=Gtk.Align.CENTER, margin_top=6)
+        box.add(switcher)
+        box.add(self.pages)
+        self.pages.add_titled(self._nearby_page(), "nearby", "📡  Nearby Arckad-D")
+        self.pages.add_titled(self._link_page(), "link", "🔗  Link & QR code")
+
+        # ---- receiving
+        box.add(Gtk.Separator(margin_top=6))
+        rhead = Gtk.Box(spacing=10)
+        rl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        rl.set_markup("<b>Receive</b>\n<small>Let nearby Arckad-D computers find me and send me files</small>")
+        rhead.pack_start(rl, True, True, 0)
+        self.vis_minutes = Gtk.ComboBoxText()
+        for m in SHARE_MINUTES:
+            self.vis_minutes.append_text(f"{m} min")
+        self.vis_minutes.set_active(SHARE_MINUTES.index(win.cfg.get("visible_minutes", 10)))
+        self.vis_minutes.set_valign(Gtk.Align.CENTER)
+        self.vis_minutes.connect("changed", self.on_vis_minutes)
+        rhead.add(self.vis_minutes)
+        self.vis_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.vis_switch.connect("state-set", self.on_vis_switch)
+        rhead.add(self.vis_switch)
+        box.add(rhead)
+        self.vis_state = Gtk.Label(xalign=0, wrap=True)
+        box.add(self.vis_state)
+        name_row = Gtk.Box(spacing=6)
+        name_row.add(Gtk.Label(label="This computer's name:"))
+        self.name_entry = Gtk.Entry(text=self.nearby.name(), hexpand=True)
+        self.name_entry.connect("changed", self.on_name_changed)
+        name_row.pack_start(self.name_entry, True, True, 0)
+        open_recv = Gtk.Button(label="Received files")
+        open_recv.set_tooltip_text(short(received_dir()))
+        open_recv.connect("clicked", lambda *_: self.win.open_path(str(received_dir())))
+        name_row.add(open_recv)
+        box.add(name_row)
+
+        # ---- activity
+        lbl2 = Gtk.Label(xalign=0, margin_top=6)
+        lbl2.set_markup("<b>Activity</b>")
+        box.add(lbl2)
+        self.log = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                                left_margin=6, top_margin=6)
+        ls = Gtk.ScrolledWindow()
+        ls.set_size_request(-1, 100)
+        ls.add(self.log)
+        lframe = Gtk.Frame()
+        lframe.add(ls)
+        box.add(lframe)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>🔒 Everything stays on your <b>local network</b>; nothing is uploaded to the "
+                        "internet. Nobody can send you files unless you click <b>Accept</b>, and sharing "
+                        "turns itself off when its timer ends.</small>")
+        note.get_style_context().add_class("dim-label")
+        box.add(note)
+        self.refresh()
+        self.refresh_peers()
+
+    # ---------- nearby page
+    def _nearby_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
+        intro = Gtk.Label(xalign=0, wrap=True)
+        intro.set_markup("Other computers running Arckad-D on this Wi-Fi appear here when their "
+                         "<b>Receive</b> switch is on. Click <b>Send</b>; they get a pop-up to accept.")
+        page.add(intro)
+        self.peer_box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        placeholder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=18)
+        sp = Gtk.Spinner()
+        sp.start()
+        placeholder.add(sp)
+        ph = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        ph.set_markup("Looking for nearby devices…\n<small>On the other computer, open Arckad-D → Share and "
+                      "turn on <b>Receive</b>.</small>")
+        ph.get_style_context().add_class("dim-label")
+        placeholder.add(ph)
+        placeholder.show_all()
+        self.peer_box.set_placeholder(placeholder)
+        pframe = Gtk.Frame()
+        pframe.add(self.peer_box)
+        page.add(pframe)
+        self.progress = Gtk.ProgressBar(show_text=True)
+        self.progress.set_no_show_all(True)
+        page.add(self.progress)
+        return page
+
+    def refresh_peers(self):
+        for row in self.peer_box.get_children():
+            self.peer_box.remove(row)
+        for peer in self.nearby.peer_list():
+            row = Gtk.Box(spacing=10, margin=8)
+            icon = Gtk.Image.new_from_icon_name("computer-symbolic", Gtk.IconSize.DND)
+            row.add(icon)
+            lbl = Gtk.Label(xalign=0, hexpand=True)
+            lbl.set_markup(f"<b>{esc(peer['name'])}</b>\n<small>{esc(peer['os'])} · {esc(peer['ip'])}</small>")
+            row.pack_start(lbl, True, True, 0)
+            btn = Gtk.Button(label="Send")
+            btn.get_style_context().add_class("suggested-action")
+            btn.set_sensitive(not self.sending)
+            btn.connect("clicked", lambda _b, p=peer: self.send_to(p))
+            row.add(btn)
+            self.peer_box.add(row)
+        self.peer_box.show_all()
+
+    def send_to(self, peer):
+        paths = self.share.snapshot()
+        if not paths:
+            self.win.info("Add some files first (Add selected / Add files…), then click Send.")
+            return
+        self.sending = True
+        self.refresh_peers()
+        self.progress.show()
+        self.progress.set_fraction(0)
+        self.log_line(f"Offering {len(paths)} item{'s' if len(paths) != 1 else ''} to {peer['name']}…")
+        self.nearby.send(peer, paths, self.on_send_progress, self.on_send_done)
+
+    def on_send_progress(self, sent, total, text):
+        self.progress.set_fraction(sent / total if total else 1)
+        self.progress.set_text(f"{text}  {human_size(sent)} / {human_size(total)}")
+        return False
+
+    def on_send_done(self, peer, error):
+        self.sending = False
+        self.refresh_peers()
+        if error:
+            self.progress.set_text(error)
+            self.log_line("⚠ " + error)
+        else:
+            self.progress.set_fraction(1)
+            self.progress.set_text(f"Sent to {peer['name']} ✓")
+            self.log_line(f"✓ Sent everything to {peer['name']}")
+            self.win.active.flash(f"Sent to {peer['name']}")
+        return False
+
+    # ---------- link page
+    def _link_page(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=6)
+        intro = Gtk.Label(xalign=0, wrap=True)
+        intro.set_markup("For phones or computers <b>without</b> Arckad-D: they open a link or scan a QR "
+                         "code in any browser and download the files.")
+        page.add(intro)
+        top = Gtk.Box(spacing=10)
+        t = Gtk.Label(xalign=0, hexpand=True)
+        t.set_markup("<b>Share as a link</b>")
+        top.pack_start(t, True, True, 0)
         self.minutes = Gtk.ComboBoxText()
         for m in SHARE_MINUTES:
-            self.minutes.append_text(f"{m} minute{'s' if m > 1 else ''}")
-        self.minutes.set_active(SHARE_MINUTES.index(win.cfg.get("share_minutes", 10)))
+            self.minutes.append_text(f"{m} min")
+        self.minutes.set_active(SHARE_MINUTES.index(self.win.cfg.get("share_minutes", 10)))
         self.minutes.connect("changed", self.on_minutes_changed)
         top.add(self.minutes)
         self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.switch.connect("state-set", self.on_switch)
         top.add(self.switch)
-        box.add(top)
+        page.add(top)
         self.state = Gtk.Label(xalign=0, wrap=True)
-        box.add(self.state)
-
+        page.add(self.state)
         self.link_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.qr = Gtk.Image()
         self.link_box.add(self.qr)
@@ -3122,61 +3936,8 @@ class ShareWindow(Gtk.Window):
         self.other_ips.get_style_context().add_class("dim-label")
         self.link_box.add(self.other_ips)
         self.link_box.set_no_show_all(True)
-        box.add(self.link_box)
-
-        head = Gtk.Box(spacing=6, margin_top=6)
-        lbl = Gtk.Label(xalign=0, hexpand=True)
-        lbl.set_markup("<b>Files being shared</b>")
-        head.pack_start(lbl, True, True, 0)
-        add_sel = Gtk.Button(label="Add selected")
-        add_sel.set_tooltip_text("Add the files selected in Arckad-D")
-        add_sel.connect("clicked", lambda *_: self.add_paths(self.win.active.selected_paths()))
-        head.add(add_sel)
-        add_files = Gtk.Button(label="Add files…")
-        add_files.connect("clicked", self.on_add_files)
-        head.add(add_files)
-        self.remove_btn = Gtk.Button(label="Remove")
-        self.remove_btn.connect("clicked", self.on_remove)
-        head.add(self.remove_btn)
-        box.add(head)
-        self.store = Gtk.ListStore(Gio.Icon, str, str, str)    # icon, name, size, path
-        self.view = Gtk.TreeView(model=self.store, headers_visible=False)
-        self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        col = Gtk.TreeViewColumn()
-        ir = Gtk.CellRendererPixbuf()
-        col.pack_start(ir, False)
-        col.add_attribute(ir, "gicon", 0)
-        tr = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
-        col.pack_start(tr, True)
-        col.add_attribute(tr, "text", 1)
-        col.set_expand(True)
-        self.view.append_column(col)
-        self.view.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(xalign=1), text=2))
-        fs = Gtk.ScrolledWindow()
-        fs.set_size_request(-1, 150)
-        fs.add(self.view)
-        frame = Gtk.Frame()
-        frame.add(fs)
-        box.add(frame)
-
-        lbl2 = Gtk.Label(xalign=0, margin_top=6)
-        lbl2.set_markup("<b>Activity</b>")
-        box.add(lbl2)
-        self.log = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR,
-                                left_margin=6, top_margin=6)
-        ls = Gtk.ScrolledWindow()
-        ls.set_size_request(-1, 110)
-        ls.add(self.log)
-        lframe = Gtk.Frame()
-        lframe.add(ls)
-        box.add(lframe)
-        note = Gtk.Label(xalign=0, wrap=True)
-        note.set_markup("<small>🔒 Only people on the <b>same Wi-Fi / network</b> who have this link can download "
-                        "these files, and only while sharing is on. Nothing is uploaded to the internet. "
-                        "Sharing turns itself off when the timer ends.</small>")
-        note.get_style_context().add_class("dim-label")
-        box.add(note)
-        self.refresh()
+        page.add(self.link_box)
+        return page
 
     # ---------- files
     def add_paths(self, paths):
@@ -3188,7 +3949,7 @@ class ShareWindow(Gtk.Window):
         self.refresh()
 
     def on_add_files(self, *_):
-        dlg = Gtk.FileChooserNative.new("Add files to share", self, Gtk.FileChooserAction.OPEN, "Add", "Cancel")
+        dlg = Gtk.FileChooserNative.new("Add files", self, Gtk.FileChooserAction.OPEN, "Add", "Cancel")
         dlg.set_select_multiple(True)
         if dlg.run() == Gtk.ResponseType.ACCEPT:
             self.add_paths(dlg.get_filenames())
@@ -3210,19 +3971,26 @@ class ShareWindow(Gtk.Window):
             self.store.append([icon_for(p, is_dir), os.path.basename(p.rstrip("/\\")), size, p])
         self.update_state()
 
-    # ---------- on / off
+    def on_mapped(self):
+        try:
+            self.nearby.start_scan()
+        except OSError as ex:
+            self.log_line(f"⚠ Can't look for nearby devices ({ex}). Is another program using port "
+                          f"{NEARBY_UDP_PORT}?")
+
+    # ---------- link sharing on / off
     def on_minutes_changed(self, combo):
         minutes = SHARE_MINUTES[combo.get_active()]
         self.win.cfg["share_minutes"] = minutes
         if self.share.active():
             self.share.extend(minutes)
-            self.log_line(f"Timer reset to {minutes} minute{'s' if minutes > 1 else ''}")
+            self.log_line(f"Link timer reset to {minutes} min")
             self.update_state()
 
     def on_switch(self, switch, on):
         if on and not self.share.active():
             if not self.share.snapshot():
-                self.win.info("Add at least one file to share first.")
+                self.win.info("Add at least one file first.")
                 GLib.idle_add(lambda: switch.set_active(False) or False)
                 return True
             if not self.win.start_share(SHARE_MINUTES[self.minutes.get_active()]):
@@ -3234,21 +4002,46 @@ class ShareWindow(Gtk.Window):
         self.update_state()
         return True
 
+    # ---------- receiving on / off
+    def on_vis_minutes(self, combo):
+        minutes = SHARE_MINUTES[combo.get_active()]
+        self.win.cfg["visible_minutes"] = minutes
+        if self.nearby.visible():
+            self.nearby.set_visible(minutes)
+            self.update_state()
+
+    def on_vis_switch(self, switch, on):
+        if on and not self.nearby.visible():
+            if not self.win.start_visible(SHARE_MINUTES[self.vis_minutes.get_active()]):
+                GLib.idle_add(lambda: switch.set_active(False) or False)
+                return True
+        elif not on and self.nearby.visible():
+            self.win.stop_visible()
+        switch.set_state(on)
+        self.update_state()
+        return True
+
+    def on_name_changed(self, entry):
+        self.win.cfg["device_name"] = entry.get_text().strip()
+
+    @staticmethod
+    def _sync_switch(switch, handler, active):
+        if switch.get_active() != active:
+            switch.handler_block_by_func(handler)
+            switch.set_active(active)
+            switch.set_state(active)
+            switch.handler_unblock_by_func(handler)
+
     def update_state(self):
         active = self.share.active()
-        if self.switch.get_active() != active:
-            self.switch.handler_block_by_func(self.on_switch)
-            self.switch.set_active(active)
-            self.switch.set_state(active)
-            self.switch.handler_unblock_by_func(self.on_switch)
+        self._sync_switch(self.switch, self.on_switch, active)
         n = len(self.share.snapshot())
         if active:
             left = self.share.remaining()
-            self.state.set_markup(f"🟢 <b>On</b>, ends in <b>{left // 60}:{left % 60:02d}</b> · "
-                                  f"{n} item{'s' if n != 1 else ''} shared")
+            self.state.set_markup(f"🟢 <b>On</b>, link ends in <b>{left // 60}:{left % 60:02d}</b> · "
+                                  f"{n} item{'s' if n != 1 else ''}")
         else:
-            self.state.set_markup(f"⚪ <b>Off</b>. Add files, then turn the switch on. "
-                                  f"({n} item{'s' if n != 1 else ''} ready)")
+            self.state.set_markup("⚪ <b>Off</b>. Turn the switch on to get a link and QR code.")
         if active and not self.link_box.get_visible():
             ips = lan_addresses()
             url = self.share.url(ips[0])
@@ -3256,11 +4049,9 @@ class ShareWindow(Gtk.Window):
             pb = qr_pixbuf(url)
             if pb:
                 self.qr.set_from_pixbuf(pb)
-                self.qr.show()
-                self.qr_hint.set_text("Scan with a phone camera, or open the link below in any browser "
-                                      "on the same network.")
+                self.qr_hint.set_text("Scan with a phone camera, or open the link in any browser on the same "
+                                      "network.")
             else:
-                self.qr.hide()
                 self.qr_hint.set_text("Open this link in any browser on the same network.\n"
                                       + ("" if IS_WIN else "(For a QR code: sudo apt install qrencode)"))
             others = [self.share.url(ip) for ip in ips[1:]]
@@ -3272,6 +4063,16 @@ class ShareWindow(Gtk.Window):
         elif not active and self.link_box.get_visible():
             self.link_box.hide()
             self.link_box.set_no_show_all(True)
+
+        visible = self.nearby.visible()
+        self._sync_switch(self.vis_switch, self.on_vis_switch, visible)
+        if visible:
+            left = self.nearby.remaining()
+            self.vis_state.set_markup(f"🟢 Visible as <b>{esc(self.nearby.name())}</b> for "
+                                      f"<b>{left // 60}:{left % 60:02d}</b>. Files you accept go to "
+                                      f"<i>{esc(short(received_dir()))}</i>")
+        else:
+            self.vis_state.set_markup("⚪ <b>Not visible.</b> Turn on to let other Arckad-D computers send you files.")
 
     def log_line(self, text):
         buf = self.log.get_buffer()
@@ -3296,7 +4097,7 @@ Ctrl+H  hidden files      F5  refresh
 Ctrl+Shift+D  switch theme (system / light / dark)
 Alt+← / Alt+→ / Alt+↑  back, forward, up
 Middle-click a folder  open it in a new tab
-Share button  Quick Share files on your Wi-Fi (up to 10 minutes)"""
+Share button  send to nearby Arckad-D, or share a link / QR code"""
 
 
 class MainWindow(Gtk.ApplicationWindow):
@@ -3316,6 +4117,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.timeline_win = None
         self.preview_timer = None
         self.share = QuickShare(on_event=self.on_share_event)
+        self.nearby = Nearby(self)
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -3427,7 +4229,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
             ("Compare selected files…", self.compare_selected),
             ("Auto-sort Downloads…", self.autosort_dialog),
-            ("Quick Share on Wi-Fi…", lambda: self.open_share()),
+            ("Share on Wi-Fi…", lambda: self.open_share()),
             None,
             ("Update search index now", INDEX.rebuild),
         ]))
@@ -3437,7 +4239,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.share_label = Gtk.Label(label="Share")
         sb.add(self.share_label)
         self.share_btn.add(sb)
-        self.share_btn.set_tooltip_text("Quick Share: let phones and laptops on your Wi-Fi download files (up to 10 min)")
+        self.share_btn.set_tooltip_text("Send files to nearby Arckad-D computers, or share a link / QR code (up to 10 min)")
         self.share_btn.connect("clicked", lambda *_: self.open_share(self.active.selected_paths() or None))
         hb.pack_end(self.share_btn)
         self.undo_btn = self.icon_btn("edit-undo-symbolic", "Undo last organize / auto-sort", self.on_undo)
@@ -4011,38 +4813,205 @@ class MainWindow(Gtk.ApplicationWindow):
             self.clipboard = None
 
     def transfer(self, paths, move, dest):
+        """Copies or moves items into dest, asking what to do when a name already exists."""
         self.spinner.start()
+        state = {"file": None, "dir": None, "done": 0, "skipped": 0, "replaced": 0, "errors": [],
+                 "cancelled": False, "count": len(paths)}
+
+        def ask(src, dst):
+            req = {"src": src, "dst": dst, "event": threading.Event(), "answer": ("cancel", None, False),
+                   "more": state["count"] > 1 or os.path.isdir(src)}
+            GLib.idle_add(self._ask_conflict, req)
+            req["event"].wait()
+            return req["answer"]
+
+        def put(src, dst):
+            if move:
+                shutil.move(src, dst)
+                TAG_STORE.moved(src, dst)
+            elif os.path.isdir(src) and not os.path.islink(src):
+                shutil.copytree(src, dst, symlinks=True)
+            else:
+                shutil.copy2(src, dst, follow_symlinks=False)
+            state["done"] += 1
+
+        def place(src, dest_dir):
+            name = os.path.basename(src.rstrip("/\\"))
+            dst = os.path.join(dest_dir, name)
+            if os.path.isdir(src) and (os.path.realpath(dest_dir) + os.sep).startswith(os.path.realpath(src) + os.sep):
+                state["errors"].append(f"{name}: can't put a folder inside itself")
+                return
+            if os.path.realpath(os.path.dirname(src)) == os.path.realpath(dest_dir):
+                if move:
+                    return                                    # already here: nothing to do
+                put(src, str(unique_target(Path(dst))))       # copy & paste in the same folder = duplicate
+                return
+            if os.path.lexists(dst):
+                kind = "dir" if os.path.isdir(src) and os.path.isdir(dst) else "file"
+                if state[kind]:
+                    action, new_name = state[kind], None
+                else:
+                    action, new_name, apply_all = ask(src, dst)
+                    if action == "cancel":
+                        raise InterruptedError
+                    if apply_all:
+                        state[kind] = action
+                if action == "skip":
+                    state["skipped"] += 1
+                    return
+                if action == "merge":
+                    for child in sorted(os.listdir(src)):
+                        place(os.path.join(src, child), dst)
+                    if move:
+                        try:
+                            os.rmdir(src)                     # only if everything inside was moved
+                        except OSError:
+                            pass
+                    return
+                if action == "rename":
+                    dst = os.path.join(dest_dir, new_name) if new_name else dst
+                    if os.path.lexists(dst):
+                        dst = str(unique_target(Path(dst)))
+                elif action == "replace":
+                    self._remove_for_replace(dst)
+                    state["replaced"] += 1
+            put(src, dst)
 
         def work():
-            done, errors = 0, []
             for src in paths:
-                if move and os.path.dirname(src) == dest:
-                    continue
-                if os.path.isdir(src) and (dest == src or dest.startswith(src + os.sep)):
-                    errors.append(f"{os.path.basename(src)}: can't put a folder inside itself")
-                    continue
-                target = unique_target(Path(dest) / os.path.basename(src))
                 try:
-                    if move:
-                        shutil.move(src, str(target))
-                        TAG_STORE.moved(src, str(target))
-                    elif os.path.isdir(src):
-                        shutil.copytree(src, str(target), symlinks=True)
-                    else:
-                        shutil.copy2(src, str(target))
-                    done += 1
+                    place(src, dest)
+                except InterruptedError:
+                    state["cancelled"] = True
+                    break
                 except (OSError, shutil.Error) as ex:
-                    errors.append(f"{os.path.basename(src)}: {getattr(ex, 'strerror', None) or ex}")
-            GLib.idle_add(self._transfer_done, done, errors, move, dest)
+                    state["errors"].append(f"{os.path.basename(src)}: {getattr(ex, 'strerror', None) or ex}")
+            GLib.idle_add(self._transfer_done, state, move, dest)
         threading.Thread(target=work, daemon=True).start()
 
-    def _transfer_done(self, done, errors, move, dest):
+    @staticmethod
+    def _remove_for_replace(path):
+        """The item being replaced goes to the Trash, so a wrong click can be undone."""
+        try:
+            Gio.File.new_for_path(path).trash(None)
+        except GLib.Error:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+
+    def _ask_conflict(self, req):
+        src, dst = req["src"], req["dst"]
+        both_dirs = os.path.isdir(src) and os.path.isdir(dst)
+        what = "folder" if os.path.isdir(dst) else "file"
+        name = os.path.basename(dst)
+        dlg = Gtk.Dialog(title="Confirm to replace files" if not both_dirs else "Merge folders",
+                         transient_for=self, modal=True)
+        dlg.set_default_size(720, -1)
+        box = dlg.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        head = Gtk.Label(xalign=0, wrap=True)
+        head.set_markup(f"<big><b>This folder already contains a {what} “{esc(name)}”.</b></big>")
+        box.add(head)
+        try:
+            s_src, s_dst = os.stat(src), os.stat(dst)
+        except OSError:
+            s_src = s_dst = None
+
+        def card(path, st, other):
+            row = Gtk.Box(spacing=12, margin_start=24)
+            pb = None if os.path.isdir(path) else thumbnail_for(path, 64, render=False)
+            img = Gtk.Image.new_from_pixbuf(pb) if pb else Gtk.Image.new_from_gicon(
+                icon_for(os.path.basename(path), os.path.isdir(path)), Gtk.IconSize.DIALOG)
+            row.add(img)
+            info = Gtk.Label(xalign=0, selectable=True)
+            if st is None:
+                info.set_text("(can't read details)")
+            else:
+                if os.path.isdir(path):
+                    try:
+                        n = len(os.listdir(path))
+                    except OSError:
+                        n = 0
+                    size = f"Contains: {n} item{'s' if n != 1 else ''}"
+                else:
+                    size = f"Size: {human_size(st.st_size)} ({st.st_size:,} bytes)"
+                hints = []
+                if other is not None and not os.path.isdir(path):
+                    if st.st_mtime > other.st_mtime + 1:
+                        hints.append("newer")
+                    if st.st_size > other.st_size:
+                        hints.append("larger")
+                hint = f"   <i>({', '.join(hints)})</i>" if hints else ""
+                info.set_markup(f"{esc(size)}\nModified: {esc(fmt_full(st.st_mtime))}{hint}\n"
+                                f"<small>{esc(short(os.path.dirname(path)))}</small>")
+            row.add(info)
+            return row
+
+        q1 = Gtk.Label(xalign=0)
+        q1.set_text("Do you want to merge these folders? Files inside that clash will be asked about one by one."
+                    if both_dirs else f"Do you want to replace the existing {what}")
+        box.add(q1)
+        box.add(card(dst, s_dst, s_src))
+        q2 = Gtk.Label(xalign=0)
+        q2.set_text("with the folder you're pasting:" if both_dirs else "with the following file?" if
+                    not os.path.isdir(src) else "with the following folder?")
+        box.add(q2)
+        box.add(card(src, s_src, s_dst))
+        rename_row = Gtk.Box(spacing=8, margin_top=4)
+        rename_row.add(Gtk.Label(label="New name for Rename:"))
+        entry = Gtk.Entry(text=unique_target(Path(dst)).name, hexpand=True, activates_default=True)
+        rename_row.pack_start(entry, True, True, 0)
+        box.add(rename_row)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>Replaced items go to the Trash, so you can get them back.</small>")
+        note.get_style_context().add_class("dim-label")
+        box.add(note)
+
+        CANCEL, SKIP_ALL, SKIP, MAIN_ALL, MAIN, RENAME_ALL, RENAME = range(1, 8)
+        main = "Merge" if both_dirs else "Replace"
+        buttons = [("Cancel", CANCEL), ("Skip All", SKIP_ALL), ("Skip", SKIP), (f"{main} All", MAIN_ALL),
+                   (main, MAIN), ("Rename All", RENAME_ALL), ("Rename", RENAME)]
+        for label, rid in buttons:
+            if not req["more"] and label.endswith(" All"):
+                continue
+            dlg.add_button(label, rid)
+        dlg.get_widget_for_response(RENAME).get_style_context().add_class("suggested-action")
+        dlg.set_default_response(RENAME)
+        dlg.show_all()
+        resp = dlg.run()
+        new_name = entry.get_text().strip()
+        dlg.destroy()
+        bad = set('/\\:*?"<>|') if IS_WIN else {"/"}
+        if new_name and any(c in bad for c in new_name):
+            new_name = None
+        verb = "merge" if both_dirs else "replace"
+        req["answer"] = {
+            SKIP_ALL: ("skip", None, True), SKIP: ("skip", None, False),
+            MAIN_ALL: (verb, None, True), MAIN: (verb, None, False),
+            RENAME_ALL: ("rename", None, True), RENAME: ("rename", new_name or None, False),
+        }.get(resp, ("cancel", None, False))
+        req["event"].set()
+        return False
+
+    def _transfer_done(self, state, move, dest):
         self.update_spinner()
         self.refresh_all()
         verb = "Moved" if move else "Copied"
-        self.active.flash(f"{verb} {done} item{'s' if done != 1 else ''} to {short(dest)}")
-        if errors:
-            self.error("Some items couldn't be " + ("moved" if move else "copied") + ":\n\n" + "\n".join(errors[:15]))
+        done = state["done"]
+        msg = f"{verb} {done} item{'s' if done != 1 else ''} to {short(dest)}"
+        extras = []
+        if state["replaced"]:
+            extras.append(f"{state['replaced']} replaced, old versions in Trash")
+        if state["skipped"]:
+            extras.append(f"{state['skipped']} skipped")
+        if state["cancelled"]:
+            extras.append("stopped")
+        self.active.flash(msg + (f" ({', '.join(extras)})" if extras else ""))
+        if state["errors"]:
+            self.error("Some items couldn't be " + ("moved" if move else "copied") + ":\n\n"
+                       + "\n".join(state["errors"][:15]))
         return False
 
     def refresh_all(self):
@@ -4109,6 +5078,130 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_install(self):
         path = install_launcher()
         self.info(f"{APP_NAME} is now in your app menu.\nSearch for “{APP_NAME}” in Activities.\n\n({short(path)})")
+
+    # ---------- archives
+    def extract_to(self, pane, paths):
+        dlg = Gtk.FileChooserNative.new("Extract to…", self, Gtk.FileChooserAction.SELECT_FOLDER, "Extract here", "Cancel")
+        start = pane.location if is_folder_loc(pane.location) else os.path.dirname(paths[0])
+        dlg.set_current_folder(start)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            self.extract(pane, paths, dlg.get_filename())
+        dlg.destroy()
+
+    def extract(self, pane, paths, dest_dir):
+        """Extracts the archives one after another; dest_dir None = next to each archive."""
+        queue = [(p, dest_dir or os.path.dirname(p)) for p in paths]
+        results = []
+        self._extract_next(pane, queue, results, None)
+
+    def _extract_next(self, pane, queue, results, password):
+        if not queue:
+            self.update_spinner()
+            if results:
+                if len(results) == 1:
+                    pane.flash(f"Extracted to {short(results[0])}")
+                else:
+                    pane.flash(f"Extracted {len(results)} archives")
+                if pane.mode == "folder" and any(str(r.parent) == pane.location for r in results):
+                    pane.pending_select = [str(r) for r in results]
+                    pane.refresh()
+            return
+        archive, dest = queue[0]
+        name = os.path.basename(archive)
+        self.spinner.start()
+        pane.flash(f"Extracting {name}…")
+        last = [0.0]
+
+        def progress(done, total):
+            if time.time() - last[0] > 0.25:
+                last[0] = time.time()
+                GLib.idle_add(pane.flash, f"Extracting {name}… {int(done * 100 / total)}%")
+
+        def work():
+            try:
+                outcome = ("ok", extract_archive(archive, dest, password, progress))
+            except NeedPassword as ex:
+                outcome = ("password", ex.wrong)
+            except ExtractError as ex:
+                outcome = ("error", str(ex))
+            except OSError as ex:
+                outcome = ("error", f"{ex.strerror or ex} ({getattr(ex, 'filename', '') or name})")
+            GLib.idle_add(finish, outcome)
+
+        def finish(outcome):
+            kind, value = outcome
+            if kind == "ok":
+                results.append(Path(value))
+                self._extract_next(pane, queue[1:], results, None)
+            elif kind == "password":
+                pw = self.ask_password(name, wrong=value)
+                if pw is None:
+                    pane.flash(f"Skipped {name}")
+                    self._extract_next(pane, queue[1:], results, None)
+                else:
+                    self._extract_next(pane, queue, results, pw)
+            else:
+                self.update_spinner()
+                self.error(f"Couldn't extract {name}.\n\n{value}")
+                self._extract_next(pane, queue[1:], results, None)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def ask_password(self, name, wrong=False):
+        dlg = Gtk.Dialog(title="Password needed", transient_for=self, modal=True)
+        dlg.add_buttons("Skip", Gtk.ResponseType.CANCEL, "Extract", Gtk.ResponseType.OK)
+        dlg.set_default_response(Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        msg = Gtk.Label(xalign=0, wrap=True)
+        msg.set_markup(("<b>That password didn't work.</b> " if wrong else "")
+                       + f"“{esc(name)}” is protected. Enter its password:")
+        box.add(msg)
+        entry = Gtk.Entry(visibility=False, activates_default=True, width_chars=32)
+        box.add(entry)
+        dlg.show_all()
+        resp = dlg.run()
+        pw = entry.get_text()
+        dlg.destroy()
+        return pw if resp == Gtk.ResponseType.OK and pw else None
+
+    def compress(self, pane, paths):
+        folder = pane.location if pane.mode == "folder" else os.path.dirname(paths[0])
+        default = (os.path.basename(paths[0].rstrip("/\\")) if len(paths) == 1 else "Archive")
+        default = os.path.splitext(default)[0] if os.path.isfile(paths[0]) and len(paths) == 1 else default
+        name = self.ask_text("Compress to ZIP", "Name of the ZIP file:", default + ".zip", select_stem=True)
+        if not name:
+            return
+        if not name.lower().endswith(".zip"):
+            name += ".zip"
+        target = unique_target(Path(folder) / name)
+        self.spinner.start()
+        last = [0.0]
+
+        def progress(done, total):
+            if time.time() - last[0] > 0.25:
+                last[0] = time.time()
+                GLib.idle_add(pane.flash, f"Compressing… {int(done * 100 / total)}%")
+
+        def work():
+            try:
+                result, err = compress_to_zip(paths, target, progress), None
+            except OSError as ex:
+                result, err = None, ex.strerror or str(ex)
+            GLib.idle_add(done, result, err)
+
+        def done(result, err):
+            self.update_spinner()
+            if err:
+                self.error(f"Couldn't create the ZIP file: {err}")
+            else:
+                pane.flash(f"Created {result.name} ({human_size(result.stat().st_size)})")
+                if pane.mode == "folder" and str(result.parent) == pane.location:
+                    pane.pending_select = [str(result)]
+                    pane.refresh()
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     # ---------- compare & duplicates
     def compare_selected(self):
@@ -4202,14 +5295,132 @@ class MainWindow(Gtk.ApplicationWindow):
         self.active.flash(f"Undo: restored {len(restored)} files")
 
     # ---------- Quick Share
-    def open_share(self, paths=None):
+    def open_share(self, paths=None, page=None):
         if self.share_win is None:
             self.share_win = ShareWindow(self)
             self.share_win.show_all()
+            self.share_win.progress.hide()
             self.share_win.update_state()
         if paths:
             self.share_win.add_paths(paths)
+        if page:
+            self.share_win.pages.set_visible_child_name(page)
         self.share_win.present()
+
+    # ---------- Nearby (Arckad-D to Arckad-D)
+    def start_visible(self, minutes):
+        try:
+            self.nearby.set_visible(minutes)
+        except OSError as ex:
+            self.error(f"Couldn't turn on receiving: {ex}")
+            return False
+        if self.share_win:
+            self.share_win.log_line(f"Visible to nearby devices as “{self.nearby.name()}”")
+            if IS_WIN:
+                self.share_win.log_line("If Windows asks about the firewall, allow Arckad-D on Private networks.")
+            elif self.firewall_on():
+                self.share_win.log_line("⚠ Ubuntu's firewall is on. If others can't see you, run:  "
+                                        "sudo ufw allow 47820/udp && sudo ufw allow 47821:47823/tcp")
+        GLib.timeout_add_seconds(1, self.visible_tick)
+        self.update_share_button()
+        return True
+
+    def stop_visible(self, expired=False):
+        closed = self.nearby.hide()
+        if self.share_win:
+            self.share_win.log_line("Receiving turned off (time is up)" if expired else "Receiving turned off"
+                                    + ("" if closed else ", after the current transfer finishes"))
+            self.share_win.update_state()
+        self.update_share_button()
+
+    def visible_tick(self):
+        nb = self.nearby
+        if nb.server is None:
+            self.update_share_button()
+            return False
+        if not nb.visible():
+            if nb.visible_until:               # timer ran out
+                self.stop_visible(expired=True)
+            elif not nb.transfers:
+                nb.hide()
+            if nb.server is None:
+                self.update_share_button()
+                return False
+        self.update_share_button()
+        if self.share_win and self.share_win.get_visible():
+            self.share_win.update_state()
+        return True
+
+    def on_peers_changed(self):
+        if self.share_win:
+            self.share_win.refresh_peers()
+        return False
+
+    def ask_incoming(self, req):
+        names = ["/".join(parts) for parts, _ in req["files"]]
+        listing = "\n".join("•  " + n for n in names[:6])
+        if len(names) > 6:
+            listing += f"\n…and {len(names) - 6} more"
+        n = len(names)
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
+                              text=f"{req['from']} wants to send you {n} file{'s' if n != 1 else ''}")
+        d.format_secondary_text(f"{human_size(req['total'])} from {req['from']} ({req['os']}, {req['ip']})\n\n"
+                                f"{listing}\n\nThey will be saved in {short(received_dir())}")
+        d.add_buttons("Decline", Gtk.ResponseType.REJECT, "Accept", Gtk.ResponseType.ACCEPT)
+        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+        d.set_keep_above(True)
+
+        def respond(dlg, resp):
+            if not req["event"].is_set():
+                req["accepted"] = resp == Gtk.ResponseType.ACCEPT
+                req["event"].set()
+                if self.share_win:
+                    verb = "Accepted" if req["accepted"] else "Declined"
+                    self.share_win.log_line(f"{verb} {n} file{'s' if n != 1 else ''} from {req['from']}")
+            dlg.destroy()
+
+        def give_up():
+            if not req["event"].is_set():
+                d.response(Gtk.ResponseType.REJECT)
+            return False
+        d.connect("response", respond)
+        GLib.timeout_add_seconds(60, give_up)
+        d.show_all()
+        d.present()
+        return False
+
+    def on_nearby_progress(self, req):
+        if self.share_win:
+            self.share_win.vis_state.set_markup(
+                f"⬇ Receiving from <b>{esc(req['from'])}</b>: {req['done_files']} / {len(req['files'])} files "
+                f"({human_size(req['received'])} of {human_size(req['total'])})")
+        return False
+
+    def on_nearby_received(self, req):
+        n = len(req["files"])
+        msg = f"Received {n} file{'s' if n != 1 else ''} from {req['from']}"
+        if self.share_win:
+            self.share_win.log_line("✓ " + msg)
+            self.share_win.update_state()
+        if self.active:
+            self.active.flash(msg)
+        target = req["dest"][0] if n == 1 else received_dir()
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.INFO,
+                              text=msg)
+        d.format_secondary_text(f"Saved in {short(received_dir())}")
+        d.add_buttons("Close", Gtk.ResponseType.CLOSE, "Show files", Gtk.ResponseType.ACCEPT)
+
+        def respond(dlg, resp):
+            dlg.destroy()
+            if resp == Gtk.ResponseType.ACCEPT:
+                self.present()
+                if n == 1:
+                    self.active.show_in_folder(str(target))
+                else:
+                    self.active.go(str(received_dir()))
+        d.connect("response", respond)
+        d.show_all()
+        return False
 
     @staticmethod
     def firewall_on():
@@ -4232,6 +5443,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.firewall_on():
             self.share_win.log_line("⚠ Ubuntu's firewall (ufw) is on. If other devices can't connect, run:  "
                                     "sudo ufw allow 8765:8767/tcp")
+        self.share_win.pages.set_visible_child_name("link")
         GLib.timeout_add_seconds(1, self.share_tick)
         self.update_share_button()
         return True
@@ -4262,6 +5474,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.share.active():
             left = self.share.remaining()
             self.share_label.set_text(f"Sharing {left // 60}:{left % 60:02d}")
+            ctx.add_class("suggested-action")
+        elif self.nearby.visible():
+            left = self.nearby.remaining()
+            self.share_label.set_text(f"Visible {left // 60}:{left % 60:02d}")
             ctx.add_class("suggested-action")
         else:
             self.share_label.set_text("Share")
@@ -4431,6 +5647,8 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.sorter:
             self.sorter.stop()
         self.share.stop()
+        self.nearby.scanning = False
+        self.nearby.hide(force=True)
         return False
 
 
