@@ -231,7 +231,6 @@ final class Net {
         String id, name, os, ip;
         int port;
         long seen;
-        boolean manual;          // added by IP address (other network / VLAN)
     }
 
     static final class Incoming {
@@ -272,9 +271,6 @@ final class Net {
         private volatile long visibleUntil;
         private long lastBeacon, lastProbe, lastExpire;
         private WifiManager.MulticastLock lock;
-        private long lastManual;
-        private volatile boolean manualBusy;
-        final List<String> manual = Collections.synchronizedList(new ArrayList<>());
         String name = "Phone";
 
         Nearby(Context c, String id, NearbyUi ui) {
@@ -460,20 +456,12 @@ final class Net {
                 lastProbe = now;
                 send(msg("probe"), null);
             }
-            if (scanning && !manual.isEmpty() && !manualBusy && now - lastManual > 4000) {
-                lastManual = now;
-                manualBusy = true;
-                Thread t = new Thread(this::checkManual, "arckad-manual");
-                t.setDaemon(true);
-                t.start();
-            }
             if (now - lastExpire > 2000) {
                 lastExpire = now;
                 boolean gone = false;
                 synchronized (peers) {
                     for (java.util.Iterator<Peer> it = peers.values().iterator(); it.hasNext(); ) {
-                        Peer pe = it.next();
-                        if (now - pe.seen > (pe.manual ? 12000 : 8000)) {
+                        if (now - it.next().seen > 8000) {
                             it.remove();
                             gone = true;
                         }
@@ -483,82 +471,9 @@ final class Net {
             }
         }
 
-        // ---------- devices on other networks / VLANs, added by IP
-        private void checkManual() {
-            try {
-                List<String> hosts;
-                synchronized (manual) {
-                    hosts = new ArrayList<>(manual);
-                }
-                boolean changed = false;
-                for (String h : hosts) {
-                    send(msg("probe"), h);                 // if UDP gets through, it answers the normal way
-                    boolean known;
-                    synchronized (peers) {
-                        known = false;
-                        for (Peer p : peers.values()) if (p.manual && h.equals(p.ip)) known = true;
-                    }
-                    Object res = helloAt(h, 2000);
-                    if (res instanceof Peer && !known) changed = true;
-                }
-                if (changed) ui.peersChanged();
-            } finally {
-                manualBusy = false;
-            }
-        }
-
-        /** Asks one address directly. Returns the Peer, or a String saying why not. Runs off the main thread. */
-        Object helloAt(String host, int timeoutMs) {
-            String reason = "no answer";
-            for (int i = 0; i < NEARBY_PORTS.length - 1; i++) {
-                int port = NEARBY_PORTS[i];
-                try {
-                    HttpURLConnection c = (HttpURLConnection) new URL("http://" + host + ":" + port + "/hello").openConnection();
-                    c.setConnectTimeout(timeoutMs);
-                    c.setReadTimeout(timeoutMs);
-                    int code = c.getResponseCode();
-                    InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-                    ByteArrayOutputStream b = new ByteArrayOutputStream();
-                    if (in != null) {
-                        try (InputStream s = in) {
-                            Fs.pipe(s, b);
-                        }
-                    }
-                    c.disconnect();
-                    JSONObject o = new JSONObject(b.size() == 0 ? "{}" : b.toString("UTF-8"));
-                    if ("arckad-d".equals(o.optString("app")) && o.optInt("port") > 0) {
-                        if (id.equals(o.optString("id"))) return "that's this phone";
-                        Peer p = new Peer();
-                        p.id = o.optString("id");
-                        p.name = o.optString("name", host);
-                        p.os = o.optString("os", "");
-                        p.ip = InetAddress.getByName(host).getHostAddress();
-                        p.port = o.optInt("port");
-                        p.seen = System.currentTimeMillis();
-                        p.manual = true;
-                        synchronized (peers) {
-                            peers.put(p.id, p);
-                        }
-                        return p;
-                    }
-                    if (code == 403) reason = "Arckad-D is there, but its Receive is turned off";
-                } catch (Exception ignored) {
-                }
-            }
-            return reason;
-        }
-
         // ---------- receiving
         private void handle(Request r) throws Exception {
             List<String> seg = segments(r.path);
-            if ("GET".equals(r.method) && seg.size() == 1 && seg.get(0).equals("hello")) {
-                if (!visible()) {
-                    r.json(403, new JSONObject().put("ok", false).put("reason", "not visible right now"));
-                    return;
-                }
-                r.json(200, msg("hello"));
-                return;
-            }
             if ("POST".equals(r.method) && seg.size() == 1 && seg.get(0).equals("offer")) {
                 if (!visible()) {
                     r.json(403, new JSONObject().put("ok", false).put("reason", "not visible right now"));

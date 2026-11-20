@@ -47,32 +47,13 @@ try:
     gi.require_version("Gdk", "3.0")
     gi.require_version("GdkPixbuf", "2.0")
     from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango
-except Exception:                       # also broken installs, not just missing GTK
-    import traceback
-    _err = traceback.format_exc()
-    if "--selftest" in sys.argv:         # the automatic build test reads this file
-        _i = sys.argv.index("--selftest")
-        with open(sys.argv[_i + 1] if len(sys.argv) > _i + 1 else "selftest.txt", "w", encoding="utf-8") as _f:
-            _f.write("SELFTEST FAILED while loading GTK\n" + _err)
-        sys.exit(1)
-    if sys.platform == "win32":
-        _log = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "arckad-d-error.log")
-        try:
-            with open(_log, "w", encoding="utf-8") as _f:
-                _f.write(_err)
-        except OSError:
-            pass
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(None, "Arckad-D couldn't start because part of it is missing or damaged.\n\n"
-                                         "Please reinstall it from the Releases page.\n\nDetails were saved to:\n" + _log,
-                                         "Arckad-D", 0x10)
-        sys.exit(1)
-    sys.exit("GTK for Python is missing or broken. Install it with:\n"
-             "  sudo apt install python3-gi gir1.2-gtk-3.0\n\n" + _err)
+except (ImportError, ValueError):
+    sys.exit("GTK for Python is missing. Install it with:\n"
+             "  sudo apt install python3-gi gir1.2-gtk-3.0")
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.11.2"
+APP_VERSION = "3.9.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -220,79 +201,9 @@ def esc(text):
 
 _icon_cache = {}
 FOLDER_ICON = Gio.ThemedIcon.new("folder")
-ICON_STYLE = {"colour": False}          # True: Arckad-D's own file-type icons (default on Windows)
-
-# Arckad-D's own file icons: a page with a coloured band naming the type. They don't depend on the
-# system's icon theme, and read well on light and dark backgrounds.
-_TYPE_COLOURS = [
-    ({"pdf"}, "#D9252A"), ({"doc", "docx", "odt", "rtf"}, "#1C71D8"), ({"txt", "md", "log", "rst"}, "#5E5C64"),
-    ({"epub"}, "#8F5902"), ({"exe", "msi", "deb", "rpm", "apk", "appimage", "run", "iso"}, "#3D3846"),
-]
-_KIND_COLOURS = {"Images": "#0E8A84", "Videos": "#C01C28", "Audio": "#7B3FA0", "Spreadsheets": "#1F8F4E",
-                 "Presentations": "#D35400", "Archives": "#8A5A2B", "Code": "#2B2D42", "Installers": "#3D3846",
-                 "Documents": "#1C71D8", "Others": "#6E6C76"}
-_PAGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="2 2 61 61">
-<path d="M15 4h24l15 15v39a4 4 0 0 1-4 4H15a4 4 0 0 1-4-4V8a4 4 0 0 1 4-4z" fill="#FBFAF9" stroke="#8E8C95" stroke-width="1.6"/>
-<path d="M39 4v11a4 4 0 0 0 4 4h11" fill="#DEDDDA" stroke="#8E8C95" stroke-width="1.6" stroke-linejoin="round"/>
-<rect x="11" y="34" width="43" height="18" fill="{colour}"/>
-<text x="32.5" y="47.6" text-anchor="middle" fill="#FFFFFF" font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif"
- font-weight="700" font-size="{size}">{label}</text>
-</svg>"""
-_FOLDER_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-<path d="M6 15a5 5 0 0 1 5-5h13.5l6 6H53a5 5 0 0 1 5 5v3H6z" fill="#D9930D"/>
-<rect x="6" y="20" width="52" height="36" rx="5" fill="#F5B83D"/>
-<path d="M6 25a5 5 0 0 1 5-5h42a5 5 0 0 1 5 5v1H6z" fill="#FFD47A"/>
-</svg>"""
-
-
-def _svg_icon(svg):
-    return Gio.BytesIcon.new(GLib.Bytes.new(svg.encode("utf-8")))
-
-
-_SIZES = {}
-
-
-def icon_size(kind):
-    """GTK icon sizes for the coloured icons: 32 px list rows, 64 px grid tiles."""
-    if kind not in _SIZES:
-        px = {"row": 32, "tile": 64}[kind]
-        try:
-            _SIZES[kind] = Gtk.icon_size_register(f"arckad-{kind}", px, px)
-        except Exception:
-            _SIZES[kind] = Gtk.IconSize.DND if kind == "row" else Gtk.IconSize.DIALOG
-    return _SIZES[kind]
-
-
-def colour_icons_supported():
-    """The coloured icons are SVG; check this system can draw SVG (it can on Ubuntu and in the Windows build)."""
-    try:
-        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-        loader.write(_FOLDER_SVG.encode())
-        loader.close()
-        return loader.get_pixbuf() is not None
-    except Exception:
-        return False
-
-
-def colour_icon(name, is_dir):
-    if is_dir:
-        key = ("folder",)
-        if key not in _icon_cache:
-            _icon_cache[key] = _svg_icon(_FOLDER_SVG)
-        return _icon_cache[key]
-    ext = ext_of(name)
-    colour = next((c for exts, c in _TYPE_COLOURS if ext in exts), None) or _KIND_COLOURS.get(category_of(name), "#6E6C76")
-    label = (ext.upper() if ext and len(ext) <= 4 else "FILE")
-    key = ("c", label, colour)
-    if key not in _icon_cache:
-        size = {1: 15, 2: 15, 3: 13.5, 4: 11}.get(len(label), 11)
-        _icon_cache[key] = _svg_icon(_PAGE_SVG.format(colour=colour, size=size, label=esc(label)))
-    return _icon_cache[key]
 
 
 def icon_for(name, is_dir):
-    if ICON_STYLE["colour"]:
-        return colour_icon(name, is_dir)
     if is_dir:
         return FOLDER_ICON
     ext = ext_of(name)
@@ -539,78 +450,6 @@ def archive_tool():
     return None
 
 
-def bsdtar_tool():
-    """libarchive's tar: built into Windows 10/11 (System32\\tar.exe); on Linux the 'bsdtar' command.
-    It opens .7z / .rar / .zip without 7-Zip and can create .7z (but not with a password)."""
-    if IS_WIN:
-        exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tar.exe")
-        return exe if os.path.exists(exe) else None
-    return shutil.which("bsdtar")
-
-
-def _no_window():
-    return {"creationflags": 0x08000000} if IS_WIN else {}
-
-
-def _hide_on_windows(path):
-    if IS_WIN:
-        try:
-            import ctypes
-            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2)
-        except Exception:
-            pass
-
-
-def _replace(src, dst):
-    """os.replace that waits out antivirus scanners briefly locking brand-new files (common on Windows);
-    for a folder it falls back to moving the contents one by one."""
-    for attempt in range(25):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == 24:
-                break
-            time.sleep(0.2)
-    if os.path.isdir(src):
-        os.makedirs(dst, exist_ok=True)
-        for name in os.listdir(src):
-            shutil.move(os.path.join(src, name), os.path.join(dst, name))
-        shutil.rmtree(src, ignore_errors=True)
-    else:
-        shutil.copy2(src, dst)
-        try:
-            os.remove(src)
-        except OSError:
-            pass
-
-
-def _zip_name(info):
-    """ZIPs made by Windows' "Send to → Compressed folder" store names in the old DOS code page,
-    not UTF-8, so non-English names came out garbled. Try UTF-8, then this computer's code page."""
-    name = info.filename
-    if info.flag_bits & 0x800:
-        return name
-    try:
-        raw = name.encode("cp437")
-    except UnicodeEncodeError:
-        return name
-    for enc in ("utf-8",) + ((f"cp{_oem_codepage()}",) if IS_WIN else ()):
-        try:
-            return raw.decode(enc)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return name
-
-
-def _oem_codepage():
-    try:
-        import ctypes
-        return ctypes.windll.kernel32.GetOEMCP()
-    except Exception:
-        return 437
-
-
 def _inside(base, target):
     base, target = os.path.realpath(base), os.path.realpath(target)
     return target == base or target.startswith(base + os.sep)
@@ -629,7 +468,7 @@ def _extract_zip(path, out, password, progress):
             raise NeedPassword()
         total, done = sum(i.file_size for i in infos) or 1, 0
         for info in infos:
-            name = _zip_name(info).replace("\\", "/")
+            name = info.filename.replace("\\", "/")
             target = os.path.join(out, *[p for p in name.split("/") if p not in ("", ".", "..")])
             if not _inside(out, target):
                 continue
@@ -706,23 +545,11 @@ def _extract_single(path, out, progress):
 def _extract_tool(path, out, password):
     tool = archive_tool()
     if not tool:
-        bsd = bsdtar_tool()
-        if bsd and not password:
-            proc = subprocess.run([bsd, "-xf", path, "-C", out], stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, errors="replace", **_no_window())
-            if proc.returncode == 0:
-                return
-            text = (proc.stderr or proc.stdout).lower()
-            if "passphrase" in text or "encrypt" in text or "password" in text:
-                raise NeedPassword()
-            hint = "Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip"
-            raise ExtractError("The built-in archive tool couldn't open it:\n" + (proc.stderr or proc.stdout).strip()[-400:]
-                               + f"\n\n{hint}, which handles more archive types.")
         hint = ("Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip")
-        need = "Password-protected archives need" if password else "Opening .7z and .rar files needs"
-        raise ExtractError(f"{need} 7-Zip. {hint}")
+        raise ExtractError(f"Opening .7z and .rar files needs 7-Zip. {hint}")
+    extra = {"creationflags": 0x08000000} if IS_WIN else {}       # no console window
     proc = subprocess.run([tool, "x", "-y", f"-o{out}", f"-p{password or ''}", path],
-                          stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", **_no_window())
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, **extra)
     text = (proc.stdout + proc.stderr).lower()
     if proc.returncode != 0:
         if "password" in text or "encrypted" in text:
@@ -738,7 +565,6 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
     if kind is None:
         raise ExtractError("This file type isn't an archive Arckad-D can extract.")
     work = tempfile.mkdtemp(prefix=".arckad-extract-", dir=dest_dir)
-    _hide_on_windows(work)
     try:
         if kind == "zip":
             try:
@@ -758,17 +584,11 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
             raise ExtractError("The archive is empty.")
         if len(items) == 1:
             final = unique_target(Path(dest_dir) / items[0])
-            _replace(os.path.join(work, items[0]), final)
+            os.replace(os.path.join(work, items[0]), final)
             shutil.rmtree(work, ignore_errors=True)
         else:
             final = unique_target(Path(dest_dir) / archive_stem(path))
-            _replace(work, final)
-            if IS_WIN:
-                try:
-                    import ctypes
-                    ctypes.windll.kernel32.SetFileAttributesW(str(final), 0x80)     # normal (not hidden)
-                except Exception:
-                    pass
+            os.replace(work, final)
         return final
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)
@@ -778,7 +598,7 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
 # (key, extension, label, needs 7-Zip, single file only)
 COMPRESS_FORMATS = [
     ("zip", ".zip", "ZIP: opens on every computer", False, False),
-    ("7z", ".7z", "7Z: smallest size", True, False),
+    ("7z", ".7z", "7Z: smallest size (needs 7-Zip)", True, False),
     ("tar.gz", ".tar.gz", "TAR.GZ: common on Linux, fast", False, False),
     ("tar.xz", ".tar.xz", "TAR.XZ: very small, slower", False, False),
     ("tar.bz2", ".tar.bz2", "TAR.BZ2: small, slower", False, False),
@@ -805,27 +625,13 @@ def _gather(paths):
     return entries
 
 
-def can_make_7z(password=False):
-    return archive_tool() is not None or (not password and bsdtar_tool() is not None)
-
-
-def _bsdtar_7z(paths, out):
-    args = [bsdtar_tool(), "--format", "7zip", "-cf", str(out)]
-    for p in paths:
-        p = str(p).rstrip("/\\")
-        args += ["-C", os.path.dirname(p) or ".", os.path.basename(p)]
-    proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", **_no_window())
-    if proc.returncode != 0:
-        raise ExtractError("Couldn't create the .7z file:\n" + (proc.stderr or proc.stdout).strip()[-400:])
-
-
 def _run_7z(args):
     tool = archive_tool()
     if not tool:
         hint = "Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip"
         raise ExtractError(f"This needs 7-Zip. {hint}")
-    proc = subprocess.run([tool] + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                          **_no_window())
+    extra = {"creationflags": 0x08000000} if IS_WIN else {}
+    proc = subprocess.run([tool] + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, **extra)
     if proc.returncode != 0:
         raise ExtractError("7-Zip couldn't create the archive:\n" + (proc.stderr or proc.stdout).strip()[-600:])
 
@@ -836,9 +642,7 @@ def compress_archive(paths, dest, fmt="zip", level=6, password=None, progress=la
     ext = next(e for k, e, *_ in COMPRESS_FORMATS if k == fmt)
     tmp = dest.with_name(f".arckad-{secrets.token_hex(4)}{ext}")    # finished file appears in one step
     try:
-        if fmt == "7z" and not password and archive_tool() is None and bsdtar_tool():
-            _bsdtar_7z(paths, tmp)
-        elif fmt == "7z" or (fmt == "zip" and password):
+        if fmt == "7z" or (fmt == "zip" and password):
             args = ["a", "-y", "-t7z" if fmt == "7z" else "-tzip", f"-mx={level}"]
             if password:
                 args.append(f"-p{password}")
@@ -879,7 +683,7 @@ def compress_archive(paths, dest, fmt="zip", level=6, password=None, progress=la
                     dst.write(chunk)
                     done += len(chunk)
                     progress(done, total)
-        _replace(tmp, dest)
+        os.replace(tmp, dest)
         return dest
     except BaseException:
         if tmp.exists():
@@ -1756,15 +1560,14 @@ class FilePane(Gtk.Box):
         self.add(flow)
 
         # list view
-        self.tree = Gtk.TreeView(enable_search=False, rubber_banding=False)   # press-and-drag = drag files
+        self.tree = Gtk.TreeView(enable_search=False, rubber_banding=True)
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.get_selection().connect("changed", self.on_selection_changed)
         self.tree.connect("row-activated", lambda t, p, c: self.activate_row(p))
         self.tree.connect("button-press-event", self.on_view_click)
         col = Gtk.TreeViewColumn("Name")
         icon_r = Gtk.CellRendererPixbuf()
-        self.icon_renderer = icon_r
-        icon_r.set_property("stock-size", icon_size("row") if ICON_STYLE["colour"] else Gtk.IconSize.LARGE_TOOLBAR)
+        icon_r.set_property("stock-size", Gtk.IconSize.LARGE_TOOLBAR)
         col.pack_start(icon_r, False)
         col.add_attribute(icon_r, "gicon", C_ICON)
         text_r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
@@ -1791,8 +1594,7 @@ class FilePane(Gtk.Box):
         self.icons = Gtk.IconView(item_width=110, column_spacing=4, row_spacing=4, margin=8)
         self.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         pix_r = Gtk.CellRendererPixbuf()
-        self.tile_renderer = pix_r
-        pix_r.set_property("stock-size", icon_size("tile") if ICON_STYLE["colour"] else Gtk.IconSize.DIALOG)
+        pix_r.set_property("stock-size", Gtk.IconSize.DIALOG)
         pix_r.set_fixed_size(100, 100)
         self.icons.pack_start(pix_r, False)
         self.icons.set_cell_data_func(pix_r, self._grid_icon)
@@ -1814,69 +1616,7 @@ class FilePane(Gtk.Box):
         self.status = Gtk.Label(xalign=0, margin=5, ellipsize=Pango.EllipsizeMode.END)
         self.status.get_style_context().add_class("dim-label")
         self.add(self.status)
-        self._setup_dnd()
         self.connect("map", lambda *_: self.view_stack.set_visible_child_name(self.view_mode))
-
-    # ---------- drag and drop
-    def _setup_dnd(self):
-        targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
-        actions = Gdk.DragAction.MOVE | Gdk.DragAction.COPY
-        self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.tree.enable_model_drag_dest(targets, actions)
-        self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.icons.enable_model_drag_dest(targets, actions)
-        for view in (self.tree, self.icons):
-            view.connect("drag-data-get", self.on_drag_get)
-            view.connect("drag-data-received", self.on_drag_received)
-            view.connect("drag-drop", self.on_drag_drop)
-            view.connect("drag-begin", self.on_drag_begin)
-
-    def on_drag_begin(self, view, context):
-        n = len(self.selected_paths())
-        Gtk.drag_set_icon_name(context, "folder-documents" if n > 1 else "text-x-generic", 0, 0)
-
-    def on_drag_get(self, view, context, selection, info, time_):
-        uris = [Gio.File.new_for_path(p).get_uri() for p in self.selected_paths()]
-        selection.set_uris(uris)
-
-    def drop_target(self, view, x, y):
-        """The folder under the pointer, or this pane's folder."""
-        if view is self.tree:
-            hit = self.tree.get_dest_row_at_pos(x, y)
-            if hit and hit[1] in (Gtk.TreeViewDropPosition.INTO_OR_BEFORE, Gtk.TreeViewDropPosition.INTO_OR_AFTER):
-                row = self.sorted[hit[0]]
-                if row[C_ISDIR]:
-                    return row[C_PATH]
-        else:
-            hit = self.icons.get_dest_item_at_pos(x, y)
-            if hit:
-                row = self.sorted[hit[0]]
-                if row[C_ISDIR]:
-                    return row[C_PATH]
-        return self.location if self.mode == "folder" else None
-
-    def on_drag_drop(self, view, context, x, y, time_):
-        view.stop_emission_by_name("drag-drop")            # sorted lists can't take rows; ask for the files instead
-        view.drag_get_data(context, Gdk.Atom.intern("text/uri-list", False), time_)
-        return True
-
-    def on_drag_received(self, view, context, x, y, selection, info, time_):
-        view.stop_emission_by_name("drag-data-received")      # we handle it; don't let GTK reorder rows
-        dest = self.drop_target(view, x, y)
-        paths = [Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])]
-        paths = [p for p in paths if p]
-        internal = Gtk.drag_get_source_widget(context) is not None
-        mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
-        ok = self.win.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
-                                  bool(mods & Gdk.ModifierType.SHIFT_MASK))
-        Gtk.drag_finish(context, ok, False, time_)
-
-    def apply_icon_style(self):
-        colour = ICON_STYLE["colour"]
-        self.icon_renderer.set_property("stock-size", icon_size("row") if colour else Gtk.IconSize.LARGE_TOOLBAR)
-        self.tile_renderer.set_property("stock-size", icon_size("tile") if colour else Gtk.IconSize.DIALOG)
-        self.tree.columns_autosize()
-        self.refresh()
 
     def _text_col(self, title, text_col, sort_col, xalign=0.0):
         r = Gtk.CellRendererText(xalign=xalign, ellipsize=Pango.EllipsizeMode.END)
@@ -3798,16 +3538,6 @@ def make_nearby_handler(nb):
             self.end_headers()
             self.wfile.write(data)
 
-        def do_GET(self):
-            """Lets a sender on another network (VLAN) check this device directly by its IP."""
-            try:
-                if self.path.split("?")[0].rstrip("/") == "/hello" and nb.visible():
-                    return self._json(200, {"app": "arckad-d", "v": 1, "type": "hello", "id": nb.id,
-                                            "name": nb.name(), "os": OS_NAME, "port": nb.port})
-                return self._json(403, {"ok": False, "reason": "not visible right now"})
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                pass
-
         def do_POST(self):
             try:
                 self._post()
@@ -3908,56 +3638,7 @@ class Nearby:
         self.visible_until = 0
         self.transfers = {}
         self._ips = ([], 0)
-        self.last_beacon = self.last_probe = self.last_expire = self.last_manual = 0
-        self.manual_busy = False
-
-    def ui(self, method, *args):
-        GLib.idle_add(lambda: getattr(self.win, method)(*args) or False)
-
-    def manual_ips(self):
-        return list(self.win.cfg.get("manual_ips", []))
-
-    def hello_at(self, host, timeout=2.5):
-        """Asks one address directly (works across VLANs / routed networks where broadcasts don't reach).
-        Returns (peer, None) or (None, reason)."""
-        import http.client
-        reason = "no answer"
-        for port in NEARBY_TCP_PORTS[:-1]:
-            try:
-                c = http.client.HTTPConnection(host, port, timeout=timeout)
-                c.request("GET", "/hello")
-                r = c.getresponse()
-                data = json.loads(r.read() or b"{}")
-                c.close()
-            except (OSError, ValueError):
-                continue
-            if data.get("app") == "arckad-d" and isinstance(data.get("port"), int) and data["port"] > 0:
-                if data.get("id") == self.id:
-                    return None, "that's this computer"
-                ip = socket.gethostbyname(host)
-                peer = {"id": str(data.get("id"))[:40], "name": str(data.get("name") or host)[:40],
-                        "os": str(data.get("os") or "")[:10], "ip": ip, "port": data["port"],
-                        "seen": time.time(), "manual": True}
-                with self.lock:
-                    self.peers[peer["id"]] = peer
-                return peer, None
-            if r.status == 403:
-                reason = "Arckad-D is there, but its Receive is turned off"
-        return None, reason
-
-    def _check_manual(self):
-        try:
-            changed = False
-            for host in self.manual_ips():
-                self._send({"type": "probe"}, host)          # if UDP gets through, it answers the normal way
-                before = {k for k in self.peers}
-                peer, _ = self.hello_at(host, timeout=2)
-                if peer and peer["id"] not in before:
-                    changed = True
-            if changed:
-                self.ui("on_peers_changed")
-        finally:
-            self.manual_busy = False
+        self.last_beacon = self.last_probe = self.last_expire = 0
 
     def name(self):
         return (self.win.cfg.get("device_name") or socket.gethostname() or "My computer").strip()[:40]
@@ -4107,14 +3788,10 @@ class Nearby:
         if self.scanning and now - self.last_probe > 3:
             self.last_probe = now
             self._send({"type": "probe"})
-        if self.scanning and self.manual_ips() and not self.manual_busy and now - self.last_manual > 4:
-            self.last_manual = now
-            self.manual_busy = True
-            threading.Thread(target=self._check_manual, daemon=True).start()
         if now - self.last_expire > 2:
             self.last_expire = now
             with self.lock:
-                gone = [k for k, p in self.peers.items() if now - p["seen"] > (12 if p.get("manual") else 8)]
+                gone = [k for k, p in self.peers.items() if now - p["seen"] > 8]
                 for k in gone:
                     del self.peers[k]
             if gone:
@@ -4204,7 +3881,6 @@ class ShareWindow(Gtk.Window):
         recv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)         # Receive tab
         self.tabs.add_titled(box, "send", "📤  Send")
         self.tabs.add_titled(recv, "receive", "📥  Receive")
-        self.tabs.add_titled(self._paired_page(), "paired", "🔗  Paired")
 
         # ---- files
         head = Gtk.Box(spacing=6)
@@ -4285,14 +3961,6 @@ class ShareWindow(Gtk.Window):
         open_recv.connect("clicked", lambda *_: self.win.open_path(str(received_dir())))
         name_row.add(open_recv)
         box.add(name_row)
-        addr_row = Gtk.Box(spacing=6)
-        self.addr_label = Gtk.Label(xalign=0, hexpand=True, wrap=True, selectable=True)
-        addr_row.pack_start(self.addr_label, True, True, 0)
-        copy_addr = Gtk.Button(label="Copy")
-        copy_addr.set_tooltip_text("Copy this address, to paste into a chat or read out")
-        copy_addr.connect("clicked", lambda *_: self.win.copy_text(lan_addresses()[0]))
-        addr_row.add(copy_addr)
-        box.add(addr_row)
         box = outer
 
         # ---- activity (shared by both tabs)
@@ -4341,78 +4009,7 @@ class ShareWindow(Gtk.Window):
         self.progress = Gtk.ProgressBar(show_text=True)
         self.progress.set_no_show_all(True)
         page.add(self.progress)
-
-        ip_head = Gtk.Label(xalign=0, wrap=True, margin_top=6)
-        ip_head.set_markup("<b>On another network or VLAN?</b>  Add its IP address (Receive must be on there).")
-        page.add(ip_head)
-        ip_row = Gtk.Box(spacing=6)
-        self.ip_entry = Gtk.Entry(placeholder_text="IP address, e.g. 10.20.5.14", hexpand=True)
-        self.ip_entry.connect("activate", lambda *_: self.add_ip())
-        ip_row.pack_start(self.ip_entry, True, True, 0)
-        self.ip_btn = Gtk.Button(label="Add")
-        self.ip_btn.connect("clicked", lambda *_: self.add_ip())
-        ip_row.add(self.ip_btn)
-        page.add(ip_row)
-        self.ip_status = Gtk.Label(xalign=0, wrap=True)
-        self.ip_status.get_style_context().add_class("dim-label")
-        page.add(self.ip_status)
-        self.saved_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4,
-                                     column_spacing=6, row_spacing=6)
-        page.add(self.saved_box)
-        self.my_addr = Gtk.Label(xalign=0, wrap=True, selectable=True)
-        self.my_addr.get_style_context().add_class("dim-label")
-        page.add(self.my_addr)
-        self.refresh_saved()
         return page
-
-    def refresh_saved(self):
-        for c in self.saved_box.get_children():
-            self.saved_box.remove(c)
-        for host in self.nearby.manual_ips():
-            chip = Gtk.Box(spacing=2)
-            chip.add(Gtk.Label(label=host))
-            x = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
-            x.set_relief(Gtk.ReliefStyle.NONE)
-            x.set_tooltip_text(f"Forget {host}")
-            x.connect("clicked", lambda _b, h=host: self.remove_ip(h))
-            chip.add(x)
-            self.saved_box.add(chip)
-        self.saved_box.show_all()
-
-    def remove_ip(self, host):
-        self.win.cfg["manual_ips"] = [h for h in self.nearby.manual_ips() if h != host]
-        write_json(CONFIG_FILE, self.win.cfg)
-        self.refresh_saved()
-
-    def add_ip(self):
-        host = self.ip_entry.get_text().strip()
-        if not host or " " in host:
-            return
-        self.ip_btn.set_sensitive(False)
-        self.ip_status.set_text(f"Checking {host}…")
-
-        def work():
-            peer, reason = self.nearby.hello_at(host)
-            GLib.idle_add(done, peer, reason)
-
-        def done(peer, reason):
-            self.ip_btn.set_sensitive(True)
-            if peer:
-                ips = self.nearby.manual_ips()
-                if host not in ips:
-                    self.win.cfg["manual_ips"] = ips + [host]
-                    write_json(CONFIG_FILE, self.win.cfg)
-                self.ip_entry.set_text("")
-                self.ip_status.set_text(f"✓ Found {peer['name']} ({peer['os']}) at {host}. It's saved and appears "
-                                        "above whenever its Receive is on.")
-                self.refresh_saved()
-                self.refresh_peers()
-            else:
-                self.ip_status.set_text(f"✗ No Arckad-D answered at {host} ({reason}). On that device: open Arckad-D "
-                                        "and turn Receive on. The firewall must allow TCP ports 47821–47823 "
-                                        "between the networks (a working ping isn't enough).")
-            return False
-        threading.Thread(target=work, daemon=True).start()
 
     def refresh_peers(self):
         for row in self.peer_box.get_children():
@@ -4422,8 +4019,7 @@ class ShareWindow(Gtk.Window):
             icon = Gtk.Image.new_from_icon_name("computer-symbolic", Gtk.IconSize.DND)
             row.add(icon)
             lbl = Gtk.Label(xalign=0, hexpand=True)
-            how = " · by IP" if peer.get("manual") else ""
-            lbl.set_markup(f"<b>{esc(peer['name'])}</b>\n<small>{esc(peer['os'])} · {esc(peer['ip'])}{how}</small>")
+            lbl.set_markup(f"<b>{esc(peer['name'])}</b>\n<small>{esc(peer['os'])} · {esc(peer['ip'])}</small>")
             row.pack_start(lbl, True, True, 0)
             btn = Gtk.Button(label="Send")
             btn.get_style_context().add_class("suggested-action")
@@ -4461,221 +4057,6 @@ class ShareWindow(Gtk.Window):
             self.progress.set_text(f"Sent to {peer['name']} ✓")
             self.log_line(f"✓ Sent everything to {peer['name']}")
             self.win.active.flash(f"Sent to {peer['name']}")
-        return False
-
-    # ---------- paired devices page (private, encrypted; separate from Nearby and Quick Share)
-    def _paired_page(self):
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        intro = Gtk.Label(xalign=0, wrap=True)
-        intro.set_markup("<big><b>Paired devices</b></big>\nPair once with a 6-digit code. After that, paired devices "
-                         "find each other by themselves, even after a restart or when their IP address changes. "
-                         "They're invisible to everyone else, and every file is <b>encrypted</b>.")
-        page.add(intro)
-        self.pair_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        ph = Gtk.Label(label="No paired devices yet. Pair one below.", margin=16)
-        ph.get_style_context().add_class("dim-label")
-        ph.show()
-        self.pair_list.set_placeholder(ph)
-        frame = Gtk.Frame()
-        frame.add(self.pair_list)
-        page.add(frame)
-        hint = Gtk.Label(xalign=0, wrap=True)
-        hint.set_markup("<small>“Send” sends the files listed on the <b>Send</b> tab.</small>")
-        hint.get_style_context().add_class("dim-label")
-        page.add(hint)
-        self.pair_progress = Gtk.ProgressBar(show_text=True)
-        self.pair_progress.set_no_show_all(True)
-        page.add(self.pair_progress)
-
-        page.add(Gtk.Separator(margin_top=6))
-        head = Gtk.Label(xalign=0)
-        head.set_markup("<b>Pair a new device</b>")
-        page.add(head)
-        btns = Gtk.Box(spacing=8, homogeneous=True)
-        show_code = Gtk.Button(label="Show a pairing code")
-        show_code.get_style_context().add_class("suggested-action")
-        show_code.connect("clicked", lambda *_: self.show_pair_code())
-        enter_code = Gtk.Button(label="I have a code")
-        enter_code.connect("clicked", lambda *_: self.toggle_code_entry())
-        btns.add(show_code)
-        btns.add(enter_code)
-        page.add(btns)
-        self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        self.code_label = Gtk.Label(selectable=True)
-        self.code_info = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
-        self.code_box.add(self.code_label)
-        self.code_box.add(self.code_info)
-        cancel = Gtk.Button(label="Stop pairing", halign=Gtk.Align.CENTER)
-        cancel.connect("clicked", lambda *_: self.stop_pair_code())
-        self.code_box.add(cancel)
-        self.code_box.set_no_show_all(True)
-        page.add(self.code_box)
-        self.code_entry_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        row = Gtk.Box(spacing=6)
-        self.code_entry = Gtk.Entry(placeholder_text="6-digit code", max_length=6, width_chars=10)
-        self.code_entry.set_input_purpose(Gtk.InputPurpose.DIGITS)
-        self.code_entry.connect("activate", lambda *_: self.do_pair())
-        self.code_ip = Gtk.Entry(placeholder_text="its IP (only if on another network)", hexpand=True)
-        self.pair_btn = Gtk.Button(label="Pair")
-        self.pair_btn.get_style_context().add_class("suggested-action")
-        self.pair_btn.connect("clicked", lambda *_: self.do_pair())
-        row.add(self.code_entry)
-        row.pack_start(self.code_ip, True, True, 0)
-        row.add(self.pair_btn)
-        self.code_entry_box.add(row)
-        self.pair_status = Gtk.Label(xalign=0, wrap=True)
-        self.code_entry_box.add(self.pair_status)
-        self.code_entry_box.set_no_show_all(True)
-        page.add(self.code_entry_box)
-        self.refresh_pairs()
-        return page
-
-    def toggle_code_entry(self):
-        """Show / hide the code box. (It starts hidden, so its contents must be revealed too.)"""
-        if self.code_entry_box.get_visible():
-            self.code_entry_box.hide()
-            return
-        self.code_entry_box.set_no_show_all(False)
-        self.code_entry_box.show_all()
-        self.pair_status.set_text("Type the 6-digit code shown on the other device.")
-        self.code_entry.grab_focus()
-
-    def refresh_pairs(self):
-        pr = self.win.paired
-        for r in self.pair_list.get_children():
-            self.pair_list.remove(r)
-        for p in sorted(pr.pairs(), key=lambda x: x["name"].lower()):
-            online = pr.is_online(p["id"])
-            row = Gtk.Box(spacing=10, margin=8)
-            icon = "phone-symbolic" if p.get("os") == "Android" else "computer-symbolic"
-            row.add(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DND))
-            lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
-            ip = (pr.online.get(p["id"]) or {}).get("ip") or p.get("last_ip") or "?"
-            state = (f"<span foreground='#2ec27e'>● Online</span> · {esc(ip)}" if online
-                     else f"<span foreground='#9a9996'>● Offline</span> · last seen at {esc(ip)}")
-            lbl.set_markup(f"<b>{esc(p['name'])}</b>  <small>🔒 {esc(p.get('os', ''))}</small>\n<small>{state}</small>")
-            row.pack_start(lbl, True, True, 0)
-            auto = Gtk.CheckButton(label="Auto-accept")
-            auto.set_tooltip_text(f"Save files from {p['name']} without asking")
-            auto.set_active(bool(p.get("auto_accept")))
-            auto.connect("toggled", lambda b, pid=p["id"]: self.set_auto_accept(pid, b.get_active()))
-            row.add(auto)
-            send = Gtk.Button(label="Send")
-            send.get_style_context().add_class("suggested-action")
-            send.set_sensitive(online and not getattr(self, "pair_sending", False))
-            send.set_tooltip_text("Send the files on the Send tab" if online else "Waiting for it to come online")
-            send.connect("clicked", lambda _b, pid=p["id"]: self.send_paired(pid))
-            row.add(send)
-            detach = Gtk.Button(label="Detach")
-            detach.connect("clicked", lambda _b, pid=p["id"], n=p["name"]: self.detach_pair(pid, n))
-            row.add(detach)
-            self.pair_list.add(row)
-        self.pair_list.show_all()
-
-    def set_auto_accept(self, pid, on):
-        p = self.win.paired.pair(pid)
-        if p:
-            p["auto_accept"] = on
-            self.win.paired.save()
-
-    def show_pair_code(self):
-        try:
-            code = self.win.paired.new_code()
-        except OSError as ex:
-            self.win.error(f"Couldn't start pairing: {ex}")
-            return
-        self.code_label.set_markup(f"<span size='xx-large' weight='bold' letter_spacing='6000'>{code[:3]} {code[3:]}</span>")
-        self.code_box.set_no_show_all(False)
-        self.code_box.show_all()
-        self.code_entry_box.hide()
-        self._tick_code()
-        GLib.timeout_add_seconds(1, self._tick_code)
-
-    def _tick_code(self):
-        pr = self.win.paired
-        if not pr.code_active():
-            self.code_box.hide()
-            return False
-        left = int(pr.code_until - time.time())
-        ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
-        self.code_info.set_markup(f"On the other device: <b>Paired → I have a code</b>, and type this code.\n"
-                                  f"<small>Valid for {left // 60}:{left % 60:02d} · this computer is "
-                                  f"{esc(ips[0] if ips else '?')} (needed only from another network)</small>")
-        return True
-
-    def stop_pair_code(self):
-        self.win.paired.cancel_code()
-        self.code_box.hide()
-
-    def do_pair(self):
-        code = "".join(c for c in self.code_entry.get_text() if c.isdigit())
-        if len(code) != 6:
-            self.pair_status.set_text("The code has 6 digits.")
-            return
-        host = self.code_ip.get_text().strip() or None
-        self.pair_btn.set_sensitive(False)
-        self.pair_status.set_text("Looking for the device showing this code…")
-
-        def work():
-            ok, msg = self.win.paired.guest_pair(code, host)
-            GLib.idle_add(done, ok, msg)
-
-        def done(ok, msg):
-            self.pair_btn.set_sensitive(True)
-            if ok:
-                self.pair_status.set_text(f"✓ Paired with {msg}. It will connect by itself from now on.")
-                self.code_entry.set_text("")
-                self.code_ip.set_text("")
-                self.log_line(f"🔗 Paired with {msg}")
-            else:
-                self.pair_status.set_text(f"✗ {msg}")
-            self.refresh_pairs()
-            return False
-        threading.Thread(target=work, daemon=True).start()
-
-    def detach_pair(self, pid, name):
-        if not self.win.confirm(f"Detach {name}?\n\nThe two devices stop connecting to each other. "
-                                "To share again, pair with a new code.", parent=self):
-            return
-
-        def work():
-            told = self.win.paired.detach(pid)
-            GLib.idle_add(done, told)
-
-        def done(told):
-            self.log_line(f"Detached {name}" + ("" if told else " (it was offline: it detaches there when it next connects)"))
-            self.refresh_pairs()
-            return False
-        threading.Thread(target=work, daemon=True).start()
-
-    def send_paired(self, pid):
-        paths = self.share.snapshot()
-        if not paths:
-            self.win.info("Add some files on the Send tab first (Add selected / Add files…), then click Send here.")
-            return
-        self.pair_sending = True
-        self.refresh_pairs()
-        self.pair_progress.show()
-        self.pair_progress.set_fraction(0)
-        self.win.paired.send(pid, paths, self.on_pair_progress, self.on_pair_done)
-
-    def on_pair_progress(self, sent, total, text):
-        self.pair_progress.set_fraction(sent / total if total else 1)
-        self.pair_progress.set_text(f"{text}  {human_size(sent)} / {human_size(total)}")
-        return False
-
-    def on_pair_done(self, pid, error):
-        self.pair_sending = False
-        p = self.win.paired.pair(pid)
-        name = p["name"] if p else "the paired device"
-        if error:
-            self.pair_progress.set_text(error)
-            self.log_line("⚠ " + error)
-        else:
-            self.pair_progress.set_fraction(1)
-            self.pair_progress.set_text(f"Sent to {name} ✓ (encrypted)")
-            self.log_line(f"✓ Sent to {name} (encrypted)")
-        self.refresh_pairs()
         return False
 
     # ---------- link page
@@ -4757,20 +4138,7 @@ class ShareWindow(Gtk.Window):
             self.store.append([icon_for(p, is_dir), os.path.basename(p.rstrip("/\\")), size, p])
         self.update_state()
 
-    def refresh_addresses(self):
-        ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
-        if not ips:
-            self.addr_label.set_markup("<b>This computer's IP address:</b> not connected to a network")
-            self.my_addr.set_text("")
-            return
-        extra = f"  <small>(also {esc(', '.join(ips[1:]))})</small>" if len(ips) > 1 else ""
-        self.addr_label.set_markup(f"<b>This computer's IP address:</b>  <big><b>{esc(ips[0])}</b></big>{extra}\n"
-                                   "<small>On another network or VLAN, the sender types this under Send.</small>")
-        self.my_addr.set_markup(f"<small>This computer is <b>{esc(ips[0])}</b>"
-                                + (f" (also {esc(', '.join(ips[1:]))})" if len(ips) > 1 else "") + "</small>")
-
     def on_mapped(self):
-        self.refresh_addresses()
         try:
             self.nearby.start_scan()
         except OSError as ex:
@@ -4864,9 +4232,6 @@ class ShareWindow(Gtk.Window):
             self.link_box.set_no_show_all(True)
 
         visible = self.nearby.visible()
-        if time.time() - getattr(self, "_addr_at", 0) > 10:      # the address can change (Wi-Fi ↔ cable)
-            self._addr_at = time.time()
-            self.refresh_addresses()
         self._sync_switch(self.vis_switch, self.on_vis_switch, visible)
         if visible:
             left = self.nearby.remaining()
@@ -4880,634 +4245,6 @@ class ShareWindow(Gtk.Window):
         buf = self.log.get_buffer()
         buf.insert(buf.get_end_iter(), f"{datetime.now().strftime('%H:%M:%S')}  {text}\n")
         self.log.scroll_to_iter(buf.get_end_iter(), 0, False, 0, 0)
-
-
-# ---------------------------------------------------------------- Paired devices (private, encrypted)
-# Separate from Quick Share and Nearby: own ports, no open discovery. Two devices pair once with a
-# 6-digit code (Diffie-Hellman key exchange, confirmed by the code on both sides); afterwards they find
-# each other by secret beacons (works after restarts and IP changes) and every request and file is
-# encrypted and authenticated with the shared key. Detach forgets the key on both sides.
-import hmac as hmacmod
-
-PAIR_UDP_PORT = 47830
-PAIR_TCP_PORTS = (47831, 47832, 47833, 0)
-PAIR_CODE_SECONDS = 120
-DH_P = int(
-    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD"
-    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
-    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
-    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
-    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
-    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)                       # RFC 3526 group 14 (2048-bit safe prime)
-
-
-def _hm(key, *parts):
-    msg = b"|".join(p if isinstance(p, bytes) else str(p).encode("utf-8") for p in parts)
-    return hmacmod.new(key, msg, hashlib.sha256).digest()
-
-
-class StreamCipher:
-    """Counter-mode keystream from SHA-256(key ‖ nonce ‖ counter), XORed with the data."""
-
-    def __init__(self, key, nonce=b"\0" * 16):
-        self.base = hashlib.sha256(key + nonce)
-        self.counter = 0
-        self.left = b""
-
-    def apply(self, data):
-        n = len(data)
-        need = n - len(self.left)
-        blocks = []
-        while need > 0:
-            h = self.base.copy()
-            h.update(self.counter.to_bytes(8, "big"))
-            blocks.append(h.digest())
-            self.counter += 1
-            need -= 32
-        ks = self.left + b"".join(blocks)
-        self.left = ks[n:]
-        return (int.from_bytes(data, "big") ^ int.from_bytes(ks[:n], "big")).to_bytes(n, "big") if n else b""
-
-
-def seal(key, data):
-    """Encrypt + authenticate a small message: nonce ‖ ciphertext ‖ tag."""
-    nonce = secrets.token_bytes(16)
-    ct = StreamCipher(_hm(key, "seal-enc", nonce), nonce).apply(data)
-    return nonce + ct + _hm(_hm(key, "seal-mac", nonce), nonce + ct)
-
-
-def unseal(key, blob):
-    if len(blob) < 48:
-        raise ValueError("message too short")
-    nonce, ct, tag = blob[:16], blob[16:-32], blob[-32:]
-    if not hmacmod.compare_digest(tag, _hm(_hm(key, "seal-mac", nonce), nonce + ct)):
-        raise ValueError("message not from the paired device")
-    return StreamCipher(_hm(key, "seal-enc", nonce), nonce).apply(ct)
-
-
-def beacon_tag(key, sender_id, bucket):
-    return _hm(key, "beacon", sender_id, bucket).hex()[:24]
-
-
-def make_pair_handler(pr):
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "Arckad-D"
-
-        def log_message(self, *args):
-            pass
-
-        def _raw(self, code, body, ctype="application/octet-stream"):
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def _plain(self, code, obj):
-            self._raw(code, json.dumps(obj).encode(), "application/json")
-
-        def _body(self, limit=5_000_000):
-            n = int(self.headers.get("Content-Length") or 0)
-            if n < 0 or n > limit:
-                raise ValueError("too large")
-            return self.rfile.read(n) if n else b""
-
-        def _auth(self):
-            """The paired device that signed this request, or None."""
-            pid = self.headers.get("X-Pair-From", "")
-            pair = pr.pair(pid)
-            if not pair:
-                return None
-            try:
-                ts = int(self.headers.get("X-Pair-Time", "0"))
-            except ValueError:
-                return None
-            if abs(time.time() - ts) > 600:
-                return None
-            sig = _hm(pr.key(pid), self.command, self.path, ts).hex()
-            if not hmacmod.compare_digest(sig, self.headers.get("X-Pair-Sig", "")):
-                return None
-            pair["ip"] = self.client_address[0]
-            pr.mark_seen(pid, self.client_address[0], pair.get("port"))
-            return pair
-
-        def do_POST(self):
-            try:
-                self._post()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                pass
-            except ValueError:
-                self._plain(400, {"ok": False})
-
-        def do_PUT(self):
-            try:
-                self._put()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                pass
-
-        def _post(self):
-            path = self.path.split("?")[0]
-            if path == "/pair/start":                     # step 1: exchange keys (needs the code to be shown)
-                if not pr.code_active():
-                    return self._plain(403, {"ok": False, "reason": "no pairing code is shown on that device"})
-                req = json.loads(self._body(100_000))
-                reply = pr.host_start(req, self.client_address[0])
-                return self._plain(200 if reply.get("ok") else 403, reply)
-            if path == "/pair/confirm":                   # step 2: prove both know the code, user confirms
-                req = json.loads(self._body(100_000))
-                reply = pr.host_confirm(req, self.client_address[0])
-                return self._plain(200 if reply.get("ok") else 403, reply)
-            pair = self._auth()
-            if pair is None:
-                return self._plain(401, {"ok": False, "reason": "not paired"})
-            key = pr.key(pair["id"])
-            if path == "/p/hello":
-                return self._raw(200, seal(key, json.dumps({"ok": True, "name": pr.name(), "os": OS_NAME,
-                                                            "port": pr.port}).encode()))
-            if path == "/p/detach":
-                pr.forget(pair["id"], tell=False)
-                pr.ui("on_pair_event", f"{pair['name']} detached from this device")
-                return self._raw(200, seal(key, b'{"ok": true}'))
-            if path == "/p/offer":
-                offer = json.loads(unseal(key, self._body()))
-                files = []
-                for f in (offer.get("files") or [])[:20000]:
-                    rel, size = safe_rel_parts(f.get("path", "")), f.get("size")
-                    if rel is None or not isinstance(size, int) or size < 0:
-                        return self._raw(400, seal(key, b'{"ok": false, "reason": "bad file name"}'))
-                    files.append((rel, size))
-                if not files:
-                    return self._raw(400, seal(key, b'{"ok": false, "reason": "no files"}'))
-                req = {"from": pair["name"], "os": pair.get("os", ""), "ip": self.client_address[0],
-                       "files": files, "total": sum(s for _, s in files), "event": threading.Event(),
-                       "accepted": False, "paired": True, "pair_id": pair["id"]}
-                if pair.get("auto_accept"):
-                    req["accepted"] = True
-                    req["event"].set()
-                else:
-                    pr.ui("ask_incoming", req)
-                    req["event"].wait(90)
-                if not req["accepted"]:
-                    return self._raw(403, seal(key, b'{"ok": false, "reason": "declined"}'))
-                req["dest"] = plan_destinations(files)
-                req["received"], req["done_files"] = 0, 0
-                token = secrets.token_hex(12)
-                pr.transfers[token] = req
-                return self._raw(200, seal(key, json.dumps({"ok": True, "token": token}).encode()))
-            parts = [p for p in path.split("/") if p]
-            if len(parts) == 3 and parts[:2] == ["p", "done"]:
-                req = pr.transfers.pop(parts[2], None)
-                if not req:
-                    return self._raw(404, seal(key, b'{"ok": false}'))
-                pr.ui("on_nearby_received", req)
-                return self._raw(200, seal(key, b'{"ok": true}'))
-            return self._raw(404, seal(key, b'{"ok": false}'))
-
-        def _put(self):
-            pair = self._auth()
-            if pair is None:
-                return self._plain(401, {"ok": False, "reason": "not paired"})
-            parts = [p for p in self.path.split("/") if p]
-            if len(parts) != 4 or parts[:2] != ["p", "upload"] or not parts[3].isdigit():
-                return self._plain(404, {"ok": False})
-            req, i = pr.transfers.get(parts[2]), int(parts[3])
-            if not req or i >= len(req["files"]) or req.get("pair_id") != pair["id"]:
-                return self._plain(404, {"ok": False})
-            size = req["files"][i][1]
-            if int(self.headers.get("Content-Length") or -1) != size + 32:
-                return self._plain(400, {"ok": False, "reason": "size mismatch"})
-            key = pr.key(pair["id"])
-            cipher = StreamCipher(_hm(key, "file", parts[2], i))
-            mac = hmacmod.new(_hm(key, "file-mac", parts[2], i), digestmod=hashlib.sha256)
-            dest = req["dest"][i]
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            tmp = dest.with_name(dest.name + ".part")
-            left = size
-            with open(tmp, "wb") as f:
-                while left > 0:
-                    chunk = self.rfile.read(min(1 << 18, left))
-                    if not chunk:
-                        break
-                    mac.update(chunk)
-                    f.write(cipher.apply(chunk))
-                    left -= len(chunk)
-                    req["received"] += len(chunk)
-            tag = self.rfile.read(32)
-            if left or not hmacmod.compare_digest(tag, mac.digest()):
-                tmp.unlink()
-                return self._plain(400, {"ok": False, "reason": "file damaged or not from the paired device"})
-            os.replace(tmp, dest)
-            req["done_files"] += 1
-            pr.ui("on_nearby_progress", req)
-            return self._plain(200, {"ok": True})
-    return Handler
-
-
-class Paired:
-    """Private, encrypted sharing between devices paired with a 6-digit code."""
-
-    def __init__(self, win):
-        self.win = win
-        self.id = win.cfg["device_id"] if win.cfg.get("device_id") else None
-        self.server, self.port, self.udp = None, 0, None
-        self.online = {}                                   # pair id -> {"ip", "port", "seen"}
-        self.transfers = {}
-        self.lock = threading.Lock()
-        self.code, self.code_until, self.code_tries = None, 0, 0
-        self.pending = {}                                  # guest id -> pairing state (host side)
-        self.last_beacon = self.last_direct = 0
-        self.running = False
-        self._keys = {}
-        self.code_seen = {}                                # pairing-beacon hash -> (ip, port, time)
-
-    # ---------- stored pairs (secret keys live in the config file, which only you can read)
-    def pairs(self):
-        return self.win.cfg.setdefault("pairs", [])
-
-    def pair(self, pid):
-        for p in self.pairs():
-            if p["id"] == pid:
-                return p
-        return None
-
-    def key(self, pid):
-        k = self._keys.get(pid)
-        if k is None:
-            p = self.pair(pid)
-            k = bytes.fromhex(p["secret"]) if p else None
-            if k:
-                self._keys[pid] = k
-        return k
-
-    def save(self):
-        with self.lock:
-            write_json(CONFIG_FILE, self.win.cfg)
-        if not IS_WIN:
-            try:
-                os.chmod(CONFIG_FILE, 0o600)
-            except OSError:
-                pass
-
-    def name(self):
-        return self.win.nearby.name()
-
-    def ui(self, method, *args):
-        GLib.idle_add(lambda: getattr(self.win, method)(*args) or False)
-
-    def is_online(self, pid):
-        o = self.online.get(pid)
-        return bool(o) and time.time() - o["seen"] < 12
-
-    def mark_seen(self, pid, ip, port):
-        was = self.is_online(pid)
-        self.online[pid] = {"ip": ip, "port": port or (self.online.get(pid) or {}).get("port"), "seen": time.time()}
-        p = self.pair(pid)
-        if p and (p.get("last_ip") != ip or (port and p.get("port") != port)):
-            p["last_ip"] = ip
-            if port:
-                p["port"] = port
-            self.save()
-        if not was:
-            self.ui("on_pairs_changed")
-
-    # ---------- start / stop (runs while Arckad-D is open, if there are pairs or a code is shown)
-    def ensure_running(self):
-        if self.running:
-            return
-        self.id = self.win.cfg["device_id"]
-        for port in PAIR_TCP_PORTS:
-            try:
-                self.server = ThreadingHTTPServer(("0.0.0.0", port), make_pair_handler(self))
-                break
-            except OSError:
-                continue
-        if self.server is None:
-            raise OSError("no free network port")
-        self.server.daemon_threads = True
-        self.port = self.server.server_address[1]
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.bind(("", PAIR_UDP_PORT))
-        s.settimeout(0.5)
-        self.udp = s
-        self.running = True
-        threading.Thread(target=self._loop, args=(s,), daemon=True).start()
-
-    def stop(self):
-        self.running = False
-        if self.server:
-            srv, self.server = self.server, None
-            threading.Thread(target=lambda: (srv.shutdown(), srv.server_close()), daemon=True).start()
-        if self.udp:
-            u, self.udp = self.udp, None
-            try:
-                u.close()
-            except OSError:
-                pass
-
-    # ---------- secret beacons: only paired devices can recognise them
-    def _beacon(self):
-        bucket = int(time.time() // 30)
-        tags = [beacon_tag(self.key(p["id"]), self.id, bucket) for p in self.pairs()]
-        msg = {"app": "arckad-pair", "v": 1, "port": self.port, "tags": tags}
-        if self.code_active():
-            msg["pairing"] = hashlib.sha256(f"arckad-pair-code|{self.code}".encode()).hexdigest()[:20]
-        return json.dumps(msg).encode()
-
-    def _send_beacon(self, targets):
-        data = self._beacon()
-        for t in targets:
-            try:
-                self.udp.sendto(data, (t, PAIR_UDP_PORT))
-            except (OSError, AttributeError):
-                pass
-
-    def _loop(self, s):
-        while self.udp is s:
-            try:
-                data, addr = s.recvfrom(16384)
-                self._handle_udp(data, addr[0])
-            except socket.timeout:
-                pass
-            except OSError:
-                break
-            now = time.time()
-            if (self.pairs() or self.code_active()) and now - self.last_beacon > 3:
-                self.last_beacon = now
-                self._send_beacon({"255.255.255.255"} | {ip.rsplit(".", 1)[0] + ".255" for ip in lan_addresses()
-                                                         if ip.count(".") == 3})
-            if now - self.last_direct > 6:          # also knock on last known addresses (other VLANs)
-                self.last_direct = now
-                self._send_beacon({p["last_ip"] for p in self.pairs() if p.get("last_ip")})
-            for pid in list(self.online):
-                if not self.is_online(pid) and now - self.online[pid]["seen"] < 14:
-                    self.online[pid]["seen"] -= 100       # report the change only once
-                    self.ui("on_pairs_changed")
-
-    def _handle_udp(self, data, ip):
-        try:
-            msg = json.loads(data.decode("utf-8"))
-        except ValueError:
-            return
-        if not isinstance(msg, dict) or msg.get("app") != "arckad-pair":
-            return
-        if msg.get("pairing") and msg.get("port"):
-            self.code_seen[str(msg["pairing"])] = (ip, int(msg["port"]), time.time())
-        tags = set(msg.get("tags") or [])
-        if not tags:
-            return
-        bucket = int(time.time() // 30)
-        for p in self.pairs():
-            key = self.key(p["id"])
-            if beacon_tag(key, p["id"], bucket) in tags or beacon_tag(key, p["id"], bucket - 1) in tags:
-                was = self.is_online(p["id"])
-                self.mark_seen(p["id"], ip, msg.get("port"))
-                if not was:
-                    self._send_beacon({ip})               # answer directly so it finds us quickly too
-
-    # ---------- pairing: host side (shows the code)
-    def new_code(self):
-        self.ensure_running()
-        self.code = f"{secrets.randbelow(1_000_000):06d}"
-        self.code_until = time.time() + PAIR_CODE_SECONDS
-        self.code_tries = 0
-        self.pending.clear()
-        self.last_beacon = 0
-        return self.code
-
-    def code_active(self):
-        return self.code is not None and time.time() < self.code_until
-
-    def cancel_code(self):
-        self.code = None
-
-    def host_start(self, req, ip):
-        try:
-            gid, gpub = str(req["id"])[:40], int(req["pub"], 16)
-        except (KeyError, ValueError, TypeError):
-            return {"ok": False, "reason": "bad request"}
-        if not 1 < gpub < DH_P - 1:
-            return {"ok": False, "reason": "bad key"}
-        x = secrets.randbits(320)
-        pub = pow(2, x, DH_P)
-        shared = pow(gpub, x, DH_P).to_bytes(256, "big")
-        key = hashlib.sha256(b"arckad-pair-key|" + shared + gpub.to_bytes(256, "big") + pub.to_bytes(256, "big")).digest()
-        self.pending[gid] = {"key": key, "name": str(req.get("name") or "Unknown")[:40],
-                             "os": str(req.get("os") or "")[:10], "ip": ip, "port": req.get("port")}
-        return {"ok": True, "id": self.id, "name": self.name(), "os": OS_NAME, "pub": format(pub, "x"), "port": self.port}
-
-    def host_confirm(self, req, ip):
-        gid = str(req.get("id", ""))[:40]
-        st = self.pending.get(gid)
-        if not st or not self.code_active():
-            return {"ok": False, "reason": "the code has expired; show a new one"}
-        expect = _hm(st["key"], "guest-proof", self.code).hex()
-        if not hmacmod.compare_digest(expect, str(req.get("proof", ""))):
-            self.code_tries += 1
-            if self.code_tries >= 5:
-                self.code = None
-                self.ui("on_pair_event", "Too many wrong codes: pairing stopped. Show a new code to try again.")
-            return {"ok": False, "reason": "wrong code"}
-        ev = {"event": threading.Event(), "accepted": False, "name": st["name"], "os": st["os"], "code": self.code}
-        self.ui("ask_pair", ev)
-        ev["event"].wait(90)
-        if not ev["accepted"]:
-            return {"ok": False, "reason": "the other device declined"}
-        self._store(gid, st["name"], st["os"], st["key"], ip, st.get("port"))
-        proof = _hm(st["key"], "host-proof", self.code).hex()
-        self.code = None
-        self.pending.pop(gid, None)
-        return {"ok": True, "proof": proof}
-
-    def _store(self, pid, name, os_name, key, ip, port):
-        self.forget(pid, tell=False, quiet=True)
-        self._keys[pid] = key
-        self.pairs().append({"id": pid, "name": name, "os": os_name, "secret": key.hex(),
-                             "last_ip": ip, "port": port, "auto_accept": False, "since": time.time()})
-        self.save()
-        self.mark_seen(pid, ip, port)
-        self.ui("on_pairs_changed")
-
-    # ---------- pairing: guest side (types the code)
-    def find_code_host(self, code, wait=8):
-        """Where the device showing this code is: (ip, port) or None. Its beacon only carries a hash of the code."""
-        want = hashlib.sha256(f"arckad-pair-code|{code}".encode()).hexdigest()[:20]
-        end = time.time() + wait
-        while time.time() < end:
-            hit = self.code_seen.get(want)
-            if hit and time.time() - hit[2] < 10:
-                return hit[0], hit[1]
-            time.sleep(0.2)
-        return None
-
-    @staticmethod
-    def _reachable(host, port):
-        try:
-            with socket.create_connection((host, port), timeout=2):
-                return True
-        except OSError:
-            return False
-
-    def guest_pair(self, code, host=None):
-        """Runs in a background thread. Returns (True, name) or (False, reason)."""
-        import http.client
-        self.ensure_running()
-        where = None
-        if host:
-            for port in PAIR_TCP_PORTS[:-1]:
-                if self._reachable(host, port):
-                    where = (socket.gethostbyname(host), port)
-                    break
-        else:
-            where = self.find_code_host(code)
-        if not where:
-            return False, ("No device showing that code was found. Check the code, and that the other device "
-                           "shows it right now (same network, or enter its IP address).")
-        ip, port = where
-        x = secrets.randbits(320)
-        pub = pow(2, x, DH_P)
-
-        def call(path, obj):
-            c = http.client.HTTPConnection(ip, port, timeout=100)
-            c.request("POST", path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
-            r = c.getresponse()
-            data = json.loads(r.read() or b"{}")
-            c.close()
-            return data
-        try:
-            r1 = call("/pair/start", {"id": self.id, "name": self.name(), "os": OS_NAME, "pub": format(pub, "x"),
-                                      "port": self.port})
-            if not r1.get("ok"):
-                return False, r1.get("reason", "the other device refused")
-            hpub = int(r1["pub"], 16)
-            if not 1 < hpub < DH_P - 1:
-                return False, "bad key from the other device"
-            shared = pow(hpub, x, DH_P).to_bytes(256, "big")
-            key = hashlib.sha256(b"arckad-pair-key|" + shared + pub.to_bytes(256, "big") + hpub.to_bytes(256, "big")).digest()
-            r2 = call("/pair/confirm", {"id": self.id, "proof": _hm(key, "guest-proof", code).hex()})
-            if not r2.get("ok"):
-                return False, r2.get("reason", "pairing was not confirmed")
-            if not hmacmod.compare_digest(_hm(key, "host-proof", code).hex(), str(r2.get("proof", ""))):
-                return False, "the other device couldn't prove it knows the code"
-        except (OSError, ValueError, KeyError) as ex:
-            return False, f"connection problem ({ex})"
-        self._store(str(r1["id"])[:40], str(r1.get("name") or ip)[:40], str(r1.get("os") or "")[:10], key, ip,
-                    r1.get("port"))
-        return True, str(r1.get("name") or ip)
-
-    # ---------- talking to a paired device
-    def _request(self, pid, method, path, body=b"", timeout=30, raw_body=False):
-        import http.client
-        p = self.pair(pid)
-        key = self.key(pid)
-        o = self.online.get(pid) or {}
-        ip, port = o.get("ip") or p.get("last_ip"), o.get("port") or p.get("port")
-        if not ip or not port:
-            raise OSError("its address isn't known yet")
-        ts = int(time.time())
-        headers = {"X-Pair-From": self.id, "X-Pair-Time": str(ts),
-                   "X-Pair-Sig": _hm(key, method, path, ts).hex(), "Content-Length": str(len(body))}
-        c = http.client.HTTPConnection(ip, port, timeout=timeout)
-        c.request(method, path, body, headers)
-        r = c.getresponse()
-        data = r.read()
-        c.close()
-        if r.status == 401:
-            raise PermissionError("not paired")
-        return r.status, (data if raw_body else (json.loads(unseal(key, data)) if data else {}))
-
-    def detach(self, pid):
-        """Forget the pair here, and tell the other device if it's reachable."""
-        told = False
-        try:
-            self._request(pid, "POST", "/p/detach", timeout=5)
-            told = True
-        except Exception:
-            pass
-        self.forget(pid, tell=False)
-        return told
-
-    def forget(self, pid, tell=True, quiet=False):
-        before = len(self.pairs())
-        self.win.cfg["pairs"] = [p for p in self.pairs() if p["id"] != pid]
-        self.online.pop(pid, None)
-        self._keys.pop(pid, None)
-        if len(self.pairs()) != before:
-            self.save()
-            if not quiet:
-                self.ui("on_pairs_changed")
-
-    def send(self, pid, paths, progress, done):
-        def work():
-            try:
-                result = self._send_files(pid, files_for_sending(paths), progress)
-            except PermissionError:
-                p = self.pair(pid) or {"name": "the other device"}
-                self.forget(pid)
-                result = f"{p['name']} is no longer paired with this device (it was detached there)."
-            except (OSError, ValueError, KeyError) as ex:
-                result = f"Couldn't reach the paired device. ({ex})"
-            GLib.idle_add(done, pid, result)
-        threading.Thread(target=work, daemon=True).start()
-
-    def _send_files(self, pid, files, progress):
-        import http.client
-        if not files:
-            return "There are no files to send (empty folders are skipped)."
-        p = self.pair(pid)
-        key = self.key(pid)
-        total = sum(f[2] for f in files)
-        GLib.idle_add(progress, 0, total, f"Waiting for {p['name']} to accept…")
-        offer = {"files": [{"path": rel, "size": size} for _, rel, size in files]}
-        status, reply = self._request(pid, "POST", "/p/offer", seal(key, json.dumps(offer).encode()), timeout=100)
-        if not reply.get("ok"):
-            return f"{p['name']} declined or didn't answer." if reply.get("reason") == "declined" else \
-                f"{p['name']} couldn't receive: {reply.get('reason', 'unknown reason')}."
-        token, sent, last = reply["token"], 0, 0
-        o = self.online.get(pid) or {}
-        ip, port = o.get("ip") or p.get("last_ip"), o.get("port") or p.get("port")
-        for i, (src, rel, size) in enumerate(files):
-            path = f"/p/upload/{token}/{i}"
-            ts = int(time.time())
-            c = http.client.HTTPConnection(ip, port, timeout=60)
-            c.putrequest("PUT", path)
-            c.putheader("Content-Length", str(size + 32))
-            c.putheader("X-Pair-From", self.id)
-            c.putheader("X-Pair-Time", str(ts))
-            c.putheader("X-Pair-Sig", _hm(key, "PUT", path, ts).hex())
-            c.endheaders()
-            cipher = StreamCipher(_hm(key, "file", token, i))
-            mac = hmacmod.new(_hm(key, "file-mac", token, i), digestmod=hashlib.sha256)
-            left = size
-            with open(src, "rb") as f:
-                while left > 0:
-                    chunk = f.read(min(1 << 18, left))
-                    if not chunk:
-                        break
-                    enc = cipher.apply(chunk)
-                    mac.update(enc)
-                    c.send(enc)
-                    left -= len(chunk)
-                    sent += len(chunk)
-                    if time.time() - last > 0.2:
-                        last = time.time()
-                        GLib.idle_add(progress, sent, total, f"Sending {rel} (encrypted)…")
-            c.send(mac.digest())
-            r = c.getresponse()
-            r.read()
-            c.close()
-            if r.status != 200 or left:
-                return f"Sending stopped at {rel}."
-        self._request(pid, "POST", f"/p/done/{token}")
-        GLib.idle_add(progress, total, total, "Done")
-        return None
 
 
 # ---------------------------------------------------------------- main window
@@ -5526,8 +4263,6 @@ F2  rename                Delete  move to Trash
 Ctrl+H  hidden files      F5  refresh
 Ctrl+Shift+D  switch theme (system / light / dark)
 Alt+← / Alt+→ / Alt+↑  back, forward, up
-Drag files onto a folder, a tab or the sidebar to move them
-   (hold Ctrl to copy; files dragged in from other apps are copied)
 Middle-click a folder  open it in a new tab
 Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
 
@@ -5540,8 +4275,6 @@ class MainWindow(Gtk.ApplicationWindow):
                              ("preview", True), ("autosort", False), ("autosort_background", False),
                              ("autosort_delay", 5)):
             self.cfg.setdefault(key, default)
-        self.cfg.setdefault("file_icons", "colour" if IS_WIN else "system")
-        ICON_STYLE["colour"] = self.cfg["file_icons"] == "colour" and colour_icons_supported()
         self.set_default_size(*self.cfg.get("size", [1280, 760]))
         self.cfg.setdefault("theme", "system")
         self.active = None
@@ -5552,7 +4285,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self.preview_timer = None
         self.share = QuickShare(on_event=self.on_share_event)
         self.nearby = Nearby(self)
-        self.paired = Paired(self)
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -5564,7 +4296,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self.system_prefer_dark = settings.get_property("gtk-application-prefer-dark-theme")
         self.apply_theme(self.cfg["theme"])
         self._build_ui()
-        self.watch_drives()
         self.connect("key-press-event", self.on_key)
         self.connect("delete-event", self.on_close)
         self.connect("set-focus", self.on_set_focus)
@@ -5591,11 +4322,6 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(60, self.tick)
         self.on_index_updated()
         self.apply_autosort(startup=True)
-        if self.paired.pairs():                       # paired devices reconnect by themselves
-            try:
-                self.paired.ensure_running()
-            except OSError as ex:
-                print(f"{APP_NAME}: paired sharing unavailable: {ex}", file=sys.stderr)
         self.find_last_file(show=True)
         if time.time() - self.cfg.get("update_checked", 0) > 86400:      # quietly, once a day
             GLib.timeout_add_seconds(8, lambda: self.check_updates(manual=False) or False)
@@ -5655,11 +4381,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.hidden_item = Gtk.CheckMenuItem(label="Show hidden files (Ctrl+H)")
         self.hidden_item.set_active(self.cfg["show_hidden"])
         self.hidden_item.connect("toggled", self.on_hidden_toggled)
-        self.icons_item = Gtk.CheckMenuItem(label="Colourful file icons")
-        self.icons_item.set_active(ICON_STYLE["colour"])
-        self.icons_item.connect("toggled", self.on_icons_toggled)
         hb.pack_end(self._menu_button(None, "open-menu-symbolic", [
-            self.hidden_item, self.icons_item, None,
+            self.hidden_item, None,
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
             ("New folder…", lambda: self.new_folder(self.active)),
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
@@ -5747,12 +4470,8 @@ class MainWindow(Gtk.ApplicationWindow):
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.sidebar = Gtk.ListBox()
         self.sidebar.get_style_context().add_class("navigation-sidebar")
-        self.sidebar.connect("row-activated", lambda lb, row: self.sidebar_activate(row))
+        self.sidebar.connect("row-activated", lambda lb, row: self.active.go(row.key))
         self.sidebar.connect("button-press-event", self.on_sidebar_click)
-        self.sidebar.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
-                                   Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
-        self.sidebar.connect("drag-data-received", self.on_sidebar_drop)
-        self.sidebar.connect("drag-motion", self.on_sidebar_motion)
         side_scroll = Gtk.ScrolledWindow(vexpand=True)
         side_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         side_scroll.add(self.sidebar)
@@ -6167,163 +4886,17 @@ class MainWindow(Gtk.ApplicationWindow):
             self._side_header("Right-click a folder → Pin to sidebar", dim=True)
         for p in pinned:
             self._side_row(Path(p).name or p, "folder-symbolic", p, pinned=True)
-        self._side_header("Devices")
+        self._side_header("Other")
         if IS_WIN:
-            for drive in self.windows_drives():
-                label, free = self.drive_info(drive)
-                self._side_row(label, "drive-harddisk-symbolic", drive, sub=free)
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.exists(drive):
+                    self._side_row(f"Drive {letter}:", "drive-harddisk-symbolic", drive)
         else:
-            self._side_row("Computer", "drive-harddisk-symbolic", "/", sub=self.drive_info("/")[1])
-            for kind, obj, name, path in self.linux_devices():
-                icon_widget = obj.get_symbolic_icon() if hasattr(obj, "get_symbolic_icon") else None
-                if kind == "mount":
-                    eject = None
-                    if obj.can_eject() or obj.can_unmount():
-                        eject = Gtk.Button.new_from_icon_name("media-eject-symbolic", Gtk.IconSize.MENU)
-                        eject.set_relief(Gtk.ReliefStyle.NONE)
-                        eject.set_tooltip_text(f"Eject “{name}” so it's safe to remove")
-                        eject.connect("clicked", lambda _b, m=obj, n=name: self.eject(m, n))
-                    self._side_row(name, None, path, sub=self.drive_info(path)[1], gicon=icon_widget, extra=eject)
-                else:                                         # plugged in but not opened yet
-                    row = self._side_row(name, None, "volume:" + name, sub="Not opened yet · click to open",
-                                         gicon=icon_widget)
-                    row.volume = obj
+            self._side_row("Computer", "drive-harddisk-symbolic", "/")
         self.sidebar.show_all()
         self.sync_sidebar()
-
-    # ---------- drives (USB sticks, SD cards, external and extra disks)
-    def watch_drives(self):
-        """Rebuild the Devices list the moment a drive is plugged in, opened, ejected or removed."""
-        self._drive_timer = None
-        if IS_WIN:
-            self._win_drives = self.windows_drives()
-            GLib.timeout_add_seconds(3, self._poll_windows_drives)
-            return
-        self.vm = Gio.VolumeMonitor.get()
-        for sig in ("mount-added", "mount-removed", "mount-changed", "volume-added", "volume-removed",
-                    "volume-changed", "drive-connected", "drive-disconnected"):
-            self.vm.connect(sig, self._drives_changed, sig)
-
-    def _drives_changed(self, monitor, obj, sig):
-        if sig == "mount-added" and hasattr(obj, "get_name"):
-            self.active.flash(f"“{obj.get_name()}” connected: it's in the sidebar under Devices")
-        if sig == "mount-removed":
-            root = obj.get_root().get_path() if obj.get_root() else None
-            if root:
-                for pane in self.all_panes():
-                    loc = pane.location or ""
-                    if is_folder_loc(loc) and (loc == root or loc.startswith(root.rstrip(os.sep) + os.sep)):
-                        pane.go(str(HOME))
-        if self._drive_timer:
-            GLib.source_remove(self._drive_timer)
-        self._drive_timer = GLib.timeout_add(400, self._rebuild_after_drive_change)
-
-    def _rebuild_after_drive_change(self):
-        self._drive_timer = None
-        self.build_sidebar()
-        return False
-
-    def linux_devices(self):
-        """[(kind, object, name, path)]: opened drives first, then plugged-in ones not opened yet."""
-        out, seen = [], set()
-        vm = getattr(self, "vm", None) or Gio.VolumeMonitor.get()
-        for m in vm.get_mounts():
-            try:
-                if m.is_shadowed():
-                    continue
-                root = m.get_root()
-                path = root.get_path() if root else None
-            except Exception:
-                continue
-            if not path or path == "/" or path in seen:
-                continue
-            seen.add(path)
-            out.append(("mount", m, m.get_name(), path))
-        for v in vm.get_volumes():
-            try:
-                if v.get_mount() is None and v.can_mount():
-                    out.append(("volume", v, v.get_name(), None))
-            except Exception:
-                continue
-        return out
-
-    @staticmethod
-    def windows_drives():
-        import string
-        return [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
-
-    def _poll_windows_drives(self):
-        now = self.windows_drives()
-        if now != self._win_drives:
-            added = set(now) - set(self._win_drives)
-            self._win_drives = now
-            self.build_sidebar()
-            if added and self.active:
-                self.active.flash(f"Drive {', '.join(sorted(added))} connected: it's in the sidebar under Devices")
-        return True
-
-    @staticmethod
-    def drive_info(path):
-        """(label, "12.3 GB free of 32 GB") for a drive's folder."""
-        label = path
-        try:
-            info = Gio.File.new_for_path(path).query_filesystem_info("filesystem::free,filesystem::size", None)
-            free, size = info.get_attribute_uint64("filesystem::free"), info.get_attribute_uint64("filesystem::size")
-            text = f"{human_size(free)} free of {human_size(size)}" if size else ""
-        except GLib.Error:
-            text = ""
-        if IS_WIN:
-            try:
-                import ctypes
-                buf = ctypes.create_unicode_buffer(261)
-                ctypes.windll.kernel32.GetVolumeInformationW(path, buf, 261, None, None, None, None, 0)
-                label = f"{buf.value} ({path[:2]})" if buf.value else f"Drive {path[:2]}"
-            except Exception:
-                label = f"Drive {path[:2]}"
-        return label, text
-
-    def sidebar_activate(self, row):
-        key = getattr(row, "key", None)
-        if not key:
-            return
-        volume = getattr(row, "volume", None)
-        if volume is None:
-            self.active.go(key)
-            return
-        name = volume.get_name()
-        self.active.flash(f"Opening “{name}”…")
-        op = Gtk.MountOperation(parent=self)          # asks for a password if the drive is encrypted
-
-        def done(vol, res):
-            try:
-                vol.mount_finish(res)
-            except GLib.Error as ex:
-                self.error(f"Couldn't open “{name}”:\n\n{ex.message}")
-                return
-            mount = vol.get_mount()
-            path = mount.get_root().get_path() if mount and mount.get_root() else None
-            if path:
-                self.active.go(path)
-        volume.mount(Gio.MountMountFlags.NONE, op, None, done)
-
-    def eject(self, mount, name):
-        root = mount.get_root().get_path() if mount.get_root() else None
-        for pane in self.all_panes():                     # leave the drive first, or it counts as "busy"
-            loc = pane.location or ""
-            if root and is_folder_loc(loc) and (loc == root or loc.startswith(root.rstrip(os.sep) + os.sep)):
-                pane.go(str(HOME))
-        op = Gtk.MountOperation(parent=self)
-
-        def done(m, res):
-            try:
-                (m.eject_with_operation_finish if m.can_eject() else m.unmount_with_operation_finish)(res)
-                self.active.flash(f"“{name}” can be safely removed now")
-            except GLib.Error as ex:
-                self.error(f"Couldn't eject “{name}”:\n\n{ex.message}\n\nClose any files from it that are still open, then try again.")
-        if mount.can_eject():
-            mount.eject_with_operation(Gio.MountUnmountFlags.NONE, op, None, done)
-        else:
-            mount.unmount_with_operation(Gio.MountUnmountFlags.NONE, op, None, done)
 
     def _side_header(self, text, dim=False):
         row = Gtk.ListBoxRow(selectable=False, activatable=False)
@@ -6333,32 +4906,20 @@ class MainWindow(Gtk.ApplicationWindow):
         row.add(label)
         self.sidebar.add(row)
 
-    def _side_row(self, text, icon, key, pinned=False, dot=None, sub=None, gicon=None, extra=None):
+    def _side_row(self, text, icon, key, pinned=False, dot=None):
         row = Gtk.ListBoxRow()
         box = Gtk.Box(spacing=8, margin=5, margin_start=10)
         if dot:
             d = Gtk.Label()
             d.set_markup(f'<span foreground="{dot}" size="large">●</span>')
             box.add(d)
-        elif gicon is not None:
-            box.add(Gtk.Image.new_from_gicon(gicon, Gtk.IconSize.MENU))
         else:
-            box.add(Gtk.Image.new_from_icon_name(icon or "drive-removable-media-symbolic", Gtk.IconSize.MENU))
-        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        texts.add(Gtk.Label(label=text, xalign=0, ellipsize=Pango.EllipsizeMode.END))
-        if sub:
-            s = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
-            s.set_markup(f"<small>{esc(sub)}</small>")
-            s.get_style_context().add_class("dim-label")
-            texts.add(s)
-        box.pack_start(texts, True, True, 0)
-        if extra is not None:
-            box.pack_end(extra, False, False, 0)
+            box.add(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU))
+        box.add(Gtk.Label(label=text, xalign=0, ellipsize=Pango.EllipsizeMode.END))
         row.add(box)
         row.key, row.pinned = key, pinned
-        row.set_tooltip_text(key if is_folder_loc(key) and not key.startswith("volume:") else None)
+        row.set_tooltip_text(key if is_folder_loc(key) else None)
         self.sidebar.add(row)
-        return row
 
     def sync_sidebar(self):
         loc = self.active.location if self.active else None
@@ -6391,26 +4952,6 @@ class MainWindow(Gtk.ApplicationWindow):
         menu.attach_to_widget(lb, None)
         menu.popup_at_pointer(event)
         return True
-
-    def on_sidebar_motion(self, lb, context, x, y, time_):
-        row = lb.get_row_at_y(y)
-        if row is not None and is_folder_loc(getattr(row, "key", "") or ""):
-            lb.drag_highlight_row(row)
-        else:
-            lb.drag_unhighlight_row()
-        return False
-
-    def on_sidebar_drop(self, lb, context, x, y, selection, info, time_):
-        lb.drag_unhighlight_row()
-        row = lb.get_row_at_y(y)
-        dest = getattr(row, "key", None) if row else None
-        if not dest or not is_folder_loc(dest):
-            return
-        paths = [p for p in (Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])) if p]
-        internal = Gtk.drag_get_source_widget(context) is not None
-        mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
-        self.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
-                         bool(mods & Gdk.ModifierType.SHIFT_MASK))
 
     def pin(self, path):
         if is_folder_loc(path) and path not in self.cfg["pinned"]:
@@ -6785,22 +5326,6 @@ class MainWindow(Gtk.ApplicationWindow):
                        + "\n".join(state["errors"][:15]))
         return False
 
-    def handle_drop(self, paths, dest, internal, ctrl, shift):
-        """Dropped files: inside Arckad-D they move (hold Ctrl to copy); from other apps they copy
-        (hold Shift to move). Name clashes ask, like paste does."""
-        if not paths or not dest or not os.path.isdir(dest):
-            if self.active:
-                self.active.flash("Drop files on a folder, or into an open folder")
-            return False
-        move = (internal and not ctrl) or (not internal and shift)
-        if move and all(os.path.dirname(p.rstrip(os.sep)) == dest for p in paths):
-            return False                                # dropped where they already are
-        if any(os.path.isdir(p) and (dest + os.sep).startswith(p.rstrip(os.sep) + os.sep) for p in paths):
-            self.error("A folder can't be moved or copied into itself.")
-            return False
-        self.transfer(paths, move, dest)
-        return True
-
     def refresh_all(self):
         for pane in self.all_panes():
             if pane.mode in ("folder", "tag", "notes"):
@@ -6855,19 +5380,6 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         pane.pending_select = [str(target)]
         pane.refresh()
-
-    def on_icons_toggled(self, item):
-        want = item.get_active()
-        if want and not colour_icons_supported():
-            self.error("This system can't draw the colourful icons (its SVG image support is missing).")
-            item.set_active(False)
-            return
-        self.cfg["file_icons"] = "colour" if want else "system"
-        write_json(CONFIG_FILE, self.cfg)
-        ICON_STYLE["colour"] = want
-        _icon_cache.clear()
-        for pane in self.all_panes():
-            pane.apply_icon_style()
 
     def on_hidden_toggled(self, item):
         self.cfg["show_hidden"] = item.get_active()
@@ -6972,7 +5484,7 @@ class MainWindow(Gtk.ApplicationWindow):
         base = os.path.basename(paths[0].rstrip("/\\")) if len(paths) == 1 else "Archive"
         if single_file:
             base = os.path.splitext(base)[0] or base
-        has_7z = can_make_7z()
+        has_7z = archive_tool() is not None
         total = sum(e[2] for e in _gather(paths))
 
         dlg = Gtk.Dialog(title="Compress", transient_for=self, modal=True)
@@ -7044,11 +5556,11 @@ class MainWindow(Gtk.ApplicationWindow):
                 return
             key = current_key()
             name_entry.set_text(strip_ext(name_entry.get_text() or base) + ext_of_fmt(key))
-            can_pw = key in PASSWORD_FORMATS and archive_tool() is not None
+            can_pw = key in PASSWORD_FORMATS and has_7z
             pw_box.set_sensitive(can_pw)
             if not can_pw:
                 pw_entry.set_text("")
-            if key in PASSWORD_FORMATS and archive_tool() is None:
+            if key in PASSWORD_FORMATS and not has_7z:
                 hint.set_markup("<small>Passwords need 7-Zip installed"
                                 + (" (7-zip.org)." if IS_WIN else ":  sudo apt install 7zip") + "</small>")
             elif key in PASSWORD_FORMATS:
@@ -7259,43 +5771,6 @@ class MainWindow(Gtk.ApplicationWindow):
             self.share_win.update_state()
         return True
 
-    def on_pairs_changed(self):
-        if self.share_win:
-            self.share_win.refresh_pairs()
-        return False
-
-    def on_pair_event(self, text):
-        if self.share_win:
-            self.share_win.log_line(text)
-            self.share_win.refresh_pairs()
-        if self.active:
-            self.active.flash(text)
-        return False
-
-    def ask_pair(self, ev):
-        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
-                              text=f"Pair with {ev['name']}?")
-        d.format_secondary_text(f"{ev['name']} ({ev['os']}) typed the correct code {ev['code'][:3]} {ev['code'][3:]}.\n\n"
-                                "Paired devices connect to each other automatically and can send each other files "
-                                "(you're still asked before files are saved, unless you turn on Auto-accept).")
-        d.add_buttons("Cancel", Gtk.ResponseType.REJECT, "Pair", Gtk.ResponseType.ACCEPT)
-        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
-        d.set_keep_above(True)
-
-        def respond(dlg, resp):
-            if not ev["event"].is_set():
-                ev["accepted"] = resp == Gtk.ResponseType.ACCEPT
-                ev["event"].set()
-                if ev["accepted"]:
-                    self.on_pair_event(f"🔗 Paired with {ev['name']}")
-            dlg.destroy()
-        d.connect("response", respond)
-        GLib.timeout_add_seconds(80, lambda: (d.response(Gtk.ResponseType.REJECT) if not ev["event"].is_set() else None) and False)
-        d.show_all()
-        d.present()
-        self.present()
-        return False
-
     def on_peers_changed(self):
         if self.share_win:
             self.share_win.refresh_peers()
@@ -7314,23 +5789,10 @@ class MainWindow(Gtk.ApplicationWindow):
         d.add_buttons("Decline", Gtk.ResponseType.REJECT, "Accept", Gtk.ResponseType.ACCEPT)
         d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
         d.set_keep_above(True)
-        always = None
-        if req.get("paired"):
-            d.set_property("text", f"🔗 {req['from']} (paired) wants to send you {n} file{'s' if n != 1 else ''}")
-            always = Gtk.CheckButton(label=f"Always accept files from {req['from']}")
-            always.set_margin_start(12)
-            d.get_message_area().add(always)
-            always.show()
 
         def respond(dlg, resp):
             if not req["event"].is_set():
                 req["accepted"] = resp == Gtk.ResponseType.ACCEPT
-                if req["accepted"] and always is not None and always.get_active():
-                    p = self.paired.pair(req.get("pair_id"))
-                    if p:
-                        p["auto_accept"] = True
-                        self.paired.save()
-                        self.on_pairs_changed()
                 req["event"].set()
                 if self.share_win:
                     verb = "Accepted" if req["accepted"] else "Declined"
@@ -7610,7 +6072,6 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.sorter:
             self.sorter.stop()
         self.share.stop()
-        self.paired.stop()
         self.nearby.scanning = False
         self.nearby.hide(force=True)
         return False
