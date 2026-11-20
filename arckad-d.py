@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.9.1"
+APP_VERSION = "3.10.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3612,6 +3612,16 @@ def make_nearby_handler(nb):
             self.end_headers()
             self.wfile.write(data)
 
+        def do_GET(self):
+            """Lets a sender on another network (VLAN) check this device directly by its IP."""
+            try:
+                if self.path.split("?")[0].rstrip("/") == "/hello" and nb.visible():
+                    return self._json(200, {"app": "arckad-d", "v": 1, "type": "hello", "id": nb.id,
+                                            "name": nb.name(), "os": OS_NAME, "port": nb.port})
+                return self._json(403, {"ok": False, "reason": "not visible right now"})
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
         def do_POST(self):
             try:
                 self._post()
@@ -3712,7 +3722,56 @@ class Nearby:
         self.visible_until = 0
         self.transfers = {}
         self._ips = ([], 0)
-        self.last_beacon = self.last_probe = self.last_expire = 0
+        self.last_beacon = self.last_probe = self.last_expire = self.last_manual = 0
+        self.manual_busy = False
+
+    def ui(self, method, *args):
+        GLib.idle_add(lambda: getattr(self.win, method)(*args) or False)
+
+    def manual_ips(self):
+        return list(self.win.cfg.get("manual_ips", []))
+
+    def hello_at(self, host, timeout=2.5):
+        """Asks one address directly (works across VLANs / routed networks where broadcasts don't reach).
+        Returns (peer, None) or (None, reason)."""
+        import http.client
+        reason = "no answer"
+        for port in NEARBY_TCP_PORTS[:-1]:
+            try:
+                c = http.client.HTTPConnection(host, port, timeout=timeout)
+                c.request("GET", "/hello")
+                r = c.getresponse()
+                data = json.loads(r.read() or b"{}")
+                c.close()
+            except (OSError, ValueError):
+                continue
+            if data.get("app") == "arckad-d" and isinstance(data.get("port"), int) and data["port"] > 0:
+                if data.get("id") == self.id:
+                    return None, "that's this computer"
+                ip = socket.gethostbyname(host)
+                peer = {"id": str(data.get("id"))[:40], "name": str(data.get("name") or host)[:40],
+                        "os": str(data.get("os") or "")[:10], "ip": ip, "port": data["port"],
+                        "seen": time.time(), "manual": True}
+                with self.lock:
+                    self.peers[peer["id"]] = peer
+                return peer, None
+            if r.status == 403:
+                reason = "Arckad-D is there, but its Receive is turned off"
+        return None, reason
+
+    def _check_manual(self):
+        try:
+            changed = False
+            for host in self.manual_ips():
+                self._send({"type": "probe"}, host)          # if UDP gets through, it answers the normal way
+                before = {k for k in self.peers}
+                peer, _ = self.hello_at(host, timeout=2)
+                if peer and peer["id"] not in before:
+                    changed = True
+            if changed:
+                self.ui("on_peers_changed")
+        finally:
+            self.manual_busy = False
 
     def name(self):
         return (self.win.cfg.get("device_name") or socket.gethostname() or "My computer").strip()[:40]
@@ -3862,10 +3921,14 @@ class Nearby:
         if self.scanning and now - self.last_probe > 3:
             self.last_probe = now
             self._send({"type": "probe"})
+        if self.scanning and self.manual_ips() and not self.manual_busy and now - self.last_manual > 4:
+            self.last_manual = now
+            self.manual_busy = True
+            threading.Thread(target=self._check_manual, daemon=True).start()
         if now - self.last_expire > 2:
             self.last_expire = now
             with self.lock:
-                gone = [k for k, p in self.peers.items() if now - p["seen"] > 8]
+                gone = [k for k, p in self.peers.items() if now - p["seen"] > (12 if p.get("manual") else 8)]
                 for k in gone:
                     del self.peers[k]
             if gone:
@@ -4083,7 +4146,75 @@ class ShareWindow(Gtk.Window):
         self.progress = Gtk.ProgressBar(show_text=True)
         self.progress.set_no_show_all(True)
         page.add(self.progress)
+
+        ip_head = Gtk.Label(xalign=0, wrap=True, margin_top=6)
+        ip_head.set_markup("<b>On another network or VLAN?</b>  Add its IP address (Receive must be on there).")
+        page.add(ip_head)
+        ip_row = Gtk.Box(spacing=6)
+        self.ip_entry = Gtk.Entry(placeholder_text="IP address, e.g. 10.20.5.14", hexpand=True)
+        self.ip_entry.connect("activate", lambda *_: self.add_ip())
+        ip_row.pack_start(self.ip_entry, True, True, 0)
+        self.ip_btn = Gtk.Button(label="Add")
+        self.ip_btn.connect("clicked", lambda *_: self.add_ip())
+        ip_row.add(self.ip_btn)
+        page.add(ip_row)
+        self.ip_status = Gtk.Label(xalign=0, wrap=True)
+        self.ip_status.get_style_context().add_class("dim-label")
+        page.add(self.ip_status)
+        self.saved_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4,
+                                     column_spacing=6, row_spacing=6)
+        page.add(self.saved_box)
+        self.refresh_saved()
         return page
+
+    def refresh_saved(self):
+        for c in self.saved_box.get_children():
+            self.saved_box.remove(c)
+        for host in self.nearby.manual_ips():
+            chip = Gtk.Box(spacing=2)
+            chip.add(Gtk.Label(label=host))
+            x = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+            x.set_relief(Gtk.ReliefStyle.NONE)
+            x.set_tooltip_text(f"Forget {host}")
+            x.connect("clicked", lambda _b, h=host: self.remove_ip(h))
+            chip.add(x)
+            self.saved_box.add(chip)
+        self.saved_box.show_all()
+
+    def remove_ip(self, host):
+        self.win.cfg["manual_ips"] = [h for h in self.nearby.manual_ips() if h != host]
+        write_json(CONFIG_FILE, self.win.cfg)
+        self.refresh_saved()
+
+    def add_ip(self):
+        host = self.ip_entry.get_text().strip()
+        if not host or " " in host:
+            return
+        self.ip_btn.set_sensitive(False)
+        self.ip_status.set_text(f"Checking {host}…")
+
+        def work():
+            peer, reason = self.nearby.hello_at(host)
+            GLib.idle_add(done, peer, reason)
+
+        def done(peer, reason):
+            self.ip_btn.set_sensitive(True)
+            if peer:
+                ips = self.nearby.manual_ips()
+                if host not in ips:
+                    self.win.cfg["manual_ips"] = ips + [host]
+                    write_json(CONFIG_FILE, self.win.cfg)
+                self.ip_entry.set_text("")
+                self.ip_status.set_text(f"✓ Found {peer['name']} ({peer['os']}) at {host}. It's saved and appears "
+                                        "above whenever its Receive is on.")
+                self.refresh_saved()
+                self.refresh_peers()
+            else:
+                self.ip_status.set_text(f"✗ No Arckad-D answered at {host} ({reason}). On that device: open Arckad-D "
+                                        "and turn Receive on. The firewall must allow TCP ports 47821–47823 "
+                                        "between the networks (a working ping isn't enough).")
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def refresh_peers(self):
         for row in self.peer_box.get_children():
@@ -4093,7 +4224,8 @@ class ShareWindow(Gtk.Window):
             icon = Gtk.Image.new_from_icon_name("computer-symbolic", Gtk.IconSize.DND)
             row.add(icon)
             lbl = Gtk.Label(xalign=0, hexpand=True)
-            lbl.set_markup(f"<b>{esc(peer['name'])}</b>\n<small>{esc(peer['os'])} · {esc(peer['ip'])}</small>")
+            how = " · by IP" if peer.get("manual") else ""
+            lbl.set_markup(f"<b>{esc(peer['name'])}</b>\n<small>{esc(peer['os'])} · {esc(peer['ip'])}{how}</small>")
             row.pack_start(lbl, True, True, 0)
             btn = Gtk.Button(label="Send")
             btn.get_style_context().add_class("suggested-action")

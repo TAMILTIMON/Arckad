@@ -78,6 +78,9 @@ final class ShareScreens {
         private final Spinner linkMinutes;
         private final ImageView qr;
         private final TextView copy;
+        private final EditText ipBox;
+        private final TextView ipStatus, ipAdd;
+        private final LinearLayout savedBox;
         private boolean sending, syncing;
 
         Send(MainActivity a) {
@@ -101,7 +104,29 @@ final class ShareScreens {
             devices.addView(progress, Ui.matchWrap(a, 8));
             progressText = Ui.text(a, "", 13, Ui.DIM, false);
             devices.addView(progressText);
+
+            TextView vlan = Ui.text(a, "On another network or VLAN? Add its IP address (Receive must be on there).", 13, Ui.DIM, false);
+            vlan.setPadding(0, Ui.dp(a, 14), 0, Ui.dp(a, 4));
+            devices.addView(vlan);
+            ipBox = new EditText(a);
+            ipBox.setSingleLine(true);
+            ipBox.setHint("IP address, e.g. 10.20.5.14");
+            ipBox.setTextColor(Ui.TEXT);
+            ipBox.setHintTextColor(Ui.DIM);
+            ipBox.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+            ipAdd = Ui.button(a, "Add", true, v -> addIp());
+            LinearLayout ipRow = new LinearLayout(a);
+            ipRow.setGravity(Gravity.CENTER_VERTICAL);
+            ipRow.addView(ipBox, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+            ipRow.addView(ipAdd);
+            devices.addView(ipRow);
+            ipStatus = Ui.text(a, "", 13, Ui.DIM, false);
+            devices.addView(ipStatus);
+            savedBox = new LinearLayout(a);
+            savedBox.setOrientation(LinearLayout.VERTICAL);
+            devices.addView(savedBox);
             box.addView(devices, Ui.matchWrap(a, 12));
+            loadSaved();
 
             LinearLayout link = Ui.card(a);
             link.addView(Ui.text(a, "Share as a link", 17, Ui.TEXT, true));
@@ -135,6 +160,62 @@ final class ShareScreens {
             copy.setVisibility(View.GONE);
             link.addView(copy, Ui.matchWrap(a, 8));
             box.addView(link, Ui.matchWrap(a, 12));
+        }
+
+        private void loadSaved() {
+            String saved = Ui.prefs(a).getString("manual_ips", "");
+            MainActivity.nearby.manual.clear();
+            for (String h : saved.split(",")) if (!h.trim().isEmpty()) MainActivity.nearby.manual.add(h.trim());
+            refreshSaved();
+        }
+
+        private void saveIps() {
+            synchronized (MainActivity.nearby.manual) {
+                Ui.prefs(a).edit().putString("manual_ips", android.text.TextUtils.join(",", MainActivity.nearby.manual)).apply();
+            }
+            refreshSaved();
+        }
+
+        private void refreshSaved() {
+            savedBox.removeAllViews();
+            List<String> hosts;
+            synchronized (MainActivity.nearby.manual) {
+                hosts = new ArrayList<>(MainActivity.nearby.manual);
+            }
+            for (final String h : hosts) {
+                LinearLayout r = new LinearLayout(a);
+                r.setGravity(Gravity.CENTER_VERTICAL);
+                r.addView(Ui.text(a, "Saved: " + h, 14, Ui.TEXT, false), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+                r.addView(Ui.icon(a, "✕", "Forget " + h, v -> {
+                    MainActivity.nearby.manual.remove(h);
+                    saveIps();
+                }));
+                savedBox.addView(r);
+            }
+        }
+
+        private void addIp() {
+            final String host = ipBox.getText().toString().trim();
+            if (host.isEmpty() || host.contains(" ")) return;
+            ipAdd.setEnabled(false);
+            ipStatus.setText("Checking " + host + "…");
+            new Thread(() -> {
+                Object res = MainActivity.nearby.helloAt(host, 2500);
+                a.runOnUiThread(() -> {
+                    ipAdd.setEnabled(true);
+                    if (res instanceof Net.Peer) {
+                        Net.Peer p = (Net.Peer) res;
+                        if (!MainActivity.nearby.manual.contains(host)) MainActivity.nearby.manual.add(host);
+                        saveIps();
+                        ipBox.setText("");
+                        ipStatus.setText("✓ Found " + p.name + " (" + p.os + ") at " + host + ". Saved: it appears above whenever its Receive is on.");
+                        refreshPeers();
+                    } else {
+                        ipStatus.setText("✗ No Arckad-D answered at " + host + " (" + res + "). On that device, open Arckad-D and turn "
+                                + "Receive on. The firewall must allow TCP ports 47821–47823 between the networks (a working ping isn't enough).");
+                    }
+                });
+            }).start();
         }
 
         @Override
@@ -220,7 +301,7 @@ final class ShareScreens {
                 texts.setOrientation(LinearLayout.VERTICAL);
                 texts.setPadding(Ui.dp(a, 12), 0, Ui.dp(a, 8), 0);
                 texts.addView(Ui.text(a, p.name, 15, Ui.TEXT, true));
-                texts.addView(Ui.text(a, p.os + " · " + p.ip, 12, Ui.DIM, false));
+                texts.addView(Ui.text(a, p.os + " · " + p.ip + (p.manual ? " · by IP" : ""), 12, Ui.DIM, false));
                 row.addView(texts, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
                 TextView b = Ui.button(a, "Send", true, v -> send(p));
                 b.setEnabled(!sending);
