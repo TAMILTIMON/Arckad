@@ -7,8 +7,9 @@ VERSION=$(sed -n 's/^APP_VERSION = "\(.*\)"/\1/p' ../arckad-d.py)
 IFS=. read -r MA MI PA <<< "$VERSION"
 CODE=$((2000000000 + ${MA:-0} * 10000 + ${MI:-0} * 100 + ${PA:-0}))
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
-PLATFORM=$(ls -d "$SDK"/platforms/android-* | sort -V | tail -1)
+# newest *stable* versions (skip previews such as "android-37.2-beta3" or "37.0.0-rc1")
+BT=$(ls -d "$SDK"/build-tools/* | grep -E '/[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+PLATFORM=$(ls -d "$SDK"/platforms/android-* | grep -E '/android-[0-9]+$' | sort -V | tail -1)
 JAR="$PLATFORM/android.jar"
 echo "Arckad-D $VERSION (code $CODE) · build-tools $(basename "$BT") · $(basename "$PLATFORM")"
 
@@ -19,7 +20,8 @@ sed -i "s/static final String VERSION = \".*\";/static final String VERSION = \"
 "$BT/aapt2" compile --dir res -o build/res.zip
 "$BT/aapt2" link -I "$JAR" --manifest AndroidManifest.xml -o build/base.apk build/res.zip \
     --min-sdk-version 24 --target-sdk-version 34 --version-code "$CODE" --version-name "$VERSION" --auto-add-overlay
-javac -encoding UTF-8 -source 1.8 -target 1.8 -bootclasspath "$JAR" -nowarn -Xlint:none \
+# Java's own library (for lambdas) + Android's classes on the class path
+javac -encoding UTF-8 --release 8 -classpath "$JAR" -nowarn -Xlint:none \
     -d build/classes $(find src -name '*.java')
 "$BT/d8" --release --min-api 24 --lib "$JAR" --output build/dex $(find build/classes -name '*.class')
 cp build/base.apk build/unsigned.apk
