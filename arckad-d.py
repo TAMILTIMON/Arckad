@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.11.0"
+APP_VERSION = "3.11.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -220,9 +220,79 @@ def esc(text):
 
 _icon_cache = {}
 FOLDER_ICON = Gio.ThemedIcon.new("folder")
+ICON_STYLE = {"colour": False}          # True: Arckad-D's own file-type icons (default on Windows)
+
+# Arckad-D's own file icons: a page with a coloured band naming the type. They don't depend on the
+# system's icon theme, and read well on light and dark backgrounds.
+_TYPE_COLOURS = [
+    ({"pdf"}, "#D9252A"), ({"doc", "docx", "odt", "rtf"}, "#1C71D8"), ({"txt", "md", "log", "rst"}, "#5E5C64"),
+    ({"epub"}, "#8F5902"), ({"exe", "msi", "deb", "rpm", "apk", "appimage", "run", "iso"}, "#3D3846"),
+]
+_KIND_COLOURS = {"Images": "#0E8A84", "Videos": "#C01C28", "Audio": "#7B3FA0", "Spreadsheets": "#1F8F4E",
+                 "Presentations": "#D35400", "Archives": "#8A5A2B", "Code": "#2B2D42", "Installers": "#3D3846",
+                 "Documents": "#1C71D8", "Others": "#6E6C76"}
+_PAGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="2 2 61 61">
+<path d="M15 4h24l15 15v39a4 4 0 0 1-4 4H15a4 4 0 0 1-4-4V8a4 4 0 0 1 4-4z" fill="#FBFAF9" stroke="#8E8C95" stroke-width="1.6"/>
+<path d="M39 4v11a4 4 0 0 0 4 4h11" fill="#DEDDDA" stroke="#8E8C95" stroke-width="1.6" stroke-linejoin="round"/>
+<rect x="11" y="34" width="43" height="18" fill="{colour}"/>
+<text x="32.5" y="47.6" text-anchor="middle" fill="#FFFFFF" font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif"
+ font-weight="700" font-size="{size}">{label}</text>
+</svg>"""
+_FOLDER_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<path d="M6 15a5 5 0 0 1 5-5h13.5l6 6H53a5 5 0 0 1 5 5v3H6z" fill="#D9930D"/>
+<rect x="6" y="20" width="52" height="36" rx="5" fill="#F5B83D"/>
+<path d="M6 25a5 5 0 0 1 5-5h42a5 5 0 0 1 5 5v1H6z" fill="#FFD47A"/>
+</svg>"""
+
+
+def _svg_icon(svg):
+    return Gio.BytesIcon.new(GLib.Bytes.new(svg.encode("utf-8")))
+
+
+_SIZES = {}
+
+
+def icon_size(kind):
+    """GTK icon sizes for the coloured icons: 32 px list rows, 64 px grid tiles."""
+    if kind not in _SIZES:
+        px = {"row": 32, "tile": 64}[kind]
+        try:
+            _SIZES[kind] = Gtk.icon_size_register(f"arckad-{kind}", px, px)
+        except Exception:
+            _SIZES[kind] = Gtk.IconSize.DND if kind == "row" else Gtk.IconSize.DIALOG
+    return _SIZES[kind]
+
+
+def colour_icons_supported():
+    """The coloured icons are SVG; check this system can draw SVG (it can on Ubuntu and in the Windows build)."""
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(_FOLDER_SVG.encode())
+        loader.close()
+        return loader.get_pixbuf() is not None
+    except Exception:
+        return False
+
+
+def colour_icon(name, is_dir):
+    if is_dir:
+        key = ("folder",)
+        if key not in _icon_cache:
+            _icon_cache[key] = _svg_icon(_FOLDER_SVG)
+        return _icon_cache[key]
+    ext = ext_of(name)
+    colour = next((c for exts, c in _TYPE_COLOURS if ext in exts), None) or _KIND_COLOURS.get(category_of(name), "#6E6C76")
+    label = (ext.upper() if ext and len(ext) <= 4 else "FILE")
+    key = ("c", label, colour)
+    if key not in _icon_cache:
+        size = {1: 15, 2: 15, 3: 13.5, 4: 11}.get(len(label), 11)
+        _icon_cache[key] = _svg_icon(_PAGE_SVG.format(colour=colour, size=size, label=esc(label)))
+    return _icon_cache[key]
 
 
 def icon_for(name, is_dir):
+    if ICON_STYLE["colour"]:
+        return colour_icon(name, is_dir)
     if is_dir:
         return FOLDER_ICON
     ext = ext_of(name)
@@ -469,6 +539,78 @@ def archive_tool():
     return None
 
 
+def bsdtar_tool():
+    """libarchive's tar: built into Windows 10/11 (System32\\tar.exe); on Linux the 'bsdtar' command.
+    It opens .7z / .rar / .zip without 7-Zip and can create .7z (but not with a password)."""
+    if IS_WIN:
+        exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tar.exe")
+        return exe if os.path.exists(exe) else None
+    return shutil.which("bsdtar")
+
+
+def _no_window():
+    return {"creationflags": 0x08000000} if IS_WIN else {}
+
+
+def _hide_on_windows(path):
+    if IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x2)
+        except Exception:
+            pass
+
+
+def _replace(src, dst):
+    """os.replace that waits out antivirus scanners briefly locking brand-new files (common on Windows);
+    for a folder it falls back to moving the contents one by one."""
+    for attempt in range(25):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == 24:
+                break
+            time.sleep(0.2)
+    if os.path.isdir(src):
+        os.makedirs(dst, exist_ok=True)
+        for name in os.listdir(src):
+            shutil.move(os.path.join(src, name), os.path.join(dst, name))
+        shutil.rmtree(src, ignore_errors=True)
+    else:
+        shutil.copy2(src, dst)
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
+
+def _zip_name(info):
+    """ZIPs made by Windows' "Send to → Compressed folder" store names in the old DOS code page,
+    not UTF-8, so non-English names came out garbled. Try UTF-8, then this computer's code page."""
+    name = info.filename
+    if info.flag_bits & 0x800:
+        return name
+    try:
+        raw = name.encode("cp437")
+    except UnicodeEncodeError:
+        return name
+    for enc in ("utf-8",) + ((f"cp{_oem_codepage()}",) if IS_WIN else ()):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return name
+
+
+def _oem_codepage():
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetOEMCP()
+    except Exception:
+        return 437
+
+
 def _inside(base, target):
     base, target = os.path.realpath(base), os.path.realpath(target)
     return target == base or target.startswith(base + os.sep)
@@ -487,7 +629,7 @@ def _extract_zip(path, out, password, progress):
             raise NeedPassword()
         total, done = sum(i.file_size for i in infos) or 1, 0
         for info in infos:
-            name = info.filename.replace("\\", "/")
+            name = _zip_name(info).replace("\\", "/")
             target = os.path.join(out, *[p for p in name.split("/") if p not in ("", ".", "..")])
             if not _inside(out, target):
                 continue
@@ -564,11 +706,23 @@ def _extract_single(path, out, progress):
 def _extract_tool(path, out, password):
     tool = archive_tool()
     if not tool:
+        bsd = bsdtar_tool()
+        if bsd and not password:
+            proc = subprocess.run([bsd, "-xf", path, "-C", out], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, errors="replace", **_no_window())
+            if proc.returncode == 0:
+                return
+            text = (proc.stderr or proc.stdout).lower()
+            if "passphrase" in text or "encrypt" in text or "password" in text:
+                raise NeedPassword()
+            hint = "Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip"
+            raise ExtractError("The built-in archive tool couldn't open it:\n" + (proc.stderr or proc.stdout).strip()[-400:]
+                               + f"\n\n{hint}, which handles more archive types.")
         hint = ("Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip")
-        raise ExtractError(f"Opening .7z and .rar files needs 7-Zip. {hint}")
-    extra = {"creationflags": 0x08000000} if IS_WIN else {}       # no console window
+        need = "Password-protected archives need" if password else "Opening .7z and .rar files needs"
+        raise ExtractError(f"{need} 7-Zip. {hint}")
     proc = subprocess.run([tool, "x", "-y", f"-o{out}", f"-p{password or ''}", path],
-                          stdin=subprocess.DEVNULL, capture_output=True, text=True, **extra)
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", **_no_window())
     text = (proc.stdout + proc.stderr).lower()
     if proc.returncode != 0:
         if "password" in text or "encrypted" in text:
@@ -584,6 +738,7 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
     if kind is None:
         raise ExtractError("This file type isn't an archive Arckad-D can extract.")
     work = tempfile.mkdtemp(prefix=".arckad-extract-", dir=dest_dir)
+    _hide_on_windows(work)
     try:
         if kind == "zip":
             try:
@@ -603,11 +758,17 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
             raise ExtractError("The archive is empty.")
         if len(items) == 1:
             final = unique_target(Path(dest_dir) / items[0])
-            os.replace(os.path.join(work, items[0]), final)
+            _replace(os.path.join(work, items[0]), final)
             shutil.rmtree(work, ignore_errors=True)
         else:
             final = unique_target(Path(dest_dir) / archive_stem(path))
-            os.replace(work, final)
+            _replace(work, final)
+            if IS_WIN:
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetFileAttributesW(str(final), 0x80)     # normal (not hidden)
+                except Exception:
+                    pass
         return final
     except BaseException:
         shutil.rmtree(work, ignore_errors=True)
@@ -617,7 +778,7 @@ def extract_archive(path, dest_dir, password=None, progress=lambda done, total: 
 # (key, extension, label, needs 7-Zip, single file only)
 COMPRESS_FORMATS = [
     ("zip", ".zip", "ZIP: opens on every computer", False, False),
-    ("7z", ".7z", "7Z: smallest size (needs 7-Zip)", True, False),
+    ("7z", ".7z", "7Z: smallest size", True, False),
     ("tar.gz", ".tar.gz", "TAR.GZ: common on Linux, fast", False, False),
     ("tar.xz", ".tar.xz", "TAR.XZ: very small, slower", False, False),
     ("tar.bz2", ".tar.bz2", "TAR.BZ2: small, slower", False, False),
@@ -644,13 +805,27 @@ def _gather(paths):
     return entries
 
 
+def can_make_7z(password=False):
+    return archive_tool() is not None or (not password and bsdtar_tool() is not None)
+
+
+def _bsdtar_7z(paths, out):
+    args = [bsdtar_tool(), "--format", "7zip", "-cf", str(out)]
+    for p in paths:
+        p = str(p).rstrip("/\\")
+        args += ["-C", os.path.dirname(p) or ".", os.path.basename(p)]
+    proc = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", **_no_window())
+    if proc.returncode != 0:
+        raise ExtractError("Couldn't create the .7z file:\n" + (proc.stderr or proc.stdout).strip()[-400:])
+
+
 def _run_7z(args):
     tool = archive_tool()
     if not tool:
         hint = "Install 7-Zip from 7-zip.org" if IS_WIN else "Install it with:  sudo apt install 7zip"
         raise ExtractError(f"This needs 7-Zip. {hint}")
-    extra = {"creationflags": 0x08000000} if IS_WIN else {}
-    proc = subprocess.run([tool] + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, **extra)
+    proc = subprocess.run([tool] + args, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                          **_no_window())
     if proc.returncode != 0:
         raise ExtractError("7-Zip couldn't create the archive:\n" + (proc.stderr or proc.stdout).strip()[-600:])
 
@@ -661,7 +836,9 @@ def compress_archive(paths, dest, fmt="zip", level=6, password=None, progress=la
     ext = next(e for k, e, *_ in COMPRESS_FORMATS if k == fmt)
     tmp = dest.with_name(f".arckad-{secrets.token_hex(4)}{ext}")    # finished file appears in one step
     try:
-        if fmt == "7z" or (fmt == "zip" and password):
+        if fmt == "7z" and not password and archive_tool() is None and bsdtar_tool():
+            _bsdtar_7z(paths, tmp)
+        elif fmt == "7z" or (fmt == "zip" and password):
             args = ["a", "-y", "-t7z" if fmt == "7z" else "-tzip", f"-mx={level}"]
             if password:
                 args.append(f"-p{password}")
@@ -702,7 +879,7 @@ def compress_archive(paths, dest, fmt="zip", level=6, password=None, progress=la
                     dst.write(chunk)
                     done += len(chunk)
                     progress(done, total)
-        os.replace(tmp, dest)
+        _replace(tmp, dest)
         return dest
     except BaseException:
         if tmp.exists():
@@ -1586,7 +1763,8 @@ class FilePane(Gtk.Box):
         self.tree.connect("button-press-event", self.on_view_click)
         col = Gtk.TreeViewColumn("Name")
         icon_r = Gtk.CellRendererPixbuf()
-        icon_r.set_property("stock-size", Gtk.IconSize.LARGE_TOOLBAR)
+        self.icon_renderer = icon_r
+        icon_r.set_property("stock-size", icon_size("row") if ICON_STYLE["colour"] else Gtk.IconSize.LARGE_TOOLBAR)
         col.pack_start(icon_r, False)
         col.add_attribute(icon_r, "gicon", C_ICON)
         text_r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
@@ -1613,7 +1791,8 @@ class FilePane(Gtk.Box):
         self.icons = Gtk.IconView(item_width=110, column_spacing=4, row_spacing=4, margin=8)
         self.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
         pix_r = Gtk.CellRendererPixbuf()
-        pix_r.set_property("stock-size", Gtk.IconSize.DIALOG)
+        self.tile_renderer = pix_r
+        pix_r.set_property("stock-size", icon_size("tile") if ICON_STYLE["colour"] else Gtk.IconSize.DIALOG)
         pix_r.set_fixed_size(100, 100)
         self.icons.pack_start(pix_r, False)
         self.icons.set_cell_data_func(pix_r, self._grid_icon)
@@ -1691,6 +1870,13 @@ class FilePane(Gtk.Box):
         ok = self.win.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
                                   bool(mods & Gdk.ModifierType.SHIFT_MASK))
         Gtk.drag_finish(context, ok, False, time_)
+
+    def apply_icon_style(self):
+        colour = ICON_STYLE["colour"]
+        self.icon_renderer.set_property("stock-size", icon_size("row") if colour else Gtk.IconSize.LARGE_TOOLBAR)
+        self.tile_renderer.set_property("stock-size", icon_size("tile") if colour else Gtk.IconSize.DIALOG)
+        self.tree.columns_autosize()
+        self.refresh()
 
     def _text_col(self, title, text_col, sort_col, xalign=0.0):
         r = Gtk.CellRendererText(xalign=xalign, ellipsize=Pango.EllipsizeMode.END)
@@ -5344,6 +5530,8 @@ class MainWindow(Gtk.ApplicationWindow):
                              ("preview", True), ("autosort", False), ("autosort_background", False),
                              ("autosort_delay", 5)):
             self.cfg.setdefault(key, default)
+        self.cfg.setdefault("file_icons", "colour" if IS_WIN else "system")
+        ICON_STYLE["colour"] = self.cfg["file_icons"] == "colour" and colour_icons_supported()
         self.set_default_size(*self.cfg.get("size", [1280, 760]))
         self.cfg.setdefault("theme", "system")
         self.active = None
@@ -5457,8 +5645,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self.hidden_item = Gtk.CheckMenuItem(label="Show hidden files (Ctrl+H)")
         self.hidden_item.set_active(self.cfg["show_hidden"])
         self.hidden_item.connect("toggled", self.on_hidden_toggled)
+        self.icons_item = Gtk.CheckMenuItem(label="Colourful file icons")
+        self.icons_item.set_active(ICON_STYLE["colour"])
+        self.icons_item.connect("toggled", self.on_icons_toggled)
         hb.pack_end(self._menu_button(None, "open-menu-symbolic", [
-            self.hidden_item, None,
+            self.hidden_item, self.icons_item, None,
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
             ("New folder…", lambda: self.new_folder(self.active)),
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
@@ -6655,6 +6846,19 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.pending_select = [str(target)]
         pane.refresh()
 
+    def on_icons_toggled(self, item):
+        want = item.get_active()
+        if want and not colour_icons_supported():
+            self.error("This system can't draw the colourful icons (its SVG image support is missing).")
+            item.set_active(False)
+            return
+        self.cfg["file_icons"] = "colour" if want else "system"
+        write_json(CONFIG_FILE, self.cfg)
+        ICON_STYLE["colour"] = want
+        _icon_cache.clear()
+        for pane in self.all_panes():
+            pane.apply_icon_style()
+
     def on_hidden_toggled(self, item):
         self.cfg["show_hidden"] = item.get_active()
         write_json(CONFIG_FILE, self.cfg)
@@ -6758,7 +6962,7 @@ class MainWindow(Gtk.ApplicationWindow):
         base = os.path.basename(paths[0].rstrip("/\\")) if len(paths) == 1 else "Archive"
         if single_file:
             base = os.path.splitext(base)[0] or base
-        has_7z = archive_tool() is not None
+        has_7z = can_make_7z()
         total = sum(e[2] for e in _gather(paths))
 
         dlg = Gtk.Dialog(title="Compress", transient_for=self, modal=True)
@@ -6830,11 +7034,11 @@ class MainWindow(Gtk.ApplicationWindow):
                 return
             key = current_key()
             name_entry.set_text(strip_ext(name_entry.get_text() or base) + ext_of_fmt(key))
-            can_pw = key in PASSWORD_FORMATS and has_7z
+            can_pw = key in PASSWORD_FORMATS and archive_tool() is not None
             pw_box.set_sensitive(can_pw)
             if not can_pw:
                 pw_entry.set_text("")
-            if key in PASSWORD_FORMATS and not has_7z:
+            if key in PASSWORD_FORMATS and archive_tool() is None:
                 hint.set_markup("<small>Passwords need 7-Zip installed"
                                 + (" (7-zip.org)." if IS_WIN else ":  sudo apt install 7zip") + "</small>")
             elif key in PASSWORD_FORMATS:
