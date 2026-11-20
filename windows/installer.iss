@@ -28,6 +28,10 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=force
 
+[InstallDelete]
+; clear the previous version's program files first, so old and new Python files never mix
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
@@ -40,9 +44,20 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
-; after a silent update started from inside Arckad-D, open it again
-Filename: "{app}\{#AppExe}"; Flags: nowait; Check: WizardSilent
+; after a silent update started from inside Arckad-D, open it again (not during the automatic build test)
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: ShouldRelaunch
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden; RunOnceId: "StopArckadD"
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""Arckad-D AutoSort"" /f"; Flags: runhidden; RunOnceId: "RemoveAutoSort"
+
+[Code]
+function ShouldRelaunch(): Boolean;
+var
+  i: Integer;
+begin
+  Result := WizardSilent;
+  for i := 1 to ParamCount do
+    if CompareText(ParamStr(i), '/NOLAUNCH') = 0 then
+      Result := False;
+end;

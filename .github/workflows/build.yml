@@ -75,6 +75,22 @@ jobs:
           Compress-Archive -Path dist\Arckad-D\* -DestinationPath "installer-output\Arckad-D-$version-portable-windows.zip"
           Get-ChildItem installer-output
 
+      - name: Install it and test the installed copy like a normal Windows PC
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path arckad-d.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          $dir = Join-Path $env:RUNNER_TEMP "ArckadInstalled"
+          $setup = Start-Process -FilePath "installer-output\Arckad-D-Setup-$version.exe" -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/NOLAUNCH","/CURRENTUSER","/DIR=$dir" -PassThru
+          if (-not $setup.WaitForExit(180000)) { Write-Host "Installer hung"; exit 1 }
+          Write-Host "Installer exit code: $($setup.ExitCode)"
+          if (-not (Test-Path "$dir\_internal\libpython3*.dll")) { Write-Host "Python DLL missing after install"; Get-ChildItem "$dir\_internal" | Select-Object -First 40; exit 1 }
+          $env:PATH = "C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
+          $out = Join-Path $env:RUNNER_TEMP "installed-selftest.txt"
+          $p = Start-Process -FilePath "$dir\Arckad-D.exe" -ArgumentList "--selftest",$out -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); Write-Host "Installed app hung (probably an error box)"; exit 1 }
+          if (Test-Path $out) { Get-Content $out } else { Write-Host "Installed app wrote no self-test output"; exit 1 }
+          if (-not (Select-String -Path $out -Pattern "SELFTEST OK" -Quiet)) { exit 1 }
+
       - uses: actions/upload-artifact@v4
         with:
           name: Arckad-D-Windows

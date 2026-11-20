@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.11.3"
+APP_VERSION = "3.11.4"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5891,8 +5891,14 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _run_windows_setup(self, path):
-        subprocess.Popen([str(path), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS"],
-                         creationflags=0x00000008 | 0x00000200)       # detached, so it outlives this window
+        """Start the installer only after Arckad-D has fully closed, so none of its files are still in use."""
+        setup = str(path).replace("'", "''")
+        script = (f"Wait-Process -Id {os.getpid()} -Timeout 60 -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; "
+                  f"Start-Process -FilePath '{setup}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"
+                  f"'/CLOSEAPPLICATIONS'")
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                          "-Command", script],
+                         creationflags=0x00000008 | 0x00000200 | 0x08000000)   # detached, no console window
         self.on_close()
         self.get_application().quit()
 
