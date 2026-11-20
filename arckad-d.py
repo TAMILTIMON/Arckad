@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.14.0"
+APP_VERSION = "3.14.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5804,9 +5804,104 @@ def sticker_pixbuf(sid, px):
 
 CHAT_AUTO_DOWNLOAD = 50 * 1024 * 1024        # attachments up to this size download by themselves
 CHAT_HISTORY_DAYS = 120
-EMOJIS = ("😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😎 🤩 🥳 🤔 🤨 😐 😑 🙄 😏 😴 😌 😮 😯 😲 😳 🥺 "
-          "😢 😭 😤 😠 😡 🤯 😱 😬 🤝 👍 👎 👏 🙌 🙏 💪 👀 👋 ✌️ 👌 🤞 ☝️ 👉 ✅ ❌ ⚠️ ❗ ❓ 💯 🔥 ⭐ ✨ 🎉 🎂 🎁 "
-          "❤️ 🧡 💛 💚 💙 💜 🤍 💔 📁 📂 📄 📎 📌 📅 📊 📈 📝 ✏️ 💼 🖥️ 💻 📱 ☎️ 📧 🔒 🔑 ⏰ ☕ 🍕 🚀 🏠").split()
+EMOJI_GROUPS = [
+    ("Work", "✅ ☑️ ✔️ ❌ 👍 👎 👌 🙏 👏 🤝 💪 📌 📎 📅 📆 ⏰ ⏳ ⚠️ ❗ ❓ 💡 📊 📈 📉 📝 ✏️ 📄 📁 📂 🗂️ 💼 🖥️ 💻 📱 ☎️ "
+             "📧 📨 🔒 🔑 🔔 🚀 🎯 🏁 ⭐ 🔥 ✨ 🎉 ☕ 🍕 🏠 🚗 ✈️ 🌐 🛠️ 🐞 🧾 💰 💳 📦 🔗 🔍 ♻️ 🟢 🟡 🔴 ➡️ ⬆️ ⬇️ 🔄"),
+    ("Smileys", "😀 😃 😄 😁 😆 😅 😂 🙂 😉 😊 😇 😍 🥰 😘 😋 😎 🤓 🤩 🥳 🤔 🤨 😐 😑 🙄 😏 😴 😌 😮 😲 😳 🥺 "
+                "😢 😭 😤 😠 😡 🤯 😱 😬 🤗 🤭 🤫 😷 🤒"),
+    ("People & symbols", "👋 ✌️ 🤞 ☝️ 👉 👈 🙌 🫡 👀 🧠 ❤️ 🧡 💛 💚 💙 💜 🤍 🖤 💔 💯 🎂 🎁 🏆 🥇"),
+]
+EMOJIS = [e for _, s in EMOJI_GROUPS for e in s.split()]
+
+
+# ---- Arckad-D's own emoji images: the complete Noto Emoji set by Google (Apache License 2.0, see
+# emoji/LICENSE.txt), packed in emoji/noto-emoji.zip, so emojis look the same on every computer.
+# Without that file, the system's emoji font draws them instead.
+def _find_emoji_dir():
+    here = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+    for d in (here / "emoji", Path(__file__).resolve().parent / "emoji", Path("/opt/arckad-d/emoji")):
+        if (d / "noto-emoji.zip").exists():
+            return d
+    return None
+
+
+EMOJI_DIR = _find_emoji_dir()
+_emoji_zip = None
+_EMOJI_KEYS = set()
+if EMOJI_DIR is not None:
+    try:
+        _emoji_zip = zipfile.ZipFile(EMOJI_DIR / "noto-emoji.zip")
+        _EMOJI_KEYS = {n[:-4] for n in _emoji_zip.namelist()}
+    except (OSError, zipfile.BadZipFile):
+        _emoji_zip = None
+_emoji_pix = {}
+_emoji_lock = threading.Lock()
+
+
+def emoji_key(e):
+    return "_".join(f"{ord(c):04x}" for c in e if c != "\ufe0f")
+
+
+def emoji_pixbuf(e, px):
+    """Arckad-D's image for this emoji at px pixels, or None (then the system font draws it)."""
+    if _emoji_zip is None:
+        return None
+    k = (emoji_key(e), px)
+    if k not in _emoji_pix:
+        pb = None
+        if k[0] in _EMOJI_KEYS:
+            try:
+                with _emoji_lock:
+                    data = _emoji_zip.read(k[0] + ".png")
+                loader = GdkPixbuf.PixbufLoader.new_with_type("png")
+                loader.set_size(px, px)
+                loader.write(data)
+                loader.close()
+                pb = loader.get_pixbuf()
+            except (GLib.Error, KeyError, OSError):
+                pb = None
+        _emoji_pix[k] = pb
+    return _emoji_pix[k]
+
+
+def emoji_categories():
+    """[(tab name, [emoji])]: the curated Work tab first, then every category."""
+    tabs = [("Work", EMOJI_GROUPS[0][1].split())]
+    if EMOJI_DIR is not None:
+        tabs += [(name, chars) for name, chars in read_json(EMOJI_DIR / "categories.json", [])]
+    else:
+        tabs += [(name, s.split()) for name, s in EMOJI_GROUPS[1:]]
+    return tabs
+
+
+def split_emoji(text):
+    """[(is_emoji, piece)]: emojis Arckad-D has images for (including skin tones, flags and combined
+    emojis like 👩‍💻), and the text between them."""
+    if not _EMOJI_KEYS:
+        return [(False, text)]
+    out, buf, i, n = [], [], 0, len(text)
+    while i < n:
+        best = 0
+        if ord(text[i]) > 0x2000 or text[i] in "#*0123456789":
+            for L in range(min(10, n - i), 0, -1):          # longest sequence first
+                if emoji_key(text[i:i + L]) in _EMOJI_KEYS:
+                    best = L
+                    break
+        if best:
+            j = i + best
+            if j < n and text[j] == "\ufe0f":
+                j += 1
+            if buf:
+                out.append((False, "".join(buf)))
+                buf = []
+            out.append((True, text[i:j]))
+            i = j
+        else:
+            buf.append(text[i])
+            i += 1
+    if buf:
+        out.append((False, "".join(buf)))
+    return out
 
 
 def _backup_key(password, salt, kdf="scrypt"):
@@ -6798,6 +6893,8 @@ CHAT_CSS = b"""
 .chat-mine label { color: #ffffff; }
 .chat-mine button label { color: inherit; }
 .chat-theirs { background-color: alpha(currentColor, 0.09); }
+.chat-text, .chat-text text { background-color: transparent; }
+.chat-mine .chat-text text { color: #ffffff; }
 .chat-system { opacity: 0.65; }
 .chat-code { font-size: 22px; font-weight: bold; letter-spacing: 4px; }
 """
@@ -7026,19 +7123,20 @@ class ChatPanel(Gtk.Box):
         # composer
         comp = Gtk.Box(spacing=4)
         emo_pop = Gtk.Popover()
-        flow = Gtk.FlowBox(max_children_per_line=10, min_children_per_line=8, selection_mode=Gtk.SelectionMode.NONE,
-                           homogeneous=True)
-        for e in EMOJIS:
-            b = Gtk.Button(label=e)
-            b.set_relief(Gtk.ReliefStyle.NONE)
-            b.connect("clicked", lambda _b, e=e: self.insert_emoji(e, emo_pop))
-            flow.add(b)
-        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        sc.set_size_request(360, 240)
-        sc.add(flow)
-        sc.show_all()
-        emo_pop.add(sc)
-        self.emo_btn = Gtk.MenuButton(label="😊", popover=emo_pop)
+        tabs = Gtk.Notebook(scrollable=True)
+        self._emoji_tabs = {}
+        for title, chars in emoji_categories():
+            sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            sc.set_size_request(420, 260)
+            self._emoji_tabs[sc] = chars
+            tabs.append_page(sc, Gtk.Label(label=title))
+        tabs.connect("switch-page", lambda nb, page, i: self._fill_emoji_tab(page, emo_pop))
+        self._fill_emoji_tab(tabs.get_nth_page(0), emo_pop)
+        tabs.show_all()
+        emo_pop.add(tabs)
+        self.emo_btn = Gtk.MenuButton(popover=emo_pop)
+        face = emoji_pixbuf("🙂", 20)
+        self.emo_btn.add(Gtk.Image.new_from_pixbuf(face) if face else Gtk.Label(label="🙂"))
         self.emo_btn.set_tooltip_text("Emoji")
         self.sticker_pop = Gtk.Popover()
         self.sticker_btn = Gtk.MenuButton(label="🏷", popover=self.sticker_pop)
@@ -7169,9 +7267,7 @@ class ChatPanel(Gtk.Box):
             nm.set_markup(f"<small><b>{esc(m.get('name', '?'))}</b></small>")
             bubble.add(nm)
         if m["kind"] == "text":
-            t = Gtk.Label(label=m.get("text", ""), xalign=0, wrap=True, selectable=True, max_width_chars=38)
-            t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
-            bubble.add(t)
+            bubble.add(self._text_widget(m.get("text", "")))
         elif m["kind"] == "sticker":
             ctx.remove_class("chat-mine")
             ctx.remove_class("chat-theirs")
@@ -7196,6 +7292,51 @@ class ChatPanel(Gtk.Box):
             outer.set_margin_end(40)
         row.add(outer)
         return row
+
+    def _fill_emoji_tab(self, sc, pop):
+        """Build a picker tab the first time it's opened (keeps opening the picker quick)."""
+        chars = self._emoji_tabs.pop(sc, None)
+        if chars is None:
+            return
+        flow = Gtk.FlowBox(max_children_per_line=11, min_children_per_line=9, selection_mode=Gtk.SelectionMode.NONE,
+                           homogeneous=True)
+        for e in chars:
+            b = Gtk.Button()
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            pb = emoji_pixbuf(e, 28)
+            b.add(Gtk.Image.new_from_pixbuf(pb) if pb else Gtk.Label(label=e))
+            b.connect("clicked", lambda _b, e=e: self.insert_emoji(e, pop))
+            flow.add(b)
+        sc.add(flow)
+        sc.show_all()
+
+    def _text_widget(self, text):
+        """Message text with Arckad-D's emoji images (same look on every computer). Selectable and copyable."""
+        parts = split_emoji(text)
+        if not any(is_e for is_e, _ in parts):
+            t = Gtk.Label(label=text, xalign=0, wrap=True, selectable=True, max_width_chars=38)
+            t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            return t
+        only = all(is_e or not piece.strip() for is_e, piece in parts)
+        n = sum(1 for is_e, _ in parts if is_e)
+        px = 40 if only and n <= 3 else 20                  # a short emoji-only message shows them big
+        tv = Gtk.TextView(editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.WORD_CHAR)
+        tv.get_style_context().add_class("chat-text")
+        buf = tv.get_buffer()
+        plain = []
+        for is_e, piece in parts:
+            pb = emoji_pixbuf(piece, px) if is_e else None
+            if pb:
+                buf.insert_pixbuf(buf.get_end_iter(), pb)
+                plain.append("\u2003" * (2 if px == 20 else 3))
+            else:
+                buf.insert(buf.get_end_iter(), piece)
+                plain.append(piece)
+        layout = tv.create_pango_layout("".join(plain))
+        w = max((layout.get_pixel_size()[0] if "\n" not in "".join(plain) else
+                 max(tv.create_pango_layout(line).get_pixel_size()[0] for line in "".join(plain).split("\n"))), 20)
+        tv.set_size_request(min(w + 18, 300), -1)
+        return tv
 
     def _sticker_image(self, m):
         if m.get("sticker") != "custom":
@@ -8264,6 +8405,8 @@ class MainWindow(Gtk.ApplicationWindow):
         logo = logo_pixbuf(128)
         if logo:
             dlg.set_logo(logo)
+        dlg.add_credit_section("Emoji", ["Noto Emoji by Google (Apache License 2.0)",
+                                         "images via emoji-data by Cal Henderson (MIT)"])
         dlg.run()
         dlg.destroy()
 

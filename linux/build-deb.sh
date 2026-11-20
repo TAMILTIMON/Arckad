@@ -7,6 +7,8 @@ PKG=build/arckad-d_${VERSION}_all
 rm -rf build && mkdir -p "$PKG"/{DEBIAN,opt/arckad-d,usr/bin,usr/share/applications,usr/share/doc/arckad-d,usr/share/icons/hicolor/scalable/apps}
 
 install -m 755 arckad-d.py "$PKG/opt/arckad-d/arckad-d.py"
+mkdir -p "$PKG/opt/arckad-d/emoji"
+install -m 644 emoji/noto-emoji.zip emoji/categories.json emoji/LICENSE.txt "$PKG/opt/arckad-d/emoji/"
 python3 - "$PKG" <<'EOF'
 import re, sys
 src = open("arckad-d.py", encoding="utf-8").read()
