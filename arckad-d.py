@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.12.2"
+APP_VERSION = "3.13.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2503,6 +2503,7 @@ class FilePane(Gtk.Box):
                     menu.append(item)
             add("Rename… (F2)", lambda: win.rename(self, first), len(paths) == 1)
             add("Duplicate", lambda: win.duplicate(self, paths))
+            add("Send to chat 💬", lambda: win.send_to_chat(paths))
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
             add("Properties (Alt+Enter)", lambda: win.properties(paths))
             menu.append(Gtk.SeparatorMenuItem())
@@ -4336,6 +4337,7 @@ class ShareWindow(Gtk.Window):
         copy_addr.connect("clicked", lambda *_: self.win.copy_text(lan_addresses()[0]))
         addr_row.add(copy_addr)
         box.add(addr_row)
+        box.add(self._firewall_bar())
         box = outer
 
         # ---- activity (shared by both tabs)
@@ -4530,6 +4532,7 @@ class ShareWindow(Gtk.Window):
         self.pair_progress.set_no_show_all(True)
         page.add(self.pair_progress)
 
+        page.add(self._firewall_bar())
         page.add(Gtk.Separator(margin_top=6))
         head = Gtk.Label(xalign=0)
         head.set_markup("<b>Pair a new device</b>")
@@ -4582,6 +4585,44 @@ class ShareWindow(Gtk.Window):
         self.code_entry_box.show_all()
         self.pair_status.set_text("Type the 6-digit code shown on the other device.")
         self.code_entry.grab_focus()
+
+    def _firewall_bar(self):
+        """Shown when a firewall is probably blocking sharing, with a one-click fix."""
+        bar = Gtk.Box(spacing=8)
+        lbl = Gtk.Label(xalign=0, wrap=True, hexpand=True)
+        kind = "Windows Firewall" if IS_WIN else "Ubuntu's firewall (ufw)"
+        lbl.set_markup(f"🛡 <b>{kind} is on</b> and may block other devices from finding this one.")
+        btn = Gtk.Button(label="Allow through firewall")
+        btn.set_tooltip_text("Asks for your password once, then lets Arckad-D's sharing ports through")
+        bar.pack_start(lbl, True, True, 0)
+        bar.add(btn)
+        bar.set_no_show_all(True)
+        self.firewall_bars = getattr(self, "firewall_bars", []) + [bar]
+
+        def clicked(_b):
+            btn.set_sensitive(False)
+            lbl.set_markup("🛡 Waiting for your permission…")
+
+            def done(ok, msg):
+                btn.set_sensitive(True)
+                if ok:
+                    for b in self.firewall_bars:
+                        b.hide()
+                    self.win.cfg["firewall_opened"] = True
+                    write_json(CONFIG_FILE, self.win.cfg)
+                    self.log_line("🛡 " + msg)
+                else:
+                    lbl.set_markup(f"🛡 {esc(msg)}")
+                return False
+            open_firewall(done)
+        btn.connect("clicked", clicked)
+
+        def check():
+            blocking = firewall_blocking()
+            GLib.idle_add(lambda: (bar.set_no_show_all(False), bar.show_all()) if blocking and not
+                          (blocking == "ufw" and self.win.cfg.get("firewall_opened")) else None)
+        threading.Thread(target=check, daemon=True).start()
+        return bar
 
     def refresh_pairs(self):
         pr = self.win.paired
@@ -4944,6 +4985,66 @@ DH_P = int(
     "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)                       # RFC 3526 group 14 (2048-bit safe prime)
 
 
+FIREWALL_PORTS = {"udp": ["47820", "47830"], "tcp": ["47821:47823", "47831:47833", "8765:8767"]}
+
+
+def firewall_blocking():
+    """A firewall that probably blocks Arckad-D's sharing and hasn't been opened for it: "ufw", "windows" or None."""
+    if IS_WIN:
+        try:
+            out = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", "name=Arckad-D"],
+                                 capture_output=True, text=True, errors="replace", timeout=8,
+                                 creationflags=0x08000000).stdout
+            return None if "Arckad-D" in out and "Allow" in out else "windows"
+        except (OSError, subprocess.SubprocessError):
+            return None
+    try:
+        conf = Path("/etc/ufw/ufw.conf").read_text()
+    except OSError:
+        return None
+    if "ENABLED=yes" not in conf.replace(" ", ""):
+        return None
+    try:
+        rules = Path("/etc/ufw/user.rules").read_text()          # usually only root can read it
+        return None if "47831" in rules else "ufw"
+    except OSError:
+        return "ufw"
+
+
+def open_firewall(done):
+    """Ask for the administrator password once and let Arckad-D's sharing through the firewall.
+    Calls done(ok, message) on the main thread."""
+    def work():
+        try:
+            if IS_WIN:
+                exe = sys.executable
+                script = Path(tempfile.gettempdir()) / "arckad-d-firewall.ps1"
+                script.write_text(
+                    "Remove-NetFirewallRule -DisplayName 'Arckad-D' -ErrorAction SilentlyContinue\n"
+                    f"New-NetFirewallRule -DisplayName 'Arckad-D' -Direction Inbound -Program '{exe.replace(chr(39), chr(39) * 2)}' "
+                    "-Action Allow -Profile Any | Out-Null\n", encoding="utf-8")
+                arg = str(script).replace("'", "''")
+                proc = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command",
+                     f"$p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden "
+                     f"-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{arg}\"'; exit $p.ExitCode"],
+                    capture_output=True, text=True, errors="replace", timeout=300, creationflags=0x08000000)
+                ok = proc.returncode == 0 and firewall_blocking() is None
+                msg = "Arckad-D is now allowed through Windows Firewall." if ok else \
+                    "Windows Firewall wasn't changed (the permission request was cancelled or failed)."
+            else:
+                cmds = [f"ufw allow {p}/{proto} comment Arckad-D" for proto, ports in FIREWALL_PORTS.items() for p in ports]
+                proc = subprocess.run(["pkexec", "sh", "-c", " && ".join(cmds)], capture_output=True, text=True,
+                                      errors="replace", timeout=300)
+                ok = proc.returncode == 0
+                msg = "Ubuntu's firewall now lets Arckad-D's sharing through." if ok else \
+                    "The firewall wasn't changed: " + ((proc.stderr or proc.stdout).strip()[-300:] or "cancelled")
+        except (OSError, subprocess.SubprocessError) as ex:
+            ok, msg = False, f"Couldn't change the firewall: {ex}"
+        GLib.idle_add(done, ok, msg)
+    threading.Thread(target=work, daemon=True).start()
+
+
 def _hm(key, *parts):
     msg = b"|".join(p if isinstance(p, bytes) else str(p).encode("utf-8") for p in parts)
     return hmacmod.new(key, msg, hashlib.sha256).digest()
@@ -5048,8 +5149,19 @@ def make_pair_handler(pr):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def do_GET(self):
+            try:
+                path = self.path.split("?")[0]
+                if path.startswith("/c/file/") and getattr(pr.win, "chat", None):
+                    return pr.win.chat.handle_get(self, path)
+                self._plain(404, {"ok": False})
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
+
         def _post(self):
             path = self.path.split("?")[0]
+            if (path.startswith("/c/") or path.startswith("/cj/")) and getattr(pr.win, "chat", None):
+                return pr.win.chat.handle_post(self, path)
             if path == "/pair/start":                     # step 1: exchange keys (needs the code to be shown)
                 if not pr.code_active():
                     return self._plain(403, {"ok": False, "reason": "no pairing code is shown on that device"})
@@ -5161,6 +5273,7 @@ class Paired:
         self.last_beacon = self.last_direct = 0
         self.running = False
         self._keys = {}
+        self.answered = {}
         self.code_seen = {}                                # pairing-beacon hash -> (ip, port, time)
 
     # ---------- stored pairs (secret keys live in the config file, which only you can read)
@@ -5262,6 +5375,9 @@ class Paired:
         msg = {"app": "arckad-pair", "v": 1, "port": self.port, "tags": tags}
         if self.code_active():
             msg["pairing"] = hashlib.sha256(f"arckad-pair-code|{self.code}".encode()).hexdigest()[:20]
+        chat = getattr(self.win, "chat", None)
+        if chat:
+            msg.update(chat.beacon_fields())
         return json.dumps(msg).encode()
 
     def _send_beacon(self, targets):
@@ -5282,13 +5398,17 @@ class Paired:
             except OSError:
                 break
             now = time.time()
-            if (self.pairs() or self.code_active()) and now - self.last_beacon > 3:
+            chat = getattr(self.win, "chat", None)
+            if (self.pairs() or self.code_active() or (chat and chat.active())) and now - self.last_beacon > 3:
                 self.last_beacon = now
                 self._send_beacon({"255.255.255.255"} | {ip.rsplit(".", 1)[0] + ".255" for ip in lan_addresses()
                                                          if ip.count(".") == 3})
             if now - self.last_direct > 6:          # also knock on last known addresses (other VLANs)
                 self.last_direct = now
-                self._send_beacon({p["last_ip"] for p in self.pairs() if p.get("last_ip")})
+                self._send_beacon({p["last_ip"] for p in self.pairs() if p.get("last_ip")}
+                                  | (chat.direct_targets() if chat else set()))
+                if chat:
+                    chat.tick()
             for pid in list(self.online):
                 if not self.is_online(pid) and now - self.online[pid]["seen"] < 14:
                     self.online[pid]["seen"] -= 100       # report the change only once
@@ -5303,6 +5423,10 @@ class Paired:
             return
         if msg.get("pairing") and msg.get("port"):
             self.code_seen[str(msg["pairing"])] = (ip, int(msg["port"]), time.time())
+        chat = getattr(self.win, "chat", None)
+        if chat and chat.on_udp(msg, ip) and time.time() - self.answered.get(ip, 0) > 5:
+            self.answered[ip] = time.time()              # answer directly so it finds us quickly too
+            self._send_beacon({ip})
         tags = set(msg.get("tags") or [])
         if not tags:
             return
@@ -5411,8 +5535,9 @@ class Paired:
         else:
             where = self.find_code_host(code)
         if not where:
-            return False, ("No device showing that code was found. Check the code, and that the other device "
-                           "shows it right now (same network, or enter its IP address).")
+            return False, ("No device showing that code was found. Check the code and that the other device shows it "
+                           "right now. If it does, a firewall is probably blocking the signal: click “Allow through "
+                           "firewall” below on both devices, or type the other device's IP address in the box.")
         ip, port = where
         x = secrets.randbits(320)
         pub = pow(2, x, DH_P)
@@ -5553,6 +5678,1253 @@ class Paired:
         return None
 
 
+# ---------------------------------------------------------------- Chat groups (office messenger on the local network)
+# Built on the Paired technology: same server and ports, same secret beacons, same code-confirmed key exchange.
+# Each group has a shared group key (encrypts messages, signs requests). The owner also shares a private key
+# with every member (from joining), and membership changes travel only under those keys, so only the owner
+# can approve, remove, or switch the group to "only the owner posts". No server, no internet, no accounts:
+# every member keeps the history on their own device, and members who were offline catch up automatically.
+import base64
+
+CHAT_DIR = CONFIG_DIR / "chat"
+CHAT_AUTO_DOWNLOAD = 50 * 1024 * 1024        # attachments up to this size download by themselves
+CHAT_HISTORY_DAYS = 120
+EMOJIS = ("😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😎 🤩 🥳 🤔 🤨 😐 😑 🙄 😏 😴 😌 😮 😯 😲 😳 🥺 "
+          "😢 😭 😤 😠 😡 🤯 😱 😬 🤝 👍 👎 👏 🙌 🙏 💪 👀 👋 ✌️ 👌 🤞 ☝️ 👉 ✅ ❌ ⚠️ ❗ ❓ 💯 🔥 ⭐ ✨ 🎉 🎂 🎁 "
+          "❤️ 🧡 💛 💚 💙 💜 🤍 💔 📁 📂 📄 📎 📌 📅 📊 📈 📝 ✏️ 💼 🖥️ 💻 📱 ☎️ 📧 🔒 🔑 ⏰ ☕ 🍕 🚀 🏠").split()
+
+
+def _safe_folder_name(name):
+    keep = "".join(c if c.isalnum() or c in " -_.()" else "_" for c in name).strip(" .")
+    return keep or "Group"
+
+
+class Chat:
+    def __init__(self, win):
+        self.win = win
+        self.pr = win.paired
+        self.groups = {}
+        self.msgs = {}                   # gid -> [msg] sorted by time
+        self.ids = {}                    # gid -> set(msg ids)
+        self.unread = {}
+        self.online = {}                 # device id -> {"ip", "port", "seen"}
+        self.join = None                 # owner side: {"gid", "code", "until", "tries", "pending"}
+        self.code_seen = {}
+        self.downloading = set()
+        self.lock = threading.RLock()
+        self._tag_cache = (None, {})
+        self.last_sync = 0
+        self.load()
+
+    # ---------- storage (plain JSON in your config folder, readable only by you)
+    def load(self):
+        data = read_json(CHAT_DIR / "groups.json", {})
+        self.groups = data.get("groups", {}) if isinstance(data, dict) else {}
+        for gid in self.groups:
+            msgs = []
+            try:
+                with open(CHAT_DIR / f"{gid}.jsonl", encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            msgs.append(json.loads(line))
+                        except ValueError:
+                            pass
+            except OSError:
+                pass
+            msgs.sort(key=lambda m: (m.get("ts", 0), m.get("id", "")))
+            self.msgs[gid] = msgs
+            self.ids[gid] = {m.get("id") for m in msgs}
+
+    def save(self):
+        with self.lock:
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+            write_json(CHAT_DIR / "groups.json", {"groups": self.groups})
+            if not IS_WIN:
+                for p in (CHAT_DIR, CHAT_DIR / "groups.json"):
+                    try:
+                        os.chmod(p, 0o700 if p.is_dir() else 0o600)
+                    except OSError:
+                        pass
+
+    def _append(self, gid, msg):
+        """Store a message once. Returns True if it was new."""
+        with self.lock:
+            if gid not in self.groups or msg.get("id") in self.ids.setdefault(gid, set()):
+                return False
+            self.ids[gid].add(msg["id"])
+            lst = self.msgs.setdefault(gid, [])
+            lst.append(msg)
+            if len(lst) > 1 and (lst[-2].get("ts", 0), lst[-2].get("id", "")) > (msg.get("ts", 0), msg.get("id", "")):
+                lst.sort(key=lambda m: (m.get("ts", 0), m.get("id", "")))
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+            with open(CHAT_DIR / f"{gid}.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        return True
+
+    # ---------- small helpers
+    @property
+    def me(self):
+        return self.win.cfg["device_id"]
+
+    def my_name(self):
+        return self.win.nearby.name()
+
+    def key(self, gid):
+        g = self.groups.get(gid)
+        return bytes.fromhex(g["key"]) if g and g.get("key") else None
+
+    def is_owner(self, gid):
+        g = self.groups.get(gid)
+        return bool(g) and g.get("owner") == self.me
+
+    def can_post(self, gid):
+        g = self.groups.get(gid)
+        return bool(g) and not g.get("removed") and (not g.get("owner_only") or g.get("owner") == self.me)
+
+    def active(self):
+        return any(not g.get("removed") for g in self.groups.values()) or self.join_active()
+
+    def is_online(self, did):
+        o = self.online.get(did)
+        return bool(o) and time.time() - o["seen"] < 12
+
+    def online_members(self, gid):
+        g = self.groups.get(gid) or {}
+        return [d for d in g.get("members", {}) if d != self.me and self.is_online(d)]
+
+    def ui(self, method, *args):
+        GLib.idle_add(lambda: getattr(self.win, method)(*args) or False)
+
+    def start(self):
+        if self.active():
+            self.pr.ensure_running()
+
+    def files_dir(self, gid):
+        return downloads_dir() / "Arckad-D Chat" / _safe_folder_name(self.groups.get(gid, {}).get("name", "Group"))
+
+    def _meta_for_members(self, g):
+        return {k: g[k] for k in ("id", "name", "owner", "key", "version", "owner_only", "members", "created") if k in g}
+
+    def _system(self, gid, text, share=True):
+        """A notice in the chat ("X joined"). The owner's notices go to everyone; others stay on this device."""
+        shared = share and self.is_owner(gid)
+        msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+               "kind": "system", "text": text}
+        if not shared:
+            msg["local"] = True
+        if self._append(gid, msg):
+            self.ui("on_chat_changed", gid)
+            if shared:
+                self._deliver(gid, msg)
+
+    # ---------- groups
+    def create_group(self, name):
+        gid = secrets.token_hex(8)
+        self.groups[gid] = {"id": gid, "name": name[:60], "owner": self.me, "key": secrets.token_bytes(32).hex(),
+                            "version": 1, "owner_only": False, "created": time.time(), "pair_keys": {}, "files": {},
+                            "members": {self.me: {"name": self.my_name(), "os": OS_NAME, "role": "owner",
+                                                  "joined": time.time()}}}
+        self.msgs[gid], self.ids[gid] = [], set()
+        self.save()
+        self._system(gid, f"{self.my_name()} created the group “{name}”")
+        self.start()
+        return gid
+
+    def set_owner_only(self, gid, on):
+        g = self.groups[gid]
+        g["owner_only"], g["version"] = bool(on), g.get("version", 1) + 1
+        self.save()
+        self._system(gid, "Only the owner can post now" if on else "Everyone can post again")
+        self.push_meta(gid)
+
+    def rename_group(self, gid, name):
+        g = self.groups[gid]
+        g["name"], g["version"] = name[:60], g.get("version", 1) + 1
+        self.save()
+        self._system(gid, f"Group renamed to “{name}”")
+        self.push_meta(gid)
+
+    def remove_member(self, gid, did):
+        """Owner only. The group gets a new key, so the removed device can't read anything new."""
+        g = self.groups[gid]
+        m = g["members"].pop(did, None)
+        if not m:
+            return
+        old_pair = g.get("pair_keys", {}).pop(did, None)
+        g["key"], g["version"] = secrets.token_bytes(32).hex(), g.get("version", 1) + 1
+        self.save()
+        self._system(gid, f"{m['name']} was removed from the group")
+        if old_pair:
+            threading.Thread(target=self._tell_removed, args=(gid, did, bytes.fromhex(old_pair)), daemon=True).start()
+        self.push_meta(gid)
+
+    def _tell_removed(self, gid, did, pair_key):
+        try:
+            self._request(gid, did, "POST", "/c/meta", {"id": gid, "removed": True}, pair_key=pair_key, timeout=6)
+        except Exception:
+            pass
+
+    def leave_group(self, gid):
+        """Member: tell the owner and stop. Owner: delete the group for everyone."""
+        g = self.groups.get(gid)
+        if not g:
+            return
+        if self.is_owner(gid):
+            for did, hexkey in list(g.get("pair_keys", {}).items()):
+                threading.Thread(target=self._tell_removed, args=(gid, did, bytes.fromhex(hexkey)), daemon=True).start()
+        elif not g.get("removed"):
+            owner = g.get("owner")
+            threading.Thread(target=lambda: self._try(lambda: self._request(gid, owner, "POST", "/c/leave", {},
+                                                                                 timeout=6)), daemon=True).start()
+        time.sleep(0.3)
+        with self.lock:
+            self.groups.pop(gid, None)
+            self.msgs.pop(gid, None)
+            self.ids.pop(gid, None)
+            self.save()
+            try:
+                (CHAT_DIR / f"{gid}.jsonl").unlink()
+            except OSError:
+                pass
+        self.ui("on_chat_changed", None)
+
+    @staticmethod
+    def _try(fn):
+        try:
+            return fn()
+        except Exception:
+            return None
+
+    def push_meta(self, gid):
+        """Owner: send the current membership and settings to every member (each under its private key)."""
+        g = self.groups.get(gid)
+        if not g or not self.is_owner(gid):
+            return
+        meta = self._meta_for_members(g)
+
+        def work():
+            for did, hexkey in list(g.get("pair_keys", {}).items()):
+                if did in g["members"]:
+                    self._try(lambda: self._request(gid, did, "POST", "/c/meta", meta, pair_key=bytes.fromhex(hexkey),
+                                                    timeout=6))
+        threading.Thread(target=work, daemon=True).start()
+        self.ui("on_chat_changed", gid)
+
+    def _apply_meta(self, gid, meta):
+        """Member: take the owner's membership/settings update."""
+        g = self.groups.get(gid)
+        if not g:
+            return
+        if meta.get("removed") or self.me not in (meta.get("members") or {self.me: 1}):
+            if not g.get("removed"):
+                g["removed"], g["key"] = True, ""
+                self.save()
+                self._system(gid, "You were removed from this group (or it was deleted). The history stays here.", share=False)
+            return
+        if int(meta.get("version", 0)) <= int(g.get("version", 0)):
+            return
+        for k in ("name", "owner_only", "members", "key", "version"):
+            if k in meta:
+                g[k] = meta[k]
+        self.save()
+        self._tag_cache = (None, {})
+        self.ui("on_chat_changed", gid)
+
+    # ---------- joining: owner shows a code
+    def new_join_code(self, gid):
+        self.start()
+        self.join = {"gid": gid, "code": f"{secrets.randbelow(1_000_000):06d}", "until": time.time() + 600,
+                     "tries": 0, "pending": {}}
+        self.pr.last_beacon = 0
+        return self.join["code"]
+
+    def join_active(self):
+        return bool(self.join) and time.time() < self.join["until"]
+
+    def stop_join(self):
+        self.join = None
+
+    def _join_start(self, req, ip):
+        if not self.join_active():
+            return {"ok": False, "reason": "no join code is shown on that device right now"}
+        try:
+            gid_, gpub = str(req["id"])[:40], int(req["pub"], 16)
+        except (KeyError, ValueError, TypeError):
+            return {"ok": False, "reason": "bad request"}
+        if not 1 < gpub < DH_P - 1:
+            return {"ok": False, "reason": "bad key"}
+        x = secrets.randbits(320)
+        pub = pow(2, x, DH_P)
+        shared = pow(gpub, x, DH_P).to_bytes(256, "big")
+        key = hashlib.sha256(b"arckad-chat-key|" + shared + gpub.to_bytes(256, "big") + pub.to_bytes(256, "big")).digest()
+        self.join["pending"][gid_] = {"key": key, "name": str(req.get("name") or "Unknown")[:40],
+                                      "os": str(req.get("os") or "")[:10], "ip": ip, "port": req.get("port")}
+        g = self.groups[self.join["gid"]]
+        return {"ok": True, "pub": format(pub, "x"), "group": g["name"], "owner": self.my_name(), "owner_id": self.me,
+                "port": self.pr.port}
+
+    def _join_confirm(self, req, ip):
+        did = str(req.get("id", ""))[:40]
+        j = self.join
+        st = j["pending"].get(did) if self.join_active() else None
+        if not st:
+            return {"ok": False, "reason": "the join code has expired; ask for a new one"}
+        if not hmacmod.compare_digest(_hm(st["key"], "join-guest", j["code"]).hex(), str(req.get("proof", ""))):
+            j["tries"] += 1
+            if j["tries"] >= 5:
+                self.join = None
+                self.ui("on_pair_event", "Too many wrong join codes: the code was cancelled.")
+            return {"ok": False, "reason": "wrong code"}
+        gid = j["gid"]
+        g = self.groups[gid]
+        ev = {"event": threading.Event(), "accepted": False, "name": st["name"], "os": st["os"], "group": g["name"]}
+        self.ui("ask_chat_join", ev)
+        ev["event"].wait(120)
+        if not ev["accepted"]:
+            return {"ok": False, "reason": "the group owner declined"}
+        g["members"][did] = {"name": st["name"], "os": st["os"], "role": "member", "joined": time.time()}
+        g.setdefault("pair_keys", {})[did] = st["key"].hex()
+        g["version"] = g.get("version", 1) + 1
+        self.online[did] = {"ip": ip, "port": st.get("port"), "seen": time.time()}
+        self.save()
+        self._tag_cache = (None, {})
+        self._system(gid, f"{st['name']} joined the group")
+        self.push_meta(gid)
+        meta = self._meta_for_members(g)
+        reply = seal(st["key"], json.dumps({"meta": meta, "proof": _hm(st["key"], "join-owner", j["code"]).hex()}).encode())
+        j["pending"].pop(did, None)
+        return {"ok": True, "sealed": base64.b64encode(reply).decode()}
+
+    # ---------- joining: member types the code
+    def join_with_code(self, code, host=None):
+        """Background thread. Returns (True, group name) or (False, reason)."""
+        import http.client
+        self.pr.ensure_running()
+        where = None
+        if host:
+            for port in PAIR_TCP_PORTS[:-1]:
+                if Paired._reachable(host, port):
+                    where = (socket.gethostbyname(host), port)
+                    break
+        else:
+            want = hashlib.sha256(f"arckad-chat-code|{code}".encode()).hexdigest()[:20]
+            end = time.time() + 8
+            while time.time() < end and not where:
+                hit = self.code_seen.get(want)
+                if hit and time.time() - hit[2] < 10:
+                    where = (hit[0], hit[1])
+                time.sleep(0.2)
+        if not where:
+            return False, ("No group showing that join code was found. Check the code and that the owner shows it "
+                           "right now. A firewall may be blocking it: use “Allow through firewall”, or type the "
+                           "owner's IP address.")
+        ip, port = where
+        x = secrets.randbits(320)
+        pub = pow(2, x, DH_P)
+
+        def call(path, obj):
+            c = http.client.HTTPConnection(ip, port, timeout=150)
+            c.request("POST", path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
+            r = c.getresponse()
+            data = json.loads(r.read() or b"{}")
+            c.close()
+            return data
+        try:
+            r1 = call("/cj/start", {"id": self.me, "name": self.my_name(), "os": OS_NAME, "pub": format(pub, "x"),
+                                    "port": self.pr.port})
+            if not r1.get("ok"):
+                return False, r1.get("reason", "refused")
+            opub = int(r1["pub"], 16)
+            if not 1 < opub < DH_P - 1:
+                return False, "bad key from the owner's device"
+            shared = pow(opub, x, DH_P).to_bytes(256, "big")
+            key = hashlib.sha256(b"arckad-chat-key|" + shared + pub.to_bytes(256, "big") + opub.to_bytes(256, "big")).digest()
+            r2 = call("/cj/confirm", {"id": self.me, "proof": _hm(key, "join-guest", code).hex()})
+            if not r2.get("ok"):
+                return False, r2.get("reason", "not approved")
+            data = json.loads(unseal(key, base64.b64decode(r2["sealed"])))
+            if not hmacmod.compare_digest(_hm(key, "join-owner", code).hex(), str(data.get("proof", ""))):
+                return False, "the owner's device couldn't prove it knows the code"
+        except (OSError, ValueError, KeyError) as ex:
+            return False, f"connection problem ({ex})"
+        meta = data["meta"]
+        gid = meta["id"]
+        with self.lock:
+            g = dict(meta, owner_key=key.hex(), files={})
+            self.groups[gid] = g
+            self.msgs.setdefault(gid, [])
+            self.ids.setdefault(gid, set())
+            self.save()
+        self.online[meta["owner"]] = {"ip": ip, "port": r1.get("port") or port, "seen": time.time()}
+        self._tag_cache = (None, {})
+        threading.Thread(target=self.sync_with, args=(gid, meta["owner"]), daemon=True).start()
+        self.ui("on_chat_changed", gid)
+        return True, meta["name"]
+
+    # ---------- presence: secret beacon tags per group (only members can recognise them)
+    def beacon_fields(self):
+        bucket = int(time.time() // 30)
+        out = {}
+        tags = [_hm(self.key(gid), "member", self.me, bucket).hex()[:24]
+                for gid, g in self.groups.items() if not g.get("removed") and g.get("key")]
+        if tags:
+            out["ctags"] = tags
+        if self.join_active():
+            out["chatjoin"] = hashlib.sha256(f"arckad-chat-code|{self.join['code']}".encode()).hexdigest()[:20]
+        return out
+
+    def _expected(self):
+        bucket = int(time.time() // 30)
+        stamp = (bucket, tuple(sorted((gid, g.get("key"), len(g.get("members", {}))) for gid, g in self.groups.items())))
+        if self._tag_cache[0] != stamp:
+            table = {}
+            for gid, g in self.groups.items():
+                if g.get("removed") or not g.get("key"):
+                    continue
+                k = bytes.fromhex(g["key"])
+                for did in g.get("members", {}):
+                    if did != self.me:
+                        for b in (bucket, bucket - 1):
+                            table[_hm(k, "member", did, b).hex()[:24]] = did
+            self._tag_cache = (stamp, table)
+        return self._tag_cache[1]
+
+    def on_udp(self, msg, ip):
+        if msg.get("chatjoin") and msg.get("port"):
+            self.code_seen[str(msg["chatjoin"])] = (ip, int(msg["port"]), time.time())
+        tags = msg.get("ctags") or []
+        if not tags:
+            return False
+        table = self._expected()
+        seen = {table[t] for t in tags if t in table}
+        for did in seen:
+            was = self.is_online(did)
+            self.online[did] = {"ip": ip, "port": msg.get("port"), "seen": time.time()}
+            if not was:
+                self.ui("on_chat_presence")
+                threading.Thread(target=self._came_online, args=(did,), daemon=True).start()
+        return bool(seen)
+
+    def direct_targets(self):
+        return {o["ip"] for o in self.online.values() if o.get("ip")}
+
+    def _came_online(self, did):
+        for gid, g in list(self.groups.items()):
+            if g.get("removed") or did not in g.get("members", {}):
+                continue
+            if g.get("owner") == did and not self.is_owner(gid):
+                self.pull_meta(gid)
+            self.sync_with(gid, did)
+
+    def tick(self):
+        """Called every few seconds: keep histories in step with someone online."""
+        now = time.time()
+        if now - self.last_sync < 45:
+            return
+        self.last_sync = now
+        for gid in list(self.groups):
+            online = self.online_members(gid)
+            if online:
+                threading.Thread(target=self.sync_with, args=(gid, secrets.choice(online)), daemon=True).start()
+
+    # ---------- talking to other members
+    def _request(self, gid, did, method, path, obj=None, pair_key=None, timeout=20, raw=False):
+        import http.client
+        o = self.online.get(did) or {}
+        ip, port = o.get("ip"), o.get("port")
+        if not ip or not port:
+            raise OSError("not online")
+        key = pair_key or self.key(gid)
+        body = seal(key, json.dumps(obj or {}).encode()) if obj is not None else b""
+        ts = int(time.time())
+        headers = {"X-Chat-Group": gid, "X-Chat-From": self.me, "X-Chat-Time": str(ts),
+                   "X-Chat-Sig": _hm(key, method, path, ts, self.me, gid).hex(), "Content-Length": str(len(body))}
+        if pair_key:
+            headers["X-Chat-Pair"] = "1"
+        c = http.client.HTTPConnection(ip, port, timeout=timeout)
+        c.request(method, path, body, headers)
+        r = c.getresponse()
+        if raw:
+            return c, r
+        data = r.read()
+        c.close()
+        if r.status in (401, 403) and not data.startswith(b"{"):
+            pass
+        if r.status != 200:
+            try:
+                reason = json.loads(unseal(key, data)).get("reason")
+            except Exception:
+                try:
+                    reason = json.loads(data).get("reason")
+                except Exception:
+                    reason = None
+            raise PermissionError(reason or f"refused ({r.status})")
+        return json.loads(unseal(key, data)) if data else {}
+
+    def pull_meta(self, gid):
+        g = self.groups.get(gid)
+        if not g or not g.get("owner_key"):
+            return
+        meta = self._try(lambda: self._request(gid, g["owner"], "POST", "/c/getmeta", {},
+                                               pair_key=bytes.fromhex(g["owner_key"]), timeout=8))
+        if meta:
+            self._apply_meta(gid, meta)
+
+    def sync_with(self, gid, did):
+        """Ask one member for the messages we don't have yet."""
+        g = self.groups.get(gid)
+        if not g or g.get("removed"):
+            return
+        cutoff = time.time() - CHAT_HISTORY_DAYS * 86400
+        with self.lock:
+            have = [m["id"] for m in self.msgs.get(gid, []) if m.get("ts", 0) > cutoff and not m.get("local")]
+        reply = self._try(lambda: self._request(gid, did, "POST", "/c/sync", {"ids": have}, timeout=30))
+        if not reply:
+            return
+        new = 0
+        for m in reply.get("msgs", [])[:2000]:
+            m = self._clean(m, gid)
+            if m and self._append(gid, m):
+                new += 1
+                if m["kind"] == "file":
+                    self._maybe_download(gid, m)
+        if new:
+            self.unread[gid] = self.unread.get(gid, 0) + new
+            self.ui("on_chat_changed", gid)
+
+    def _clean(self, m, gid):
+        """Only well-formed messages from current or past members get stored."""
+        if not isinstance(m, dict) or not isinstance(m.get("id"), str) or len(m["id"]) > 40:
+            return None
+        kind = m.get("kind")
+        if kind not in ("text", "file", "system"):
+            return None
+        out = {"id": m["id"], "from": str(m.get("from", ""))[:40], "name": str(m.get("name", "?"))[:40],
+               "ts": float(m.get("ts", 0) or 0), "kind": kind, "text": str(m.get("text", ""))[:8000]}
+        if kind == "file":
+            f = m.get("file") or {}
+            if not isinstance(f.get("id"), str) or not isinstance(f.get("size"), int):
+                return None
+            name = os.path.basename(str(f.get("name", "file")).replace("\\", "/"))[:200] or "file"
+            out["file"] = {"id": f["id"][:40], "name": name, "size": max(0, f["size"])}
+        return out
+
+    # ---------- sending
+    def send_text(self, gid, text):
+        text = text.strip()
+        if not text or not self.can_post(gid):
+            return
+        msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+               "kind": "text", "text": text[:8000]}
+        self._append(gid, msg)
+        self.ui("on_chat_changed", gid)
+        self._deliver(gid, msg)
+
+    def send_files(self, gid, paths):
+        if not self.can_post(gid):
+            return 0
+        n = 0
+        g = self.groups[gid]
+        for p in paths:
+            if not os.path.isfile(p):
+                continue
+            fid = secrets.token_hex(8)
+            g.setdefault("files", {})[fid] = p
+            msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+                   "kind": "file", "text": "", "file": {"id": fid, "name": os.path.basename(p),
+                                                        "size": os.path.getsize(p)}}
+            self._append(gid, msg)
+            self._deliver(gid, msg)
+            n += 1
+        self.save()
+        self.ui("on_chat_changed", gid)
+        return n
+
+    def _deliver(self, gid, msg):
+        def work():
+            for did in self.online_members(gid):
+                self._try(lambda: self._request(gid, did, "POST", "/c/msg", {"msg": msg}, timeout=10))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- attachments
+    def local_file(self, gid, fid):
+        p = (self.groups.get(gid) or {}).get("files", {}).get(fid)
+        return p if p and os.path.isfile(p) else None
+
+    def _maybe_download(self, gid, msg):
+        if msg["file"]["size"] <= CHAT_AUTO_DOWNLOAD and not self.local_file(gid, msg["file"]["id"]):
+            self.download(gid, msg)
+
+    def download(self, gid, msg):
+        fid = msg["file"]["id"]
+        if fid in self.downloading:
+            return
+        self.downloading.add(fid)
+        threading.Thread(target=self._download, args=(gid, msg), daemon=True).start()
+        self.ui("on_chat_changed", gid)
+
+    def _download(self, gid, msg):
+        fid, size = msg["file"]["id"], msg["file"]["size"]
+        try:
+            sources = [msg["from"]] + [d for d in self.online_members(gid) if d != msg["from"]]
+            for did in sources:
+                if not self.is_online(did):
+                    continue
+                key = self.key(gid)
+                try:
+                    c, r = self._request(gid, did, "GET", f"/c/file/{fid}", None, timeout=60, raw=True)
+                except Exception:
+                    continue
+                if r.status != 200:
+                    r.read()
+                    c.close()
+                    continue
+                folder = self.files_dir(gid)
+                folder.mkdir(parents=True, exist_ok=True)
+                dest = unique_target(folder / msg["file"]["name"])
+                tmp = dest.with_name(dest.name + ".part")
+                cipher = StreamCipher(_hm(key, "chatfile", fid))
+                mac = hmacmod.new(_hm(key, "chatfile-mac", fid), digestmod=hashlib.sha256)
+                left = size
+                with open(tmp, "wb") as f:
+                    while left > 0:
+                        chunk = r.read(min(1 << 18, left))
+                        if not chunk:
+                            break
+                        mac.update(chunk)
+                        f.write(cipher.apply(chunk))
+                        left -= len(chunk)
+                tag = r.read(32)
+                c.close()
+                if left or not hmacmod.compare_digest(tag, mac.digest()):
+                    tmp.unlink()
+                    continue
+                os.replace(tmp, dest)
+                with self.lock:
+                    self.groups[gid].setdefault("files", {})[fid] = str(dest)
+                    self.save()
+                return
+        finally:
+            self.downloading.discard(fid)
+            self.ui("on_chat_changed", gid)
+
+    # ---------- the server side (called from the Paired server's request handler)
+    def _auth(self, h):
+        gid, did = h.headers.get("X-Chat-Group", ""), h.headers.get("X-Chat-From", "")
+        g = self.groups.get(gid)
+        if not g or g.get("removed"):
+            return None, None, None
+        try:
+            ts = int(h.headers.get("X-Chat-Time", "0"))
+        except ValueError:
+            return None, None, None
+        if abs(time.time() - ts) > 600:
+            return None, None, None
+        if h.headers.get("X-Chat-Pair") == "1":
+            if g.get("owner") == self.me:
+                hexkey = g.get("pair_keys", {}).get(did)
+            elif did == g.get("owner"):
+                hexkey = g.get("owner_key")
+            else:
+                hexkey = None
+            if not hexkey:
+                return None, None, None
+            key, pair = bytes.fromhex(hexkey), True
+        else:
+            if did not in g.get("members", {}):
+                return None, None, None
+            key, pair = bytes.fromhex(g["key"]), False
+        sig = _hm(key, h.command, h.path, ts, did, gid).hex()
+        if not hmacmod.compare_digest(sig, h.headers.get("X-Chat-Sig", "")):
+            return None, None, None
+        o = self.online.get(did)
+        if o and o.get("port"):                    # a request from it also proves it's online
+            o["ip"], o["seen"] = h.client_address[0], time.time()
+        return gid, did, (key, pair)
+
+    def handle_post(self, h, path):
+        if path == "/cj/start":
+            return h._plain(200, self._join_start(json.loads(h._body(100_000)), h.client_address[0]))
+        if path == "/cj/confirm":
+            r = self._join_confirm(json.loads(h._body(100_000)), h.client_address[0])
+            return h._plain(200 if r.get("ok") else 403, r)
+        gid, did, auth = self._auth(h)
+        if not gid:
+            return h._plain(401, {"ok": False, "reason": "not a member"})
+        key, pair = auth
+        body = h._body(20_000_000)
+        req = json.loads(unseal(key, body)) if body else {}
+        g = self.groups[gid]
+
+        def reply(obj, code=200):
+            h._raw(code, seal(key, json.dumps(obj).encode()))
+        if path == "/c/msg" and not pair:
+            m = self._clean(req.get("msg"), gid)
+            if not m or m["from"] != did:
+                return reply({"ok": False, "reason": "bad message"}, 400)
+            if m["kind"] == "system" and did != g.get("owner"):
+                return reply({"ok": False, "reason": "only the owner's device sends notices"}, 403)
+            if g.get("owner_only") and did != g.get("owner"):
+                return reply({"ok": False, "reason": "only the owner can post in this group"}, 403)
+            if self._append(gid, m):
+                self.unread[gid] = self.unread.get(gid, 0) + 1
+                self.ui("on_chat_message", gid, m)
+                if m["kind"] == "file":
+                    self._maybe_download(gid, m)
+            return reply({"ok": True})
+        if path == "/c/sync" and not pair:
+            known = set(req.get("ids") or [])
+            cutoff = time.time() - CHAT_HISTORY_DAYS * 86400
+            with self.lock:
+                out = [{k: v for k, v in m.items() if k != "local"} for m in self.msgs.get(gid, [])
+                       if m["id"] not in known and m.get("ts", 0) > cutoff and not m.get("local")]
+            return reply({"ok": True, "msgs": out[-2000:]})
+        if path == "/c/meta" and pair and did == g.get("owner"):
+            self._apply_meta(gid, req)
+            return reply({"ok": True})
+        if path == "/c/getmeta" and pair and g.get("owner") == self.me:
+            if did not in g["members"]:
+                return reply({"id": gid, "removed": True})
+            return reply(self._meta_for_members(g))
+        if path == "/c/leave" and not pair and g.get("owner") == self.me:
+            name = g["members"].get(did, {}).get("name", "A member")
+            g["members"].pop(did, None)
+            g.get("pair_keys", {}).pop(did, None)
+            g["key"], g["version"] = secrets.token_bytes(32).hex(), g.get("version", 1) + 1
+            self.save()
+            self._system(gid, f"{name} left the group")
+            self.push_meta(gid)
+            return h._raw(200, seal(key, b'{"ok": true}'))
+        return reply({"ok": False, "reason": "unknown request"}, 404)
+
+    def handle_get(self, h, path):
+        gid, did, auth = self._auth(h)
+        if not gid or auth[1]:
+            return h._plain(401, {"ok": False})
+        parts = [p for p in path.split("/") if p]
+        fid = parts[2] if len(parts) == 3 else ""
+        src = self.local_file(gid, fid)
+        if not src:
+            return h._plain(404, {"ok": False})
+        key = auth[0]
+        size = os.path.getsize(src)
+        h.send_response(200)
+        h.send_header("Content-Type", "application/octet-stream")
+        h.send_header("Content-Length", str(size + 32))
+        h.end_headers()
+        cipher = StreamCipher(_hm(key, "chatfile", fid))
+        mac = hmacmod.new(_hm(key, "chatfile-mac", fid), digestmod=hashlib.sha256)
+        with open(src, "rb") as f:
+            left = size
+            while left > 0:
+                chunk = f.read(min(1 << 18, left))
+                if not chunk:
+                    break
+                enc = cipher.apply(chunk)
+                mac.update(enc)
+                h.wfile.write(enc)
+                left -= len(chunk)
+        h.wfile.write(mac.digest())
+
+
+# ---------------------------------------------------------------- Chat panel (right pane and its own window)
+CHAT_CSS = b"""
+.chat-bubble { border-radius: 14px; padding: 6px 11px; }
+.chat-mine { background-color: #2f7fd8; }
+.chat-mine label { color: #ffffff; }
+.chat-mine button label { color: inherit; }
+.chat-theirs { background-color: alpha(currentColor, 0.09); }
+.chat-system { opacity: 0.65; }
+.chat-code { font-size: 22px; font-weight: bold; letter-spacing: 4px; }
+"""
+_chat_css_loaded = []
+
+
+def _load_chat_css():
+    if not _chat_css_loaded:
+        prov = Gtk.CssProvider()
+        prov.load_from_data(CHAT_CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        _chat_css_loaded.append(prov)
+
+
+class ChatPanel(Gtk.Box):
+    def __init__(self, win, in_window=False):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=8)
+        _load_chat_css()
+        self.win, self.chat, self.in_window = win, win.chat, in_window
+        self.gid = None
+        self._combo_ids = []
+        self._syncing = False
+        self.set_size_request(340, -1)
+
+        top = Gtk.Box(spacing=4)
+        self.combo = Gtk.ComboBoxText(hexpand=True)
+        self.combo.connect("changed", self.on_group_changed)
+        top.pack_start(self.combo, True, True, 0)
+        plus = Gtk.Menu()
+        for label, cb in (("New group…", self.new_group), ("Join a group with a code…", self.show_join)):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            plus.append(it)
+        plus.show_all()
+        pb = Gtk.MenuButton(popup=plus)
+        pb.add(Gtk.Image.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON))
+        pb.set_tooltip_text("New group or join one")
+        top.add(pb)
+        self.more_menu = Gtk.Menu()
+        self.more_btn = Gtk.MenuButton(popup=self.more_menu)
+        self.more_btn.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
+        self.more_btn.set_tooltip_text("Group: invite people, members, settings")
+        self.more_btn.connect("toggled", lambda b: self.build_more_menu() if b.get_active() else None)
+        top.add(self.more_btn)
+        if not in_window:
+            pop = Gtk.Button.new_from_icon_name("window-new-symbolic", Gtk.IconSize.BUTTON)
+            pop.set_tooltip_text("Open the chat in its own window")
+            pop.connect("clicked", lambda *_: win.open_chat_window())
+            top.add(pop)
+        self.add(top)
+        self.info = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.info.get_style_context().add_class("dim-label")
+        self.add(self.info)
+
+        # join code shown by the owner
+        self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.code_label = Gtk.Label(selectable=True)
+        self.code_label.get_style_context().add_class("chat-code")
+        self.code_hint = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        stop = Gtk.Button(label="Stop inviting", halign=Gtk.Align.CENTER)
+        stop.connect("clicked", lambda *_: (self.chat.stop_join(), self.code_box.hide()))
+        for w in (self.code_label, self.code_hint, stop):
+            self.code_box.add(w)
+        self.code_box.set_no_show_all(True)
+        self.add(self.code_box)
+
+        # joining with a code
+        self.join_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        jr = Gtk.Box(spacing=4)
+        self.join_code = Gtk.Entry(placeholder_text="Join code", max_length=6, width_chars=8)
+        self.join_code.connect("activate", lambda *_: self.do_join())
+        self.join_ip = Gtk.Entry(placeholder_text="owner's IP (other network only)", hexpand=True)
+        self.join_btn = Gtk.Button(label="Join")
+        self.join_btn.get_style_context().add_class("suggested-action")
+        self.join_btn.connect("clicked", lambda *_: self.do_join())
+        jr.add(self.join_code)
+        jr.pack_start(self.join_ip, True, True, 0)
+        jr.add(self.join_btn)
+        self.join_status = Gtk.Label(xalign=0, wrap=True)
+        self.join_box.add(jr)
+        self.join_box.add(self.join_status)
+        self.join_box.set_no_show_all(True)
+        self.add(self.join_box)
+
+        # messages
+        self.stack = Gtk.Stack()
+        empty = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, valign=Gtk.Align.CENTER)
+        empty.set_markup("<big>💬</big>\n\n<b>Chat with your team</b>\n\nCreate a group with <b>＋ → New group</b>, "
+                         "or join one with a code from its owner.\n\n<small>Private and encrypted: it stays inside your "
+                         "network and only members can read it.</small>")
+        empty.set_margin_start(12)
+        empty.set_margin_end(12)
+        self.stack.add_named(empty, "empty")
+        self.scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.list.get_style_context().add_class("view")
+        self.scroll.add(self.list)
+        self.stack.add_named(self.scroll, "messages")
+        self.pack_start(self.stack, True, True, 0)
+
+        # composer
+        comp = Gtk.Box(spacing=4)
+        emo_pop = Gtk.Popover()
+        flow = Gtk.FlowBox(max_children_per_line=10, min_children_per_line=8, selection_mode=Gtk.SelectionMode.NONE,
+                           homogeneous=True)
+        for e in EMOJIS:
+            b = Gtk.Button(label=e)
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.connect("clicked", lambda _b, e=e: self.insert_emoji(e, emo_pop))
+            flow.add(b)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.set_size_request(360, 240)
+        sc.add(flow)
+        sc.show_all()
+        emo_pop.add(sc)
+        self.emo_btn = Gtk.MenuButton(label="😊", popover=emo_pop)
+        self.emo_btn.set_tooltip_text("Emoji")
+        self.attach_btn = Gtk.Button.new_from_icon_name("mail-attachment-symbolic", Gtk.IconSize.BUTTON)
+        self.attach_btn.set_tooltip_text("Attach files (or drag files here from the file list)")
+        self.attach_btn.connect("clicked", lambda *_: self.attach())
+        self.entry = Gtk.Entry(hexpand=True, placeholder_text="Message")
+        self.entry.connect("activate", lambda *_: self.send())
+        self.send_btn = Gtk.Button.new_from_icon_name("mail-send-symbolic", Gtk.IconSize.BUTTON)
+        self.send_btn.get_style_context().add_class("suggested-action")
+        self.send_btn.set_tooltip_text("Send (Enter)")
+        self.send_btn.connect("clicked", lambda *_: self.send())
+        for w in (self.emo_btn, self.attach_btn):
+            comp.add(w)
+        comp.pack_start(self.entry, True, True, 0)
+        comp.add(self.send_btn)
+        self.composer = comp
+        self.add(comp)
+        self.readonly = Gtk.Label(label="Only the group owner can post here.")
+        self.readonly.get_style_context().add_class("dim-label")
+        self.readonly.set_no_show_all(True)
+        self.add(self.readonly)
+
+        self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                           Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
+        self.connect("drag-data-received", self.on_drop)
+        self.refresh()
+
+    # ---------- state
+    def refresh(self, gid=None):
+        ids = sorted(self.chat.groups, key=lambda g: self.chat.groups[g].get("name", "").lower())
+        if ids != self._combo_ids or gid is None:
+            self._syncing = True
+            self.combo.remove_all()
+            for g in ids:
+                grp = self.chat.groups[g]
+                n = self.chat.unread.get(g, 0) if g != self.gid else 0
+                label = grp["name"] + ("  (left)" if grp.get("removed") else "") + (f"  • {n} new" if n else "")
+                self.combo.append(g, label)
+            self._combo_ids = ids
+            if self.gid not in ids:
+                self.gid = ids[0] if ids else None
+            if self.gid:
+                self.combo.set_active_id(self.gid)
+            self._syncing = False
+        if gid in (None, self.gid):
+            self.show_messages()
+        self.update_info()
+
+    def on_group_changed(self, combo):
+        if self._syncing:
+            return
+        self.gid = combo.get_active_id()
+        self.show_messages()
+        self.update_info()
+
+    def update_info(self):
+        g = self.chat.groups.get(self.gid) if self.gid else None
+        if not g:
+            self.info.set_text("")
+            self.composer.set_sensitive(False)
+            self.stack.set_visible_child_name("empty")
+            return
+        members = g.get("members", {})
+        online = len(self.chat.online_members(self.gid))
+        owner = members.get(g.get("owner"), {}).get("name", "?")
+        you = " (you)" if g.get("owner") == self.chat.me else ""
+        self.info.set_text(f"{len(members)} member{'s' if len(members) != 1 else ''} · {online} online · "
+                           f"owner: {owner}{you}" + (" · announcements only" if g.get("owner_only") else ""))
+        can = self.chat.can_post(self.gid)
+        self.composer.set_visible(can)
+        self.composer.set_sensitive(can)
+        self.readonly.set_visible(not can)
+        self.readonly.set_text("You're no longer a member of this group." if g.get("removed")
+                               else "Only the group owner can post here.")
+
+    def show_messages(self):
+        for r in self.list.get_children():
+            self.list.remove(r)
+        if not self.gid:
+            self.stack.set_visible_child_name("empty")
+            return
+        self.stack.set_visible_child_name("messages")
+        self.chat.unread[self.gid] = 0
+        last_day = None
+        for m in self.chat.msgs.get(self.gid, [])[-300:]:
+            day = time.strftime("%A %d %B %Y", time.localtime(m.get("ts", 0)))
+            if day != last_day:
+                last_day = day
+                d = Gtk.Label(margin_top=8, margin_bottom=2)
+                d.set_markup(f"<small><b>{esc(day)}</b></small>")
+                d.get_style_context().add_class("dim-label")
+                row = Gtk.ListBoxRow(activatable=False)
+                row.add(d)
+                self.list.add(row)
+            self.list.add(self._row(m))
+        self.list.show_all()
+        GLib.idle_add(self._scroll_bottom)
+        self.win.update_chat_button()
+
+    def _scroll_bottom(self):
+        adj = self.scroll.get_vadjustment()
+        adj.set_value(adj.get_upper())
+        return False
+
+    def _row(self, m):
+        row = Gtk.ListBoxRow(activatable=False)
+        mine = m.get("from") == self.chat.me
+        when = time.strftime("%H:%M", time.localtime(m.get("ts", 0)))
+        if m["kind"] == "system":
+            lbl = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, margin=4)
+            lbl.set_markup(f"<small>{esc(m.get('text', ''))} · {when}</small>")
+            lbl.get_style_context().add_class("chat-system")
+            row.add(lbl)
+            return row
+        outer = Gtk.Box(margin_start=6, margin_end=6, margin_top=3, margin_bottom=3)
+        bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        ctx = bubble.get_style_context()
+        ctx.add_class("chat-bubble")
+        ctx.add_class("chat-mine" if mine else "chat-theirs")
+        if not mine:
+            nm = Gtk.Label(xalign=0)
+            nm.set_markup(f"<small><b>{esc(m.get('name', '?'))}</b></small>")
+            bubble.add(nm)
+        if m["kind"] == "text":
+            t = Gtk.Label(label=m.get("text", ""), xalign=0, wrap=True, selectable=True, max_width_chars=38)
+            t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            bubble.add(t)
+        else:
+            bubble.add(self._file_box(m))
+        tl = Gtk.Label(xalign=1)
+        tl.set_markup(f"<small>{when}</small>")
+        tl.set_opacity(0.75)
+        bubble.add(tl)
+        if mine:
+            outer.pack_end(bubble, False, False, 0)
+            outer.set_margin_start(40)
+        else:
+            outer.pack_start(bubble, False, False, 0)
+            outer.set_margin_end(40)
+        row.add(outer)
+        return row
+
+    def _file_box(self, m):
+        f = m["file"]
+        box = Gtk.Box(spacing=8)
+        box.add(Gtk.Image.new_from_gicon(icon_for(f["name"], False), Gtk.IconSize.DND))
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        n = Gtk.Label(label=f["name"], xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=26)
+        texts.add(n)
+        s = Gtk.Label(xalign=0)
+        s.set_markup(f"<small>{human_size(f['size'])}</small>")
+        texts.add(s)
+        box.pack_start(texts, True, True, 0)
+        local = self.chat.local_file(self.gid, f["id"])
+        btns = Gtk.Box(spacing=2)
+        if local:
+            o = Gtk.Button(label="Open")
+            o.connect("clicked", lambda *_: self.win.open_file(local))
+            sh = Gtk.Button.new_from_icon_name("folder-open-symbolic", Gtk.IconSize.BUTTON)
+            sh.set_tooltip_text("Show in folder")
+            sh.connect("clicked", lambda *_: self.win.active.show_in_folder(local))
+            btns.add(o)
+            btns.add(sh)
+        elif f["id"] in self.chat.downloading:
+            btns.add(Gtk.Label(label="Downloading…"))
+        else:
+            d = Gtk.Button(label="Download")
+            d.set_tooltip_text("Downloads from the sender (or another member who has it) while they're online")
+            d.connect("clicked", lambda *_: self.chat.download(self.gid, m))
+            btns.add(d)
+        texts.add(btns)
+        return box
+
+    # ---------- actions
+    def send(self):
+        text = self.entry.get_text().strip()
+        if text and self.gid:
+            self.entry.set_text("")
+            self.chat.send_text(self.gid, text)
+            self.chat.start()
+
+    def insert_emoji(self, e, pop):
+        pos = self.entry.get_position()
+        self.entry.insert_text(e, pos)
+        self.entry.set_position(pos + len(e))
+        pop.popdown()
+        self.entry.grab_focus_without_selecting()
+
+    def attach(self):
+        if not self.gid:
+            return
+        dlg = Gtk.FileChooserNative(title="Attach files", transient_for=self.get_toplevel(),
+                                    action=Gtk.FileChooserAction.OPEN)
+        dlg.set_select_multiple(True)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            self.send_paths(dlg.get_filenames())
+        dlg.destroy()
+
+    def send_paths(self, paths):
+        if not self.gid or not self.chat.can_post(self.gid):
+            self.win.info("Choose a group you can post in first.")
+            return
+        folders = [p for p in paths if os.path.isdir(p)]
+        files = [p for p in paths if os.path.isfile(p)]
+        n = self.chat.send_files(self.gid, files)
+        if folders:
+            self.win.info("Folders can't be attached. Tip: right-click the folder → Compress, then attach the ZIP.")
+        return n
+
+    def on_drop(self, widget, context, x, y, selection, info, time_):
+        paths = [p for p in (Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])) if p]
+        if paths:
+            self.send_paths(paths)
+
+    def new_group(self):
+        name = self.win.ask_text("New group", "Group name (e.g. Accounts Team):", "")
+        if name and name.strip():
+            try:
+                self.gid = self.chat.create_group(name.strip())
+            except OSError as ex:
+                self.win.error(f"Couldn't start chat sharing: {ex}")
+                return
+            self.refresh()
+            self.invite()
+
+    def show_join(self):
+        self.join_box.set_no_show_all(False)
+        self.join_box.show_all()
+        self.join_status.set_text("Type the join code the group owner shows you. The owner then approves you.")
+        self.join_code.grab_focus()
+
+    def do_join(self):
+        code = "".join(c for c in self.join_code.get_text() if c.isdigit())
+        if len(code) != 6:
+            self.join_status.set_text("The join code has 6 digits.")
+            return
+        host = self.join_ip.get_text().strip() or None
+        self.join_btn.set_sensitive(False)
+        self.join_status.set_text("Looking for the group… then waiting for the owner to approve you.")
+
+        def work():
+            ok, msg = self.chat.join_with_code(code, host)
+            GLib.idle_add(done, ok, msg)
+
+        def done(ok, msg):
+            self.join_btn.set_sensitive(True)
+            if ok:
+                self.join_status.set_text("")
+                self.join_box.hide()
+                self.join_code.set_text("")
+                self.join_ip.set_text("")
+                gid = next((g for g, v in self.chat.groups.items() if v["name"] == msg), None)
+                if gid:
+                    self.gid = gid
+                self.refresh()
+                self.win.flash_all(f"Joined “{msg}”")
+            else:
+                self.join_status.set_text("✗ " + msg)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def invite(self):
+        if not self.gid or not self.chat.is_owner(self.gid):
+            return
+        try:
+            code = self.chat.new_join_code(self.gid)
+        except OSError as ex:
+            self.win.error(f"Couldn't start chat sharing: {ex}")
+            return
+        self.code_label.set_text(f"{code[:3]} {code[3:]}")
+        self.code_box.set_no_show_all(False)
+        self.code_box.show_all()
+        self._tick_code()
+        GLib.timeout_add_seconds(1, self._tick_code)
+
+    def _tick_code(self):
+        if not self.chat.join_active():
+            self.code_box.hide()
+            return False
+        left = int(self.chat.join["until"] - time.time())
+        name = self.chat.groups.get(self.chat.join["gid"], {}).get("name", "")
+        ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
+        self.code_hint.set_markup(f"<small>Join code for <b>{esc(name)}</b>. Others: <b>＋ → Join a group</b>, type "
+                                  f"this code, and you approve them. Valid {left // 60}:{left % 60:02d} · this "
+                                  f"computer is {esc(ips[0] if ips else '?')}</small>")
+        return True
+
+    def build_more_menu(self):
+        for c in self.more_menu.get_children():
+            self.more_menu.remove(c)
+        g = self.chat.groups.get(self.gid) if self.gid else None
+        if not g:
+            it = Gtk.MenuItem(label="Create or join a group first")
+            it.set_sensitive(False)
+            self.more_menu.append(it)
+            self.more_menu.show_all()
+            return
+        owner = self.chat.is_owner(self.gid)
+
+        def add(label, cb, ok=True):
+            it = Gtk.MenuItem(label=label)
+            it.set_sensitive(ok)
+            it.connect("activate", lambda *_: cb())
+            self.more_menu.append(it)
+        add("Invite people (show a join code)…", self.invite, owner and not g.get("removed"))
+        add("Members…", self.members_dialog)
+        if owner:
+            chk = Gtk.CheckMenuItem(label="Only I can post (announcements)")
+            chk.set_active(bool(g.get("owner_only")))
+            chk.connect("toggled", lambda c: self.chat.set_owner_only(self.gid, c.get_active()))
+            self.more_menu.append(chk)
+            add("Rename group…", self.rename)
+        add("Open the attachments folder", lambda: (self.chat.files_dir(self.gid).mkdir(parents=True, exist_ok=True),
+                                                    self.win.active.go(str(self.chat.files_dir(self.gid)))))
+        self.more_menu.append(Gtk.SeparatorMenuItem())
+        add("Delete group for everyone…" if owner else "Leave group…", self.leave)
+        self.more_menu.show_all()
+
+    def rename(self):
+        name = self.win.ask_text("Rename group", "New name:", self.chat.groups[self.gid]["name"])
+        if name and name.strip():
+            self.chat.rename_group(self.gid, name.strip())
+
+    def leave(self):
+        g = self.chat.groups[self.gid]
+        owner = self.chat.is_owner(self.gid)
+        q = (f"Delete “{g['name']}” for everyone?\n\nAll members are removed. Each keeps their own copy of the history."
+             if owner else f"Leave “{g['name']}”?\n\nYou'd need a new join code from the owner to come back.")
+        if self.win.confirm(q):
+            self.chat.leave_group(self.gid)
+            self.gid = None
+            self.refresh()
+
+    def members_dialog(self):
+        g = self.chat.groups.get(self.gid)
+        if not g:
+            return
+        dlg = Gtk.Dialog(title=f"Members of {g['name']}", transient_for=self.get_toplevel(), modal=True)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        dlg.set_default_size(420, -1)
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin=10)
+        owner = self.chat.is_owner(self.gid)
+        for did, m in sorted(g.get("members", {}).items(), key=lambda kv: (kv[1].get("role") != "owner", kv[1]["name"])):
+            row = Gtk.Box(spacing=8, margin=6)
+            on = did == self.chat.me or self.chat.is_online(did)
+            dot = Gtk.Label()
+            dot.set_markup(f"<span foreground='{'#2ec27e' if on else '#9a9996'}'>●</span>")
+            row.add(dot)
+            lbl = Gtk.Label(xalign=0, hexpand=True)
+            role = "owner" if m.get("role") == "owner" else "member"
+            you = " (you)" if did == self.chat.me else ""
+            lbl.set_markup(f"<b>{esc(m['name'])}</b>{you}\n<small>{role} · {esc(m.get('os', ''))}</small>")
+            row.pack_start(lbl, True, True, 0)
+            if owner and did != self.chat.me:
+                rm = Gtk.Button(label="Remove")
+                rm.connect("clicked", lambda _b, d=did, n=m["name"]: (
+                    self.win.confirm(f"Remove {n} from the group?") and (self.chat.remove_member(self.gid, d),
+                                                                         dlg.destroy())))
+                row.add(rm)
+            lb.add(row)
+        dlg.get_content_area().add(lb)
+        dlg.connect("response", lambda d, r: d.destroy())
+        dlg.show_all()
+
+
+class ChatWindow(Gtk.Window):
+    def __init__(self, win):
+        super().__init__(title=f"{APP_NAME} Chat")
+        self.set_default_size(520, 700)
+        self.set_icon(win.get_icon())
+        self.panel = ChatPanel(win, in_window=True)
+        self.add(self.panel)
+        self.connect("destroy", lambda *_: win.chat_windows.remove(self) if self in win.chat_windows else None)
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -5599,6 +6971,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.share = QuickShare(on_event=self.on_share_event)
         self.nearby = Nearby(self)
         self.paired = Paired(self)
+        self.chat = Chat(self)
+        self.chat_windows = []
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -5637,7 +7011,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(60, self.tick)
         self.on_index_updated()
         self.apply_autosort(startup=True)
-        if self.paired.pairs():                       # paired devices reconnect by themselves
+        if self.paired.pairs() or self.chat.active():   # paired devices and chat groups reconnect by themselves
             try:
                 self.paired.ensure_running()
             except OSError as ex:
@@ -5709,6 +7083,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
             ("New folder… (Ctrl+Shift+N)", lambda: self.new_folder(self.active)),
             ("New empty file…", lambda: self.new_file(self.active)),
+            ("Team chat in its own window", lambda: self.open_chat_window()),
             ("Open terminal here (F4)", lambda: self.open_terminal(self.active.location
                                                                    if is_folder_loc(self.active.location) else str(HOME))),
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
@@ -5764,6 +7139,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.preview_btn.set_tooltip_text("Show the preview panel (Space)")
         self.preview_btn.connect("toggled", self.on_preview_toggled)
         hb.pack_end(self.preview_btn)
+        self.chat_btn = Gtk.Button(label="💬 Chat")
+        self.chat_btn.set_tooltip_text("Team chat: groups, messages and files")
+        self.chat_btn.connect("clicked", lambda *_: self.toggle_chat())
+        hb.pack_end(self.chat_btn)
         self.dual_btn = Gtk.ToggleButton(label="Dual")
         self.dual_btn.set_tooltip_text("Two folders side by side (F3)")
         self.dual_btn.connect("toggled", self.on_dual_toggled)
@@ -5823,7 +7202,16 @@ class MainWindow(Gtk.ApplicationWindow):
         content.pack_start(self.dual_paned, True, True, 0)
         self.preview = PreviewPanel(self)
         self.preview_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_LEFT)
-        self.preview_rev.add(self.preview)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.right_stack.add_titled(self.preview, "preview", "Preview")
+        self.chat_panel = ChatPanel(self)
+        self.right_stack.add_titled(self.chat_panel, "chat", "Chat")
+        sw = Gtk.StackSwitcher(stack=self.right_stack, halign=Gtk.Align.CENTER, margin_top=6)
+        right.add(sw)
+        right.pack_start(self.right_stack, True, True, 0)
+        self.right_stack.connect("notify::visible-child-name", lambda *_: self.update_chat_button())
+        self.preview_rev.add(right)
         content.add(self.preview_rev)
         main.pack2(content, True, False)
         outer.pack_start(main, True, True, 0)
@@ -7543,6 +8931,102 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.share_win and self.share_win.get_visible():
             self.share_win.update_state()
         return True
+
+    # ---------- chat
+    def toggle_chat(self):
+        showing = self.preview_rev.get_reveal_child() and self.right_stack.get_visible_child_name() == "chat"
+        if showing:
+            self.right_stack.set_visible_child_name("preview")
+            self.preview_btn.set_active(False)
+        else:
+            self.right_stack.set_visible_child_name("chat")
+            self.preview_btn.set_active(True)
+            self.chat_panel.refresh()
+            self.chat_panel.entry.grab_focus()
+
+    def open_chat_window(self):
+        if self.chat_windows:
+            self.chat_windows[0].present()
+            return
+        w = ChatWindow(self)
+        self.chat_windows.append(w)
+        w.show_all()
+        if self.right_stack.get_visible_child_name() == "chat":
+            self.right_stack.set_visible_child_name("preview")
+
+    def chat_panels(self):
+        return [self.chat_panel] + [w.panel for w in self.chat_windows]
+
+    def on_chat_changed(self, gid):
+        for p in self.chat_panels():
+            p.refresh(gid)
+        self.update_chat_button()
+        return False
+
+    def on_chat_presence(self):
+        for p in self.chat_panels():
+            p.update_info()
+        return False
+
+    def on_chat_message(self, gid, msg):
+        self.on_chat_changed(gid)
+        visible = any(p.gid == gid and p.get_mapped() for p in self.chat_panels())
+        if visible and (self.is_active() or any(w.is_active() for w in self.chat_windows)):
+            self.chat.unread[gid] = 0
+            self.update_chat_button()
+            return False
+        g = self.chat.groups.get(gid, {})
+        body = f"📎 {msg['file']['name']}" if msg["kind"] == "file" else (msg.get("text") or "")
+        try:
+            n = Gio.Notification.new(f"{msg.get('name', '?')} · {g.get('name', 'Chat')}")
+            n.set_body(body[:200])
+            self.get_application().send_notification(f"chat-{gid}", n)
+        except Exception:
+            pass
+        return False
+
+    def update_chat_button(self):
+        total = sum(n for g, n in self.chat.unread.items() if g in self.chat.groups)
+        self.chat_btn.set_label(f"💬 Chat ({total})" if total else "💬 Chat")
+        return False
+
+    def flash_all(self, text):
+        if self.active:
+            self.active.flash(text)
+
+    def send_to_chat(self, paths):
+        if not self.chat.groups:
+            self.toggle_chat() if self.right_stack.get_visible_child_name() != "chat" else None
+            self.info("Create or join a chat group first (Chat → ＋).")
+            return
+        panel = self.chat_windows[0].panel if self.chat_windows else self.chat_panel
+        if panel is self.chat_panel and not (self.preview_rev.get_reveal_child()
+                                             and self.right_stack.get_visible_child_name() == "chat"):
+            self.toggle_chat()
+        n = panel.send_paths(paths)
+        if n:
+            self.flash_all(f"Sent {n} file{'s' if n != 1 else ''} to “{self.chat.groups[panel.gid]['name']}”")
+
+    def ask_chat_join(self, ev):
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
+                              text=f"Let {ev['name']} join “{ev['group']}”?")
+        d.format_secondary_text(f"{ev['name']} ({ev['os']}) typed the correct join code. Members can read and post "
+                                "messages and files in this group. You can remove them later.")
+        d.add_buttons("Decline", Gtk.ResponseType.REJECT, "Let them join", Gtk.ResponseType.ACCEPT)
+        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+        d.set_keep_above(True)
+
+        def respond(dlg, resp):
+            if not ev["event"].is_set():
+                ev["accepted"] = resp == Gtk.ResponseType.ACCEPT
+                ev["event"].set()
+            dlg.destroy()
+        d.connect("response", respond)
+        GLib.timeout_add_seconds(110, lambda: (d.response(Gtk.ResponseType.REJECT) if not ev["event"].is_set() else None)
+                                 and False)
+        d.show_all()
+        d.present()
+        return False
 
     def on_pairs_changed(self):
         if self.share_win:
