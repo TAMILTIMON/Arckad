@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.15.0"
+APP_VERSION = "3.15.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -7272,6 +7272,70 @@ def _load_chat_css():
         _chat_css_loaded.append(prov)
 
 
+# ---------- Arckad-D's own notification sounds (synthesised here: no sound files, nothing to license)
+import wave
+import struct
+import math
+
+_SOUNDS = {
+    # name: [(frequency Hz, start s, length s, loudness)]
+    "message": [(1046.5, 0.00, 0.55, 0.55), (1318.5, 0.09, 0.55, 0.50), (1568.0, 0.18, 0.75, 0.45)],   # C6 E6 G6
+    "request": [(784.0, 0.00, 0.70, 0.50), (1174.7, 0.16, 0.90, 0.45)],                                   # G5 D6
+}
+_last_sound = [0.0]
+
+
+def _sound_file(name):
+    """A soft bell chime: each note is a sine with a gentle overtone and a quick fade, written as a WAV once."""
+    path = CACHE_DIR / f"arckad-{name}-v1.wav"
+    if path.exists():
+        return path
+    rate, notes = 44100, _SOUNDS[name]
+    total = max(s + l for _f, s, l, _a in notes) + 0.05
+    buf = [0.0] * int(total * rate)
+    for f, start, length, amp in notes:
+        s0 = int(start * rate)
+        for i in range(int(length * rate)):
+            t = i / rate
+            env = min(1.0, t / 0.006) * math.exp(-t * 6.5)            # soft attack, bell-like decay
+            v = math.sin(2 * math.pi * f * t) + 0.28 * math.sin(2 * math.pi * f * 2.0 * t) * math.exp(-t * 9) \
+                + 0.10 * math.sin(2 * math.pi * f * 3.01 * t) * math.exp(-t * 14)
+            if s0 + i < len(buf):
+                buf[s0 + i] += amp * env * v
+    peak = max(abs(x) for x in buf) or 1.0
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with wave.open(str(tmp), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(x / peak * 0.42 * 32767)) for x in buf))
+    os.replace(tmp, path)
+    return path
+
+
+def play_sound(name):
+    """Play one of Arckad-D's sounds without blocking (at most one every 1.5 s)."""
+    if time.time() - _last_sound[0] < 1.5:
+        return
+    _last_sound[0] = time.time()
+
+    def work():
+        try:
+            path = _sound_file(name)
+            if IS_WIN:
+                import winsound
+                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+                return
+            for cmd in (["pw-play", str(path)], ["paplay", str(path)], ["aplay", "-q", str(path)]):
+                if shutil.which(cmd[0]):
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    return
+        except Exception:
+            pass
+    threading.Thread(target=work, daemon=True).start()
+
+
 # ---------- round avatars: a photo, or coloured initials
 _avatar_cache = {}
 _AVATAR_COLOURS = ("#1c71d8", "#26a269", "#c64600", "#9141ac", "#0e8a84", "#a51d2d", "#865e3c", "#3d3a9e", "#d63384")
@@ -7572,6 +7636,16 @@ class ChatPanel(Gtk.Box):
             it = Gtk.MenuItem(label=label)
             it.connect("activate", lambda _i, cb=cb: cb())
             lmenu.append(it)
+        snd = Gtk.CheckMenuItem(label="Message sounds")
+        snd.set_active(win.cfg.get("chat_sound", True))
+
+        def toggled(item):
+            win.cfg["chat_sound"] = item.get_active()
+            if item.get_active():
+                play_sound("message")
+        snd.connect("toggled", toggled)
+        lmenu.append(Gtk.SeparatorMenuItem())
+        lmenu.append(snd)
         lmenu.show_all()
         lm = Gtk.MenuButton(popup=lmenu)
         lm.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
@@ -8709,8 +8783,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.latest = None
         self.right_nb.set_visible(self.cfg["dual"])
         self.dual_btn.set_active(self.cfg["dual"])
-        self.preview_btn.set_active(self.cfg["preview"])
-        self.preview_rev.set_reveal_child(self.cfg["preview"])
+        GLib.idle_add(lambda: self.show_right("preview" if self.cfg["preview"] else None) and False)
         self.set_active(self.left_nb.get_nth_page(self.left_nb.get_current_page()))
 
         INDEX.listeners.append(self.on_index_updated)
@@ -8845,12 +8918,13 @@ class MainWindow(Gtk.ApplicationWindow):
         self.organize_btn.connect("clicked", lambda *_: self.organize(self.active))
         hb.pack_end(self.organize_btn)
         self.preview_btn = Gtk.ToggleButton(label="Preview")
-        self.preview_btn.set_tooltip_text("Show the preview panel (Space)")
+        self.preview_btn.set_tooltip_text("Show the preview panel (Space). Click again to close it")
         self.preview_btn.connect("toggled", self.on_preview_toggled)
         hb.pack_end(self.preview_btn)
-        self.chat_btn = Gtk.Button(label="💬 Chat")
-        self.chat_btn.set_tooltip_text("Team chat: groups, messages and files")
-        self.chat_btn.connect("clicked", lambda *_: self.toggle_chat())
+        self.chat_btn = Gtk.ToggleButton(label="💬 Chat")
+        self.chat_btn.set_tooltip_text("Team chat (click again to close)")
+        self.chat_btn.connect("toggled", lambda b: None if self._right_guard else
+                              self.show_right("chat" if b.get_active() else None))
         hb.pack_end(self.chat_btn)
         self.dual_btn = Gtk.ToggleButton(label="Dual")
         self.dual_btn.set_tooltip_text("Two folders side by side (F3)")
@@ -8908,22 +8982,29 @@ class MainWindow(Gtk.ApplicationWindow):
         self.right_nb = self._notebook()
         self.dual_paned.pack1(self.left_nb, True, False)
         self.dual_paned.pack2(self.right_nb, True, False)
-        content.pack_start(self.dual_paned, True, True, 0)
+        # right pane: Preview or Chat (the top-bar buttons switch it), width set by dragging the divider
         self.preview = PreviewPanel(self)
-        self.preview_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_LEFT)
-        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
-        self.right_stack.add_titled(self.preview, "preview", "Preview")
         self.chat_panel = ChatPanel(self)
-        self.right_stack.add_titled(self.chat_panel, "chat", "Chat")
-        sw = Gtk.StackSwitcher(stack=self.right_stack, halign=Gtk.Align.CENTER, margin_top=6)
-        right.add(sw)
-        right.pack_start(self.right_stack, True, True, 0)
-        self.right_stack.connect("notify::visible-child-name", lambda *_: self.update_chat_button())
-        self.preview_rev.add(right)
-        content.add(self.preview_rev)
+        self.right_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, hhomogeneous=False,
+                                     vhomogeneous=False)
+        self.right_stack.add_named(self.preview, "preview")
+        self.right_stack.add_named(self.chat_panel, "chat")
+        self.right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.right_box.pack_start(self.right_stack, True, True, 0)
+        self.right_box.set_no_show_all(True)
+        self.right_stack.show_all()
+        self.content_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.content_paned.pack1(self.dual_paned, True, False)
+        self.content_paned.pack2(self.right_box, False, False)
+        content.pack_start(self.content_paned, True, True, 0)
+        self._right = None
+        self._right_guard = False
         main.pack2(content, True, False)
-        outer.pack_start(main, True, True, 0)
+        # in-window pop-up for new chat messages (top centre)
+        self.overlay = Gtk.Overlay()
+        self.overlay.add(main)
+        self.overlay.add_overlay(self._build_toast())
+        outer.pack_start(self.overlay, True, True, 0)
         self.build_sidebar()
 
     def _notebook(self):
@@ -9633,15 +9714,42 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _update_preview(self):
         self.preview_timer = None
-        if self.active and self.preview_rev.get_reveal_child():
+        if self.active and self.right_showing("preview"):
             self.preview.show_paths(self.active.selected_paths())
         return False
 
     def on_preview_toggled(self, btn):
-        self.cfg["preview"] = btn.get_active()
-        self.preview_rev.set_reveal_child(btn.get_active())
-        if btn.get_active():
+        if not self._right_guard:
+            self.show_right("preview" if btn.get_active() else None)
+
+    def right_showing(self, page=None):
+        return self._right is not None and (page is None or self._right == page)
+
+    def show_right(self, page):
+        """Show the right pane with "preview" or "chat", or close it (None). The top-bar Preview and Chat
+        buttons act as on/off switches for it."""
+        if self._right and self.right_box.get_visible():
+            self.cfg["right_width"] = self.right_box.get_allocated_width()
+        self._right = page
+        self._right_guard = True
+        self.preview_btn.set_active(page == "preview")
+        self.chat_btn.set_active(page == "chat")
+        self._right_guard = False
+        self.cfg["preview"] = page == "preview"
+        if page:
+            self.right_stack.set_visible_child_name(page)
+            self.right_box.show()
+            width = max(300, min(int(self.cfg.get("right_width", 380)), 700))
+            total = self.content_paned.get_allocated_width()
+            if total > width + 300:
+                self.content_paned.set_position(total - width)
+        else:
+            self.right_box.hide()
+        if page == "preview":
             self._update_preview()
+        elif page == "chat":
+            self.chat_panel.refresh()
+        self.update_chat_button()
 
     def update_organize_hint(self):
         pane = self.active
@@ -10642,14 +10750,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     # ---------- chat
     def toggle_chat(self):
-        showing = self.preview_rev.get_reveal_child() and self.right_stack.get_visible_child_name() == "chat"
-        if showing:
-            self.right_stack.set_visible_child_name("preview")
-            self.preview_btn.set_active(False)
-        else:
-            self.right_stack.set_visible_child_name("chat")
-            self.preview_btn.set_active(True)
-            self.chat_panel.refresh()
+        self.show_right(None if self.right_showing("chat") else "chat")
+        if self.right_showing("chat") and self.chat_panel.gid:
             self.chat_panel.entry.grab_focus()
 
     def open_chat_window(self):
@@ -10659,8 +10761,8 @@ class MainWindow(Gtk.ApplicationWindow):
         w = ChatWindow(self)
         self.chat_windows.append(w)
         w.show_all()
-        if self.right_stack.get_visible_child_name() == "chat":
-            self.right_stack.set_visible_child_name("preview")
+        if self.right_showing("chat"):
+            self.show_right(None)
 
     def chat_panels(self):
         return [self.chat_panel] + [w.panel for w in self.chat_windows]
@@ -10671,6 +10773,65 @@ class MainWindow(Gtk.ApplicationWindow):
         self.update_chat_button()
         return False
 
+    # ---------- in-window pop-up (top centre) for new messages and friend requests
+    def _build_toast(self):
+        self.toast_rev = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_DOWN, transition_duration=220,
+                                      halign=Gtk.Align.CENTER, valign=Gtk.Align.START, margin_top=6)
+        frame = Gtk.Frame()
+        frame.get_style_context().add_class("app-notification")
+        ev = Gtk.EventBox()
+        box = Gtk.Box(spacing=12, margin=4)
+        self.toast_img = Gtk.Image()
+        box.add(self.toast_img)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+        self.toast_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=48)
+        self.toast_body = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=56)
+        texts.add(self.toast_title)
+        texts.add(self.toast_body)
+        box.pack_start(texts, True, True, 0)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.connect("clicked", lambda *_: self.toast_rev.set_reveal_child(False))
+        box.add(close)
+        ev.add(box)
+        ev.connect("button-press-event", lambda *_: self._toast_clicked())
+        ev.set_tooltip_text("Open")
+        frame.add(ev)
+        self.toast_rev.add(frame)
+        self.toast_action, self.toast_timer = None, None
+        return self.toast_rev
+
+    def show_toast(self, title, body, pixbuf, action, seconds=6):
+        self.toast_title.set_markup(f"<b>{esc(title)}</b>")
+        self.toast_body.set_text(body.replace("\n", " ")[:160])
+        self.toast_img.set_from_pixbuf(pixbuf)
+        self.toast_action = action
+        self.toast_rev.show_all()
+        self.toast_rev.set_reveal_child(True)
+        if self.toast_timer:
+            GLib.source_remove(self.toast_timer)
+        self.toast_timer = GLib.timeout_add_seconds(seconds, self._toast_hide)
+
+    def _toast_hide(self):
+        self.toast_timer = None
+        self.toast_rev.set_reveal_child(False)
+        return False
+
+    def _toast_clicked(self):
+        self._toast_hide()
+        if self.toast_action:
+            self.toast_action()
+        return True
+
+    def open_chat_from_toast(self, gid):
+        if self.chat_windows:
+            self.chat_windows[0].present()
+            self.chat_windows[0].panel.open_chat(gid)
+            return
+        if not self.right_showing("chat"):
+            self.show_right("chat")
+        self.chat_panel.open_chat(gid)
+
     def on_people_changed(self):
         for p in self.chat_panels():
             p.refresh()
@@ -10680,7 +10841,11 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_friend_request(self, pid):
         self.on_people_changed()
         name = self.chat.contacts["incoming"].get(pid, {}).get("name", "Someone")
-        self.flash_all(f"👋 {name} sent you a friend request (Chat → People)")
+        self.show_toast(f"{name} wants to be your friend", "Click to accept or decline",
+                        avatar_pixbuf(name, self.chat.avatar_file(pid), 40),
+                        lambda: (self.show_right("chat"), self.chat_panel.show_people()), seconds=10)
+        if self.cfg.get("chat_sound", True):
+            play_sound("request")
         try:
             n = Gio.Notification.new(f"{name} wants to be your friend")
             n.set_body("Open Chat → 👥 People to accept or decline.")
@@ -10696,13 +10861,25 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def on_chat_message(self, gid, msg):
         self.on_chat_changed(gid)
-        visible = any(p.gid == gid and p.get_mapped() for p in self.chat_panels())
+        visible = any(p.gid == gid and p.get_mapped() and p.pages.get_visible_child_name() == "conv"
+                      for p in self.chat_panels())
         if visible and (self.is_active() or any(w.is_active() for w in self.chat_windows)):
             self.chat.unread[gid] = 0
             self.update_chat_button()
             return False
+        if msg["kind"] == "system":
+            return False
         g = self.chat.groups.get(gid, {})
-        body = f"📎 {msg['file']['name']}" if msg["kind"] == "file" else (msg.get("text") or "")
+        body = {"file": f"📎 {(msg.get('file') or {}).get('name', 'file')}", "sticker": "🏷 Sticker"}.get(
+            msg["kind"], msg.get("text") or "")
+        direct = g.get("kind") == "direct"
+        title = msg.get("name", "?") if direct else f"{msg.get('name', '?')} · {g.get('name', 'Chat')}"
+        pix = avatar_pixbuf(msg.get("name", "?"), self.chat.avatar_file(msg.get("from")), 40)
+        self.show_toast(title, body, pix, lambda: self.open_chat_from_toast(gid))
+        if self.cfg.get("chat_sound", True):
+            play_sound("message")
+        if self.is_active() or any(w.is_active() for w in self.chat_windows):
+            return False                                 # the pop-up is enough while you're in Arckad-D
         try:
             n = Gio.Notification.new(f"{msg.get('name', '?')} · {g.get('name', 'Chat')}")
             n.set_body(body[:200])
@@ -10722,12 +10899,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def send_to_chat(self, paths):
         if not self.chat.groups:
-            self.toggle_chat() if self.right_stack.get_visible_child_name() != "chat" else None
+            self.toggle_chat() if not self.right_showing("chat") else None
             self.info("Create or join a chat group first (Chat → ＋).")
             return
         panel = self.chat_windows[0].panel if self.chat_windows else self.chat_panel
-        if panel is self.chat_panel and not (self.preview_rev.get_reveal_child()
-                                             and self.right_stack.get_visible_child_name() == "chat"):
+        if panel is self.chat_panel and not self.right_showing("chat"):
             self.toggle_chat()
         n = panel.send_paths(paths)
         if n:
@@ -11098,6 +11274,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def on_close(self, *_):
         self.preview.flush_note()
+        if self._right and self.right_box.get_visible():
+            self.cfg["right_width"] = self.right_box.get_allocated_width()
         self.cfg["size"] = list(self.get_size())
         self.cfg["tabs"] = {side: [nb.get_nth_page(i).location for i in range(nb.get_n_pages())]
                             for side, nb in (("left", self.left_nb), ("right", self.right_nb))}
