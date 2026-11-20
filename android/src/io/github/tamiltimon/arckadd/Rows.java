@@ -171,7 +171,15 @@ final class Rows {
                 else Android.openWith(a, e.f);
             }).show();
         } else if (e.kind.equals("Apps")) {
-            Android.install(a, e.f);
+            Ui.dialog(a).setTitle(e.name)
+                    .setMessage("To install this app, open it from your phone's own Files app (or your browser's downloads). "
+                            + "Arckad-D doesn't install apps itself, which keeps it trusted by Google Play Protect.")
+                    .setPositiveButton("OK", null)
+                    .setNeutralButton("Share", (d, w) -> {
+                        ArrayList<File> l = new ArrayList<>();
+                        l.add(e.f);
+                        Android.share(a, l);
+                    }).show();
         } else {
             Android.openWith(a, e.f);
         }

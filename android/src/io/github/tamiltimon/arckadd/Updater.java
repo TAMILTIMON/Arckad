@@ -1,23 +1,12 @@
 package io.github.tamiltimon.arckadd;
 
 import android.app.Activity;
-import android.app.AlertDialog;
-import android.content.Intent;
-import android.net.Uri;
-import android.os.Build;
-import android.provider.Settings;
-import android.widget.LinearLayout;
-import android.widget.ProgressBar;
-import android.widget.TextView;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 
@@ -106,64 +95,11 @@ final class Updater {
         }).start();
     }
 
+    /** Downloads in the browser; the person taps the finished file and chooses Update.
+     *  (Arckad-D doesn't install apps itself: that needs a sensitive permission Play Protect distrusts.) */
     private static void download(final Activity a, final String url, final String version) {
-        if (Build.VERSION.SDK_INT >= 26 && !a.getPackageManager().canRequestPackageInstalls()) {
-            Ui.dialog(a).setTitle("Allow updates")
-                    .setMessage("Android needs your OK once: turn on “Allow from this source” for Arckad-D, then come back and tap Update again.")
-                    .setPositiveButton("Open settings", (d, w) -> a.startActivity(new Intent(
-                            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + a.getPackageName()))))
-                    .setNegativeButton("Cancel", null).show();
-            return;
-        }
-        LinearLayout box = new LinearLayout(a);
-        box.setOrientation(LinearLayout.VERTICAL);
-        int p = Ui.dp(a, 20);
-        box.setPadding(p, p, p, 0);
-        final ProgressBar bar = new ProgressBar(a, null, android.R.attr.progressBarStyleHorizontal);
-        bar.setMax(1000);
-        final TextView label = Ui.text(a, "Downloading…", 14, Ui.TEXT, false);
-        box.addView(label);
-        box.addView(bar);
-        final boolean[] cancelled = {false};
-        final AlertDialog d = Ui.dialog(a).setTitle("Updating to " + version).setView(box)
-                .setNegativeButton("Cancel", (di, w) -> cancelled[0] = true).setCancelable(false).show();
-        new Thread(() -> {
-            File out = new File(a.getExternalCacheDir() != null ? a.getExternalCacheDir() : a.getCacheDir(), "Arckad-D-update.apk");
-            String err = null;
-            try {
-                HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-                c.setInstanceFollowRedirects(true);
-                c.setRequestProperty("User-Agent", "Arckad-D-Android/" + BuildInfo.VERSION);
-                long total = c.getContentLengthLong(), done = 0, last = 0;
-                byte[] buf = new byte[128 * 1024];
-                try (InputStream in = c.getInputStream(); OutputStream o = new FileOutputStream(out)) {
-                    int n;
-                    while ((n = in.read(buf)) > 0) {
-                        if (cancelled[0]) throw new Exception("cancelled");
-                        o.write(buf, 0, n);
-                        done += n;
-                        long now = System.currentTimeMillis();
-                        if (now - last > 200) {
-                            last = now;
-                            final long dd = done;
-                            a.runOnUiThread(() -> {
-                                if (total > 0) bar.setProgress((int) (dd * 1000 / total));
-                                label.setText(Fs.size(dd) + (total > 0 ? " of " + Fs.size(total) : ""));
-                            });
-                        }
-                    }
-                }
-                if (total > 0 && done != total) err = "the download was incomplete";
-            } catch (Exception e) {
-                err = e.getMessage();
-            }
-            final String fErr = err;
-            a.runOnUiThread(() -> {
-                d.dismiss();
-                if (cancelled[0]) return;
-                if (fErr != null) Ui.toast(a, "Update failed: " + fErr);
-                else Android.install(a, out);
-            });
-        }).start();
+        Android.openUrl(a, url);
+        Ui.info(a, "Downloading Arckad-D " + version, "Your browser is downloading the update. When it finishes, "
+                + "tap the downloaded file and choose Update. Your settings stay.");
     }
 }

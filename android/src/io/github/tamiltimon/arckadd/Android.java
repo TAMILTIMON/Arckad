@@ -61,12 +61,6 @@ final class Android {
         }
     }
 
-    static void install(Activity a, File apk) {
-        Intent i = new Intent(Intent.ACTION_VIEW).setDataAndType(Provider.uriFor(apk), "application/vnd.android.package-archive")
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-        a.startActivity(i);
-    }
-
     static void openUrl(Context c, String url) {
         try {
             c.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
