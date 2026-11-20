@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.11.1"
+APP_VERSION = "3.11.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -4496,7 +4496,7 @@ class ShareWindow(Gtk.Window):
         show_code.get_style_context().add_class("suggested-action")
         show_code.connect("clicked", lambda *_: self.show_pair_code())
         enter_code = Gtk.Button(label="I have a code")
-        enter_code.connect("clicked", lambda *_: self.code_entry_box.set_visible(not self.code_entry_box.get_visible()))
+        enter_code.connect("clicked", lambda *_: self.toggle_code_entry())
         btns.add(show_code)
         btns.add(enter_code)
         page.add(btns)
@@ -4529,6 +4529,16 @@ class ShareWindow(Gtk.Window):
         page.add(self.code_entry_box)
         self.refresh_pairs()
         return page
+
+    def toggle_code_entry(self):
+        """Show / hide the code box. (It starts hidden, so its contents must be revealed too.)"""
+        if self.code_entry_box.get_visible():
+            self.code_entry_box.hide()
+            return
+        self.code_entry_box.set_no_show_all(False)
+        self.code_entry_box.show_all()
+        self.pair_status.set_text("Type the 6-digit code shown on the other device.")
+        self.code_entry.grab_focus()
 
     def refresh_pairs(self):
         pr = self.win.paired
