@@ -1,10 +1,13 @@
-# Arckad-D for Android
+# Arckad-D for Android (native)
 
-Built automatically by GitHub (see `.github/workflows/build.yml`) into `Arckad-D-<version>.apk`.
+Plain Android (Java, no extra libraries), built by `build-apk.sh` with the SDK tools GitHub already has.
 
-* `main.py` – the phone screens (Kivy)
-* `arckad_core.py` – files, thumbnails, and Nearby / link sharing (same protocol as the desktop app)
-* `fonts/materialdesignicons-webfont.ttf` – icons (Material Design Icons, Apache 2.0 / OFL, from pictogrammers.com)
-* `signing/debug.keystore` – fixed signing key, so a new APK installs as an update over the old one
+* `src/.../MainActivity.java` – tabs: Files · Recent · Send · Receive
+* `FilesScreen`, `RecentScreen`, `ShareScreens` – the four tabs
+* `PhotoActivity` + `PhotoPager` – photo viewer (swipe, pinch / double-tap zoom)
+* `PdfActivity` – PDF reader (Android's PdfRenderer) · `TextActivity` – text / code viewer
+* `Net` – Nearby send/receive + link sharing (same protocol as the desktop app) · `Qr` – QR codes
+* `Provider` – hands files to other apps safely (content:// links) · `Updater` – updates from GitHub Releases
 
-The version number comes from `APP_VERSION` in `../arckad-d.py`.
+The version comes from `APP_VERSION` in `../arckad-d.py`. `signing/debug.keystore` keeps the signature
+the same, so each new APK installs as an update.

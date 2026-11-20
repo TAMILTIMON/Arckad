@@ -93,68 +93,19 @@ jobs:
 
   android:
     name: Android app (.apk)
-    needs: version
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential git zip unzip autoconf automake libtool libltdl-dev pkg-config \
-            zlib1g-dev libncurses-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
-          python -m pip install --upgrade pip
-          # versions that belong together (buildozer 1.5 + python-for-android 2024.01.21)
-          python -m pip install "buildozer==1.5.0" "Cython==0.29.36" "setuptools<70" wheel
-      - name: Use the version from arckad-d.py and the fixed signing key
-        run: |
-          sed -i 's/^__version__ = .*/__version__ = "${{ needs.version.outputs.version }}"/' android/main.py
-          mkdir -p ~/.android
-          cp android/signing/debug.keystore ~/.android/debug.keystore
-      - name: Reuse downloaded Android tools from earlier builds
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.buildozer
-            android/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('android/buildozer.spec') }}
-      - name: Build the APK (first time takes about 30 minutes)
-        working-directory: android
-        run: |
-          set +e
-          yes | buildozer android debug 2>&1 | tee build.log
-          status=${PIPESTATUS[1]}          # buildozer's own result ("yes" always ends with a harmless broken pipe)
-          ls -la bin/ || true
-          exit $status
-      - name: Show the Android build errors
-        if: failure()
-        run: |
-          sed 's/\x1b\[[0-9;]*m//g' android/build.log > clean.log
-          echo "=== error lines ==="
-          grep -n -E "ERROR:|Error:|error:|Command failed|No such file|not found" clean.log \
-            | grep -v -E "performance hint|warning|Dependency for .* not resolved" | tail -n 40 || true
-          echo "=== last lines before the settings list ==="
-          grep -v -E '^#     ' clean.log | tail -n 80
-      - name: Keep the full Android build log
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-build-log
-          path: android/build.log
-      - name: Name the APK
-        run: |
-          mkdir -p apk-out
-          cp android/bin/*.apk "apk-out/Arckad-D-${{ needs.version.outputs.version }}.apk"
+      - name: Build the APK (about a minute, native Android, no extra downloads)
+        run: bash android/build-apk.sh
       - uses: actions/upload-artifact@v4
         with:
           name: Arckad-D-Android
-          path: apk-out/*.apk
+          path: android/build/Arckad-D-*.apk
 
   release:
     name: Publish release
