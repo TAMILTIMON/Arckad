@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.13.0"
+APP_VERSION = "3.14.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5687,11 +5687,133 @@ class Paired:
 import base64
 
 CHAT_DIR = CONFIG_DIR / "chat"
+STICKER_DIR = CHAT_DIR / "stickers"
+STICKER_MAX = 3 * 1024 * 1024
+IMAGE_EXTS = {"jpg", "jpeg", "png", "gif", "webp", "bmp"}
+
+# ---- per-person signatures: standard RSA-2048 (RSASSA-PKCS1-v1_5 with SHA-256), built-in Python only
+
+def _probable_prime(n, rounds=40):
+    if n < 2: return False
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0: return n == p
+    d, s = n - 1, 0
+    while d % 2 == 0: d //= 2; s += 1
+    for _ in range(rounds):
+        a = secrets.randbelow(n - 3) + 2
+        x = pow(a, d, n)
+        if x in (1, n - 1): continue
+        for _ in range(s - 1):
+            x = pow(x, 2, n)
+            if x == n - 1: break
+        else: return False
+    return True
+
+def _prime(bits):
+    while True:
+        c = secrets.randbits(bits) | (1 << (bits - 1)) | (1 << (bits - 2)) | 1
+        if c % 65537 != 1 and _probable_prime(c): return c
+
+def rsa_generate(bits=2048):
+    e = 65537
+    while True:
+        p, q = _prime(bits // 2), _prime(bits // 2)
+        if p == q: continue
+        n = p * q
+        if n.bit_length() != bits: continue
+        phi = (p - 1) * (q - 1)
+        try: d = pow(e, -1, phi)
+        except ValueError: continue
+        return {"n": format(n, "x"), "d": format(d, "x"), "p": format(p, "x"), "q": format(q, "x")}
+
+_SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+
+def _emsa(data, k):
+    t = _SHA256_PREFIX + hashlib.sha256(data).digest()
+    return b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+
+def rsa_sign(key, data):
+    n, d, p, q = (int(key[x], 16) for x in ("n", "d", "p", "q"))
+    k = (n.bit_length() + 7) // 8
+    m = int.from_bytes(_emsa(data, k), "big")
+    sp, sq = pow(m, d % (p - 1), p), pow(m, d % (q - 1), q)
+    s = sq + q * ((pow(q, -1, p) * (sp - sq)) % p)
+    return s.to_bytes(k, "big").hex()
+
+def rsa_verify(n_hex, data, sig_hex):
+    try:
+        n = int(n_hex, 16); s = int(sig_hex, 16)
+    except (TypeError, ValueError):
+        return False
+    k = (n.bit_length() + 7) // 8
+    if not 0 < s < n: return False
+    return pow(s, 65537, n).to_bytes(k, "big") == _emsa(data, k)
+
+
+# ---- built-in stickers (drawn by Arckad-D, so no licensing issues)
+_STICKER_SYMBOLS = {
+    "check": '<path d="M52 64 l20 20 l38 -40" fill="none" stroke="#fff" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>',
+    "cross": '<path d="M56 36 l48 48 M104 36 l-48 48" fill="none" stroke="#fff" stroke-width="13" stroke-linecap="round"/>',
+    "star": '<path d="M80 22 l12 25 l27 4 l-20 19 l5 27 l-24 -13 l-24 13 l5 -27 l-20 -19 l27 -4z" fill="#fff"/>',
+    "heart": '<path d="M80 92 C40 66 44 34 64 32 C74 31 79 38 80 43 C81 38 86 31 96 32 C116 34 120 66 80 92z" fill="#fff"/>',
+    "clock": '<circle cx="80" cy="60" r="32" fill="none" stroke="#fff" stroke-width="9"/><path d="M80 42 v20 l13 9" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round"/>',
+    "alert": '<path d="M80 26 v40" stroke="#fff" stroke-width="15" stroke-linecap="round"/><circle cx="80" cy="88" r="9" fill="#fff"/>',
+    "question": '<path d="M62 46 a18 18 0 1 1 26 16 c-6 3 -8 7 -8 14" fill="none" stroke="#fff" stroke-width="11" stroke-linecap="round"/><circle cx="80" cy="92" r="8" fill="#fff"/>',
+    "cup": '<path d="M52 40 h48 v26 a22 22 0 0 1 -48 0z" fill="#fff"/><path d="M100 46 h6 a10 10 0 0 1 0 20 h-7" fill="none" stroke="#fff" stroke-width="7"/><path d="M60 92 h40" stroke="#fff" stroke-width="7" stroke-linecap="round"/>',
+    "party": '<circle cx="50" cy="40" r="7" fill="#fff"/><circle cx="104" cy="34" r="6" fill="#ffe066"/><circle cx="80" cy="56" r="10" fill="#fff"/><circle cx="62" cy="80" r="6" fill="#ffe066"/><circle cx="110" cy="72" r="8" fill="#fff"/><path d="M40 92 l12 -12 M120 50 l10 -6" stroke="#fff" stroke-width="5" stroke-linecap="round"/>',
+    "plate": '<circle cx="80" cy="60" r="30" fill="none" stroke="#fff" stroke-width="8"/><path d="M38 34 v52 M122 34 v52" stroke="#fff" stroke-width="7" stroke-linecap="round"/>',
+    "hand": '<path d="M64 92 v-34 a7 7 0 0 1 14 0 v-16 a7 7 0 0 1 14 0 v22 l8 -8 a7 7 0 0 1 10 10 l-20 26 z" fill="#fff"/>',
+}
+STICKERS = [  # id, words, colour, symbol
+    ("approved", "APPROVED", "#26a269", "check"), ("done", "DONE!", "#2ec27e", "check"),
+    ("thanks", "THANK YOU", "#9141ac", "heart"), ("great", "GREAT JOB", "#e66100", "star"),
+    ("onit", "ON IT", "#1c71d8", "hand"), ("urgent", "URGENT", "#e01b24", "alert"),
+    ("question", "QUESTION?", "#0e8a84", "question"), ("meeting", "MEETING", "#3d3a9e", "clock"),
+    ("lunch", "LUNCH?", "#c88800", "plate"), ("coffee", "COFFEE BREAK", "#865e3c", "cup"),
+    ("welcome", "WELCOME!", "#c64600", "star"), ("birthday", "HAPPY BIRTHDAY", "#d63384", "party"),
+    ("noted", "NOTED", "#5e5c64", "check"), ("later", "LATER", "#77767b", "clock"),
+    ("yes", "YES!", "#1f8f4e", "check"), ("no", "NO", "#a51d2d", "cross"),
+]
+
+
+def sticker_svg(sid):
+    for i, words, colour, sym in STICKERS:
+        if i == sid:
+            size = 26 if len(words) <= 7 else (21 if len(words) <= 10 else (17 if len(words) <= 12 else 14))
+            return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160">'
+                    f'<rect x="6" y="6" width="148" height="148" rx="34" fill="{colour}"/>'
+                    f'<rect x="6" y="6" width="148" height="74" rx="34" fill="#ffffff" opacity=".10"/>'
+                    f'{_STICKER_SYMBOLS[sym]}'
+                    f'<text x="80" y="134" text-anchor="middle" fill="#fff" font-weight="800" font-size="{size}" '
+                    f'font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif">{esc(words)}</text></svg>')
+    return None
+
+
+def sticker_pixbuf(sid, px):
+    svg = sticker_svg(sid)
+    if not svg:
+        return None
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.set_size(px, px)
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf()
+    except Exception:
+        return None
+
 CHAT_AUTO_DOWNLOAD = 50 * 1024 * 1024        # attachments up to this size download by themselves
 CHAT_HISTORY_DAYS = 120
 EMOJIS = ("😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😎 🤩 🥳 🤔 🤨 😐 😑 🙄 😏 😴 😌 😮 😯 😲 😳 🥺 "
           "😢 😭 😤 😠 😡 🤯 😱 😬 🤝 👍 👎 👏 🙌 🙏 💪 👀 👋 ✌️ 👌 🤞 ☝️ 👉 ✅ ❌ ⚠️ ❗ ❓ 💯 🔥 ⭐ ✨ 🎉 🎂 🎁 "
           "❤️ 🧡 💛 💚 💙 💜 🤍 💔 📁 📂 📄 📎 📌 📅 📊 📈 📝 ✏️ 💼 🖥️ 💻 📱 ☎️ 📧 🔒 🔑 ⏰ ☕ 🍕 🚀 🏠").split()
+
+
+def _backup_key(password, salt, kdf="scrypt"):
+    """A key from the backup password; scrypt makes guessing passwords slow and expensive."""
+    if kdf == "scrypt":
+        return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 15, r=8, p=1, maxmem=2 ** 26, dklen=32)
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600_000, 32)
 
 
 def _safe_folder_name(name):
@@ -5714,7 +5836,9 @@ class Chat:
         self.lock = threading.RLock()
         self._tag_cache = (None, {})
         self.last_sync = 0
+        self.ident = None
         self.load()
+        threading.Thread(target=self.identity, daemon=True).start()     # make the signing key in the background
 
     # ---------- storage (plain JSON in your config folder, readable only by you)
     def load(self):
@@ -5762,6 +5886,41 @@ class Chat:
         return True
 
     # ---------- small helpers
+    # ---------- this device's signing key (made once, ~1 s)
+    def identity(self):
+        with self.lock:
+            if self.ident is None:
+                data = read_json(CHAT_DIR / "identity.json", {})
+                if not (isinstance(data, dict) and data.get("n") and data.get("d")):
+                    data = rsa_generate()
+                    CHAT_DIR.mkdir(parents=True, exist_ok=True)
+                    write_json(CHAT_DIR / "identity.json", data)
+                    if not IS_WIN:
+                        try:
+                            os.chmod(CHAT_DIR / "identity.json", 0o600)
+                        except OSError:
+                            pass
+                self.ident = data
+        return self.ident
+
+    def my_pub(self):
+        return self.identity()["n"]
+
+    @staticmethod
+    def _sig_payload(gid, m):
+        f = m.get("file") or {}
+        return json.dumps([gid, m.get("id"), m.get("from"), int(round(float(m.get("ts", 0)) * 1000)), m.get("kind"),
+                           m.get("text", ""), [f.get("id"), f.get("name"), f.get("size")] if f else None,
+                           m.get("sticker")], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    def _sign(self, gid, m):
+        m["sig"] = rsa_sign(self.identity(), self._sig_payload(gid, m))
+        return m
+
+    def pub_of(self, gid, did):
+        g = self.groups.get(gid) or {}
+        return (g.get("members", {}).get(did) or g.get("past", {}).get(did) or {}).get("pub")
+
     @property
     def me(self):
         return self.win.cfg["device_id"]
@@ -5803,7 +5962,8 @@ class Chat:
         return downloads_dir() / "Arckad-D Chat" / _safe_folder_name(self.groups.get(gid, {}).get("name", "Group"))
 
     def _meta_for_members(self, g):
-        return {k: g[k] for k in ("id", "name", "owner", "key", "version", "owner_only", "members", "created") if k in g}
+        return {k: g[k] for k in ("id", "name", "owner", "key", "version", "owner_only", "members", "created", "past")
+                if k in g}
 
     def _system(self, gid, text, share=True):
         """A notice in the chat ("X joined"). The owner's notices go to everyone; others stay on this device."""
@@ -5812,6 +5972,8 @@ class Chat:
                "kind": "system", "text": text}
         if not shared:
             msg["local"] = True
+        else:
+            self._sign(gid, msg)
         if self._append(gid, msg):
             self.ui("on_chat_changed", gid)
             if shared:
@@ -5823,7 +5985,7 @@ class Chat:
         self.groups[gid] = {"id": gid, "name": name[:60], "owner": self.me, "key": secrets.token_bytes(32).hex(),
                             "version": 1, "owner_only": False, "created": time.time(), "pair_keys": {}, "files": {},
                             "members": {self.me: {"name": self.my_name(), "os": OS_NAME, "role": "owner",
-                                                  "joined": time.time()}}}
+                                                  "joined": time.time(), "pub": self.my_pub()}}}
         self.msgs[gid], self.ids[gid] = [], set()
         self.save()
         self._system(gid, f"{self.my_name()} created the group “{name}”")
@@ -5850,6 +6012,7 @@ class Chat:
         m = g["members"].pop(did, None)
         if not m:
             return
+        g.setdefault("past", {})[did] = {"name": m["name"], "pub": m.get("pub")}
         old_pair = g.get("pair_keys", {}).pop(did, None)
         g["key"], g["version"] = secrets.token_bytes(32).hex(), g.get("version", 1) + 1
         self.save()
@@ -5923,7 +6086,7 @@ class Chat:
             return
         if int(meta.get("version", 0)) <= int(g.get("version", 0)):
             return
-        for k in ("name", "owner_only", "members", "key", "version"):
+        for k in ("name", "owner_only", "members", "key", "version", "past"):
             if k in meta:
                 g[k] = meta[k]
         self.save()
@@ -5958,7 +6121,8 @@ class Chat:
         shared = pow(gpub, x, DH_P).to_bytes(256, "big")
         key = hashlib.sha256(b"arckad-chat-key|" + shared + gpub.to_bytes(256, "big") + pub.to_bytes(256, "big")).digest()
         self.join["pending"][gid_] = {"key": key, "name": str(req.get("name") or "Unknown")[:40],
-                                      "os": str(req.get("os") or "")[:10], "ip": ip, "port": req.get("port")}
+                                      "os": str(req.get("os") or "")[:10], "ip": ip, "port": req.get("port"),
+                                      "pub": str(req.get("sigpub") or "")[:1100]}
         g = self.groups[self.join["gid"]]
         return {"ok": True, "pub": format(pub, "x"), "group": g["name"], "owner": self.my_name(), "owner_id": self.me,
                 "port": self.pr.port}
@@ -5983,6 +6147,8 @@ class Chat:
         if not ev["accepted"]:
             return {"ok": False, "reason": "the group owner declined"}
         g["members"][did] = {"name": st["name"], "os": st["os"], "role": "member", "joined": time.time()}
+        if st.get("pub"):
+            g["members"][did]["pub"] = st["pub"]
         g.setdefault("pair_keys", {})[did] = st["key"].hex()
         g["version"] = g.get("version", 1) + 1
         self.online[did] = {"ip": ip, "port": st.get("port"), "seen": time.time()}
@@ -6031,7 +6197,7 @@ class Chat:
             return data
         try:
             r1 = call("/cj/start", {"id": self.me, "name": self.my_name(), "os": OS_NAME, "pub": format(pub, "x"),
-                                    "port": self.pr.port})
+                                    "port": self.pr.port, "sigpub": self.my_pub()})
             if not r1.get("ok"):
                 return False, r1.get("reason", "refused")
             opub = int(r1["pub"], 16)
@@ -6108,12 +6274,30 @@ class Chat:
     def direct_targets(self):
         return {o["ip"] for o in self.online.values() if o.get("ip")}
 
+    def ensure_my_pub(self, gid):
+        """Groups made before signatures: give the owner this device's public key."""
+        g = self.groups.get(gid)
+        if not g or g.get("removed"):
+            return
+        mine = g.get("members", {}).get(self.me)
+        if mine is None or mine.get("pub") == self.my_pub():
+            return
+        if self.is_owner(gid):
+            mine["pub"] = self.my_pub()
+            g["version"] = g.get("version", 1) + 1
+            self.save()
+            self.push_meta(gid)
+        elif g.get("owner_key") and self.is_online(g["owner"]):
+            self._try(lambda: self._request(gid, g["owner"], "POST", "/c/setpub", {"pub": self.my_pub()},
+                                            pair_key=bytes.fromhex(g["owner_key"]), timeout=8))
+
     def _came_online(self, did):
         for gid, g in list(self.groups.items()):
             if g.get("removed") or did not in g.get("members", {}):
                 continue
             if g.get("owner") == did and not self.is_owner(gid):
                 self.pull_meta(gid)
+                self.ensure_my_pub(gid)
             self.sync_with(gid, did)
 
     def tick(self):
@@ -6186,7 +6370,7 @@ class Chat:
             m = self._clean(m, gid)
             if m and self._append(gid, m):
                 new += 1
-                if m["kind"] == "file":
+                if m.get("file"):
                     self._maybe_download(gid, m)
         if new:
             self.unread[gid] = self.unread.get(gid, 0) + new
@@ -6197,16 +6381,29 @@ class Chat:
         if not isinstance(m, dict) or not isinstance(m.get("id"), str) or len(m["id"]) > 40:
             return None
         kind = m.get("kind")
-        if kind not in ("text", "file", "system"):
+        if kind not in ("text", "file", "system", "sticker"):
             return None
         out = {"id": m["id"], "from": str(m.get("from", ""))[:40], "name": str(m.get("name", "?"))[:40],
                "ts": float(m.get("ts", 0) or 0), "kind": kind, "text": str(m.get("text", ""))[:8000]}
-        if kind == "file":
-            f = m.get("file") or {}
+        f = m.get("file")
+        if kind == "file" or (kind == "sticker" and f):
+            f = f or {}
             if not isinstance(f.get("id"), str) or not isinstance(f.get("size"), int):
                 return None
             name = os.path.basename(str(f.get("name", "file")).replace("\\", "/"))[:200] or "file"
             out["file"] = {"id": f["id"][:40], "name": name, "size": max(0, f["size"])}
+        if kind == "sticker":
+            out["sticker"] = str(m.get("sticker", ""))[:40]
+            if out["sticker"] != "custom" and not sticker_svg(out["sticker"]):
+                return None
+        # who really sent it: check the sender's signature against the key the owner gave us
+        pub = self.pub_of(gid, out["from"])
+        if pub:
+            if not rsa_verify(pub, self._sig_payload(gid, dict(out)), str(m.get("sig", ""))):
+                return None                                   # forged or altered: dropped
+            out["sig"] = m["sig"]
+        else:
+            out["unverified"] = True                          # sender from before signatures existed
         return out
 
     # ---------- sending
@@ -6214,8 +6411,8 @@ class Chat:
         text = text.strip()
         if not text or not self.can_post(gid):
             return
-        msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
-               "kind": "text", "text": text[:8000]}
+        msg = self._sign(gid, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+                               "kind": "text", "text": text[:8000]})
         self._append(gid, msg)
         self.ui("on_chat_changed", gid)
         self._deliver(gid, msg)
@@ -6230,9 +6427,9 @@ class Chat:
                 continue
             fid = secrets.token_hex(8)
             g.setdefault("files", {})[fid] = p
-            msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
-                   "kind": "file", "text": "", "file": {"id": fid, "name": os.path.basename(p),
-                                                        "size": os.path.getsize(p)}}
+            msg = self._sign(gid, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(),
+                                   "ts": time.time(), "kind": "file", "text": "",
+                                   "file": {"id": fid, "name": os.path.basename(p), "size": os.path.getsize(p)}})
             self._append(gid, msg)
             self._deliver(gid, msg)
             n += 1
@@ -6240,11 +6437,169 @@ class Chat:
         self.ui("on_chat_changed", gid)
         return n
 
+    def send_sticker(self, gid, sid=None, image=None):
+        """A built-in sticker (sid) or one of your own sticker images (image path)."""
+        if not self.can_post(gid):
+            return
+        msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+               "kind": "sticker", "text": "", "sticker": sid or "custom"}
+        if image:
+            fid = secrets.token_hex(8)
+            self.groups[gid].setdefault("files", {})[fid] = image
+            msg["file"] = {"id": fid, "name": os.path.basename(image), "size": os.path.getsize(image)}
+            self.save()
+        self._sign(gid, msg)
+        self._append(gid, msg)
+        self.ui("on_chat_changed", gid)
+        self._deliver(gid, msg)
+
+    # ---------- your own stickers
+    @staticmethod
+    def my_stickers():
+        try:
+            return sorted(str(p) for p in STICKER_DIR.iterdir() if ext_of(p.name) in IMAGE_EXTS | {"svg"})
+        except OSError:
+            return []
+
+    @staticmethod
+    def add_sticker(path):
+        if os.path.getsize(path) > STICKER_MAX:
+            raise ValueError("Sticker images must be smaller than 3 MB.")
+        if ext_of(path) not in IMAGE_EXTS | {"svg"}:
+            raise ValueError("Use a PNG, JPG, GIF, WebP or SVG image.")
+        STICKER_DIR.mkdir(parents=True, exist_ok=True)
+        target = unique_target(STICKER_DIR / os.path.basename(path))
+        shutil.copy2(path, target)
+        return str(target)
+
     def _deliver(self, gid, msg):
         def work():
             for did in self.online_members(gid):
                 self._try(lambda: self._request(gid, did, "POST", "/c/msg", {"msg": msg}, timeout=10))
         threading.Thread(target=work, daemon=True).start()
+
+    # ---------- backup: one password-protected .arckadchat file
+    def export_backup(self, dest, password, with_files=True):
+        """Returns (number of groups, messages, files) written."""
+        salt = secrets.token_bytes(16)
+        kdf = "scrypt" if hasattr(hashlib, "scrypt") else "pbkdf2"
+        key = _backup_key(password, salt, kdf)
+        with self.lock:
+            data = {"format": 1, "made": time.time(), "app": APP_VERSION, "device_id": self.me,
+                    "device_name": self.my_name(), "identity": self.identity(),
+                    "groups": json.loads(json.dumps(self.groups)), "msgs": json.loads(json.dumps(self.msgs))}
+        files = []
+        if with_files:
+            for gid, g in data["groups"].items():
+                for fid, path in (g.get("files") or {}).items():
+                    if path and os.path.isfile(path):
+                        files.append((gid, fid, path))
+        tmp = Path(str(dest) + ".part")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+            z.writestr("README.txt", "Arckad-D chat backup (encrypted).\nRestore it in Arckad-D: Chat → ⋯ → Restore chats "
+                                     "from backup, and type its password.\n")
+            z.writestr("kdf", f"{kdf}:{salt.hex()}")
+            z.writestr("chat.enc", seal(key, json.dumps(data, ensure_ascii=False).encode("utf-8")))
+            for gid, fid, path in files:
+                cipher = StreamCipher(_hm(key, "backup-file", gid, fid))
+                mac = hmacmod.new(_hm(key, "backup-file-mac", gid, fid), digestmod=hashlib.sha256)
+                with open(path, "rb") as src, z.open(f"files/{gid}/{fid}", "w", force_zip64=True) as out:
+                    while True:
+                        chunk = src.read(1 << 18)
+                        if not chunk:
+                            break
+                        enc = cipher.apply(chunk)
+                        mac.update(enc)
+                        out.write(enc)
+                    out.write(mac.digest())
+        os.replace(tmp, dest)
+        return len(data["groups"]), sum(len(v) for v in data["msgs"].values()), len(files)
+
+    @staticmethod
+    def read_backup(path, password):
+        """Decrypt a backup: (data, key). Raises ValueError for a wrong password or a damaged file."""
+        try:
+            with zipfile.ZipFile(path) as z:
+                kdf, salt = z.read("kdf").decode().split(":")
+                key = _backup_key(password, bytes.fromhex(salt), kdf)
+                blob = z.read("chat.enc")
+        except (zipfile.BadZipFile, KeyError, ValueError, OSError):
+            raise ValueError("This isn't an Arckad-D chat backup, or the file is damaged.")
+        try:
+            data = json.loads(unseal(key, blob))
+        except ValueError:
+            raise ValueError("Wrong password.")
+        if data.get("format") != 1:
+            raise ValueError("This backup was made by a newer Arckad-D. Update Arckad-D first.")
+        return data, key
+
+    def restore_backup(self, path, data, key, take_identity):
+        """Merge a backup into this device. take_identity: continue as the device that made the backup
+        (so you stay a member of its groups). Returns (groups added, messages added, files restored)."""
+        if take_identity:
+            self.win.cfg["device_id"] = data["device_id"]
+            write_json(CONFIG_FILE, self.win.cfg)
+            with self.lock:
+                self.ident = data["identity"]
+                CHAT_DIR.mkdir(parents=True, exist_ok=True)
+                write_json(CHAT_DIR / "identity.json", self.ident)
+        added_groups = added_msgs = restored = 0
+        for gid, g in data.get("groups", {}).items():
+            with self.lock:
+                mine = self.groups.get(gid)
+                if mine is None:
+                    g = dict(g, files={})
+                    if self.me not in g.get("members", {}):
+                        g["removed"], g["key"] = True, ""          # history only: this device isn't a member
+                    self.groups[gid] = g
+                    self.msgs.setdefault(gid, [])
+                    self.ids.setdefault(gid, set())
+                    added_groups += 1
+                elif int(g.get("version", 0)) > int(mine.get("version", 0)) and self.me in g.get("members", {}):
+                    for k in ("name", "owner_only", "members", "key", "version", "past", "pair_keys", "owner_key"):
+                        if k in g:
+                            mine[k] = g[k]
+            for m in data.get("msgs", {}).get(gid, []):
+                if self._append(gid, m):
+                    added_msgs += 1
+        try:
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    parts = name.split("/")
+                    if len(parts) != 3 or parts[0] != "files" or parts[1] not in self.groups:
+                        continue
+                    gid, fid = parts[1], parts[2]
+                    if self.local_file(gid, fid):
+                        continue
+                    fname = next((m["file"]["name"] for m in self.msgs.get(gid, [])
+                                  if (m.get("file") or {}).get("id") == fid), fid)
+                    folder = self.files_dir(gid)
+                    folder.mkdir(parents=True, exist_ok=True)
+                    dest = unique_target(folder / os.path.basename(fname))
+                    cipher = StreamCipher(_hm(key, "backup-file", gid, fid))
+                    mac = hmacmod.new(_hm(key, "backup-file-mac", gid, fid), digestmod=hashlib.sha256)
+                    size = z.getinfo(name).file_size - 32
+                    with z.open(name) as src, open(dest, "wb") as out:
+                        left = size
+                        while left > 0:
+                            chunk = src.read(min(1 << 18, left))
+                            if not chunk:
+                                break
+                            mac.update(chunk)
+                            out.write(cipher.apply(chunk))
+                            left -= len(chunk)
+                        tag = src.read(32)
+                    if left or not hmacmod.compare_digest(tag, mac.digest()):
+                        dest.unlink()
+                        continue
+                    self.groups[gid].setdefault("files", {})[fid] = str(dest)
+                    restored += 1
+        except (zipfile.BadZipFile, OSError):
+            pass
+        self.save()
+        self._tag_cache = (None, {})
+        self.ui("on_chat_changed", None)
+        return added_groups, added_msgs, restored
 
     # ---------- attachments
     def local_file(self, gid, fid):
@@ -6369,7 +6724,7 @@ class Chat:
             if self._append(gid, m):
                 self.unread[gid] = self.unread.get(gid, 0) + 1
                 self.ui("on_chat_message", gid, m)
-                if m["kind"] == "file":
+                if m.get("file"):
                     self._maybe_download(gid, m)
             return reply({"ok": True})
         if path == "/c/sync" and not pair:
@@ -6386,9 +6741,18 @@ class Chat:
             if did not in g["members"]:
                 return reply({"id": gid, "removed": True})
             return reply(self._meta_for_members(g))
+        if path == "/c/setpub" and pair and g.get("owner") == self.me and did in g["members"]:
+            pub = str(req.get("pub") or "")[:1100]
+            if pub and not g["members"][did].get("pub"):          # set once; a changed key needs re-joining
+                g["members"][did]["pub"] = pub
+                g["version"] = g.get("version", 1) + 1
+                self.save()
+                self.push_meta(gid)
+            return reply({"ok": True})
         if path == "/c/leave" and not pair and g.get("owner") == self.me:
-            name = g["members"].get(did, {}).get("name", "A member")
-            g["members"].pop(did, None)
+            left = g["members"].pop(did, {})
+            name = left.get("name", "A member")
+            g.setdefault("past", {})[did] = {"name": name, "pub": left.get("pub")}
             g.get("pair_keys", {}).pop(did, None)
             g["key"], g["version"] = secrets.token_bytes(32).hex(), g.get("version", 1) + 1
             self.save()
@@ -6447,6 +6811,130 @@ def _load_chat_css():
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         _chat_css_loaded.append(prov)
+
+
+def _gst():
+    """GStreamer for the built-in camera (Linux), or None."""
+    try:
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        if Gst.ElementFactory.find("gdkpixbufsink") and Gst.ElementFactory.find("videoconvert"):
+            return Gst
+    except (ImportError, ValueError):
+        pass
+    return None
+
+
+class CameraDialog(Gtk.Dialog):
+    """Live camera picture with a Take photo button (Linux, GStreamer). run() → saved photo path or None."""
+    SOURCE = "v4l2src"
+
+    def __init__(self, parent):
+        super().__init__(title="Take a photo", transient_for=parent, modal=True)
+        self.set_default_size(680, 560)
+        self.Gst = _gst()
+        self.photo = None
+        self.view = Gtk.Image(vexpand=True)
+        self.msg = Gtk.Label(wrap=True, margin=8)
+        box = self.get_content_area()
+        box.pack_start(self.view, True, True, 0)
+        box.add(self.msg)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.snap = self.add_button("📷  Take photo", Gtk.ResponseType.OK)
+        self.snap.get_style_context().add_class("suggested-action")
+        self.snap.set_sensitive(False)
+        self.pipe = None
+        self.connect("response", self.on_response)
+        self.connect("destroy", lambda *_: self.stop())
+        self.start()
+
+    def start(self):
+        Gst = self.Gst
+        try:
+            self.pipe = Gst.parse_launch(f"{self.SOURCE} ! videoconvert ! gdkpixbufsink name=sink")
+        except GLib.Error as ex:
+            self.msg.set_text(f"The camera couldn't start: {ex.message}")
+            return
+        self.sink = self.pipe.get_by_name("sink")
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_error)
+        self.pipe.set_state(Gst.State.PLAYING)
+        self.msg.set_text("Starting the camera…")
+        GLib.timeout_add(66, self.update)
+
+    def on_error(self, bus, message):
+        err, _dbg = message.parse_error()
+        self.msg.set_text(f"The camera reported a problem: {err.message}\n(Is another app using it?)")
+        self.snap.set_sensitive(False)
+        self.stop()
+
+    def update(self):
+        if not self.pipe:
+            return False
+        pb = self.sink.get_property("last-pixbuf")
+        if pb is not None:
+            self.frame = pb
+            alloc = self.view.get_allocation()
+            w, h = max(alloc.width, 320), max(alloc.height, 240)
+            scale = min(w / pb.get_width(), h / pb.get_height())
+            self.view.set_from_pixbuf(pb.scale_simple(max(1, int(pb.get_width() * scale)),
+                                                      max(1, int(pb.get_height() * scale)),
+                                                      GdkPixbuf.InterpType.BILINEAR))
+            if not self.snap.get_sensitive():
+                self.snap.set_sensitive(True)
+                self.msg.set_text("Smile 🙂 then click Take photo.")
+        return True
+
+    def on_response(self, dlg, resp):
+        if resp == Gtk.ResponseType.OK and getattr(self, "frame", None) is not None:
+            folder = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or str(HOME)) / "Arckad-D Camera"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = unique_target(folder / time.strftime("Photo %Y-%m-%d %H.%M.%S.jpg"))
+            self.frame.savev(str(path), "jpeg", ["quality"], ["92"])
+            self.photo = str(path)
+        self.stop()
+
+    def stop(self):
+        if self.pipe:
+            self.pipe.set_state(self.Gst.State.NULL)
+            self.pipe = None
+
+
+class PhotoWatcher:
+    """For the system camera app: watches where it saves photos and offers the new one to attach."""
+
+    def __init__(self, win, folders, on_photo, minutes=5):
+        self.win, self.folders, self.on_photo = win, [Path(f) for f in folders], on_photo
+        self.start, self.until = time.time() - 2, time.time() + minutes * 60
+        self.seen = set()
+        GLib.timeout_add_seconds(2, self.tick)
+
+    def tick(self):
+        if time.time() > self.until:
+            return False
+        for folder in self.folders:
+            try:
+                for p in folder.iterdir():
+                    if ext_of(p.name) in IMAGE_EXTS and p.stat().st_mtime > self.start and p not in self.seen:
+                        self.seen.add(p)
+                        size = p.stat().st_size
+                        GLib.timeout_add(1200, self._settled, p, size)
+            except OSError:
+                continue
+        return True
+
+    def _settled(self, p, size):
+        try:
+            if p.stat().st_size != size:                       # still being written
+                GLib.timeout_add(1200, self._settled, p, p.stat().st_size)
+                return False
+        except OSError:
+            return False
+        self.until = 0                                         # one photo per click
+        self.on_photo(str(p))
+        return False
 
 
 class ChatPanel(Gtk.Box):
@@ -6552,6 +7040,13 @@ class ChatPanel(Gtk.Box):
         emo_pop.add(sc)
         self.emo_btn = Gtk.MenuButton(label="😊", popover=emo_pop)
         self.emo_btn.set_tooltip_text("Emoji")
+        self.sticker_pop = Gtk.Popover()
+        self.sticker_btn = Gtk.MenuButton(label="🏷", popover=self.sticker_pop)
+        self.sticker_btn.set_tooltip_text("Stickers")
+        self.sticker_btn.connect("toggled", lambda b: self.build_stickers() if b.get_active() else None)
+        self.cam_btn = Gtk.Button(label="📷")
+        self.cam_btn.set_tooltip_text("Take a photo with the camera and send it")
+        self.cam_btn.connect("clicked", lambda *_: self.take_photo())
         self.attach_btn = Gtk.Button.new_from_icon_name("mail-attachment-symbolic", Gtk.IconSize.BUTTON)
         self.attach_btn.set_tooltip_text("Attach files (or drag files here from the file list)")
         self.attach_btn.connect("clicked", lambda *_: self.attach())
@@ -6561,7 +7056,7 @@ class ChatPanel(Gtk.Box):
         self.send_btn.get_style_context().add_class("suggested-action")
         self.send_btn.set_tooltip_text("Send (Enter)")
         self.send_btn.connect("clicked", lambda *_: self.send())
-        for w in (self.emo_btn, self.attach_btn):
+        for w in (self.emo_btn, self.sticker_btn, self.cam_btn, self.attach_btn):
             comp.add(w)
         comp.pack_start(self.entry, True, True, 0)
         comp.add(self.send_btn)
@@ -6677,8 +7172,18 @@ class ChatPanel(Gtk.Box):
             t = Gtk.Label(label=m.get("text", ""), xalign=0, wrap=True, selectable=True, max_width_chars=38)
             t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
             bubble.add(t)
+        elif m["kind"] == "sticker":
+            ctx.remove_class("chat-mine")
+            ctx.remove_class("chat-theirs")
+            bubble.add(self._sticker_image(m))
         else:
             bubble.add(self._file_box(m))
+        if m.get("unverified"):
+            warn = Gtk.Label(xalign=0)
+            warn.set_markup("<small>⚠ not signed (sent before signatures)</small>")
+            warn.set_tooltip_text("Arckad-D can't confirm who sent this message: it came from a version without "
+                                  "per-person signatures.")
+            bubble.add(warn)
         tl = Gtk.Label(xalign=1)
         tl.set_markup(f"<small>{when}</small>")
         tl.set_opacity(0.75)
@@ -6692,7 +7197,38 @@ class ChatPanel(Gtk.Box):
         row.add(outer)
         return row
 
+    def _sticker_image(self, m):
+        if m.get("sticker") != "custom":
+            pb = sticker_pixbuf(m.get("sticker"), 128)
+            return Gtk.Image.new_from_pixbuf(pb) if pb else Gtk.Label(label="🏷")
+        local = self.chat.local_file(self.gid, m["file"]["id"])
+        if local:
+            try:
+                return Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(local, 140, 140, True))
+            except GLib.Error:
+                pass
+        lbl = Gtk.Label(label="🏷 sticker (downloading…)" if m["file"]["id"] in self.chat.downloading else "🏷 sticker")
+        return lbl
+
     def _file_box(self, m):
+        f = m["file"]
+        local = self.chat.local_file(self.gid, f["id"])
+        if local and ext_of(f["name"]) in IMAGE_EXTS:            # photos show as pictures
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(local, 240, 240, True)
+                ev = Gtk.EventBox()
+                ev.add(Gtk.Image.new_from_pixbuf(pb))
+                ev.set_tooltip_text("Click to open")
+                ev.connect("button-press-event", lambda *_: self.win.open_file(local))
+                outer.add(ev)
+            except GLib.Error:
+                pass
+            outer.add(self._file_line(m, local))
+            return outer
+        return self._file_line(m, local)
+
+    def _file_line(self, m, local):
         f = m["file"]
         box = Gtk.Box(spacing=8)
         box.add(Gtk.Image.new_from_gicon(icon_for(f["name"], False), Gtk.IconSize.DND))
@@ -6703,7 +7239,6 @@ class ChatPanel(Gtk.Box):
         s.set_markup(f"<small>{human_size(f['size'])}</small>")
         texts.add(s)
         box.pack_start(texts, True, True, 0)
-        local = self.chat.local_file(self.gid, f["id"])
         btns = Gtk.Box(spacing=2)
         if local:
             o = Gtk.Button(label="Open")
@@ -6763,6 +7298,239 @@ class ChatPanel(Gtk.Box):
         paths = [p for p in (Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])) if p]
         if paths:
             self.send_paths(paths)
+
+    def build_stickers(self):
+        if self.sticker_pop.get_child():
+            self.sticker_pop.remove(self.sticker_pop.get_child())
+        nb = Gtk.Notebook()
+        flow = Gtk.FlowBox(max_children_per_line=4, min_children_per_line=4, selection_mode=Gtk.SelectionMode.NONE,
+                           homogeneous=True)
+        for sid, words, _c, _s in STICKERS:
+            b = Gtk.Button()
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.add(Gtk.Image.new_from_pixbuf(sticker_pixbuf(sid, 72)))
+            b.set_tooltip_text(words.title())
+            b.connect("clicked", lambda _b, s=sid: self.send_sticker(sid=s))
+            flow.add(b)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        sc.set_size_request(380, 300)
+        sc.add(flow)
+        nb.append_page(sc, Gtk.Label(label="Stickers"))
+        mine = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=6)
+        mflow = Gtk.FlowBox(max_children_per_line=4, min_children_per_line=4, selection_mode=Gtk.SelectionMode.NONE,
+                            homogeneous=True)
+        for path in self.chat.my_stickers():
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 72, 72, True)
+            except GLib.Error:
+                continue
+            b = Gtk.Button()
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.add(Gtk.Image.new_from_pixbuf(pb))
+            b.connect("clicked", lambda _b, pth=path: self.send_sticker(image=pth))
+            mflow.add(b)
+        msc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vexpand=True)
+        msc.add(mflow)
+        add = Gtk.Button(label="＋ Add your own sticker image…")
+        add.connect("clicked", lambda *_: self.add_sticker())
+        mine.pack_start(msc, True, True, 0)
+        mine.add(add)
+        nb.append_page(mine, Gtk.Label(label="My stickers"))
+        nb.show_all()
+        self.sticker_pop.add(nb)
+
+    def send_sticker(self, sid=None, image=None):
+        self.sticker_pop.popdown()
+        if self.gid and self.chat.can_post(self.gid):
+            self.chat.send_sticker(self.gid, sid=sid, image=image)
+
+    def add_sticker(self):
+        dlg = Gtk.FileChooserNative(title="Choose a sticker image", transient_for=self.get_toplevel(),
+                                    action=Gtk.FileChooserAction.OPEN)
+        flt = Gtk.FileFilter()
+        flt.set_name("Images")
+        for e in sorted(IMAGE_EXTS | {"svg"}):
+            flt.add_pattern(f"*.{e}")
+            flt.add_pattern(f"*.{e.upper()}")
+        dlg.add_filter(flt)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            try:
+                self.chat.add_sticker(dlg.get_filename())
+                self.build_stickers()
+                self.sticker_btn.set_active(True)
+            except (ValueError, OSError) as ex:
+                self.win.error(str(ex))
+        dlg.destroy()
+
+    def take_photo(self):
+        if not self.gid or not self.chat.can_post(self.gid):
+            return
+        gid = self.gid
+
+        def got(path):
+            self.confirm_photo(gid, path)
+        if IS_WIN:
+            pics = Path(os.environ.get("USERPROFILE", str(HOME))) / "Pictures"
+            folders = [pics / "Camera Roll", pics, Path(os.environ.get("OneDrive", str(pics))) / "Pictures" / "Camera Roll"]
+            try:
+                os.startfile("microsoft.windows.camera:")
+            except OSError:
+                self.win.error("The Windows Camera app couldn't be opened.")
+                return
+            PhotoWatcher(self.win, folders, got)
+            self.win.flash_all("Take the photo in the Camera app: Arckad-D will offer to send it.")
+            return
+        if (_gst() and any(Path("/dev").glob("video*"))) or (_gst() and CameraDialog.SOURCE != "v4l2src"):
+            dlg = CameraDialog(self.get_toplevel())
+            dlg.show_all()
+            dlg.run()
+            photo = dlg.photo
+            dlg.destroy()
+            if photo:
+                self.chat.send_files(gid, [photo])
+            return
+        app = next((a for a in ("snapshot", "cheese", "guvcview") if shutil.which(a)), None)
+        if not any(Path("/dev").glob("video*")):
+            self.win.error("No camera was found on this computer.")
+            return
+        if not app:
+            self.win.error("Taking photos needs the camera library. Install it with:\n\n"
+                           "  sudo apt install gir1.2-gstreamer-1.0 gstreamer1.0-plugins-good")
+            return
+        subprocess.Popen([app], start_new_session=True)
+        pics = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or str(HOME))
+        PhotoWatcher(self.win, [pics / "Camera", pics / "Webcam", pics], got)
+        self.win.flash_all("Take the photo in the camera app: Arckad-D will offer to send it.")
+
+    def confirm_photo(self, gid, path):
+        d = Gtk.MessageDialog(transient_for=self.get_toplevel(), modal=True, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text="Send this photo?")
+        try:
+            img = Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 320, 240, True))
+            d.get_message_area().add(img)
+            img.show()
+        except GLib.Error:
+            pass
+        d.format_secondary_text(os.path.basename(path))
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Send", Gtk.ResponseType.OK)
+        if d.run() == Gtk.ResponseType.OK:
+            self.chat.send_files(gid, [path])
+        d.destroy()
+
+    # ---------- backup
+    def backup(self):
+        d = Gtk.Dialog(title="Back up chats", transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Choose where to save…", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        intro.set_markup("Saves all your groups, messages and your signing key in one file, <b>encrypted with a "
+                         "password</b>. Keep the file and the password safe: without the password it can't be opened.")
+        box.add(intro)
+        pw1 = Gtk.Entry(visibility=False, placeholder_text="Password (at least 8 characters)")
+        pw2 = Gtk.Entry(visibility=False, placeholder_text="Type it again")
+        files = Gtk.CheckButton(label="Include attachments (photos and files)")
+        files.set_active(True)
+        err = Gtk.Label(xalign=0)
+        for w in (pw1, pw2, files, err):
+            box.add(w)
+        d.show_all()
+        while True:
+            if d.run() != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+            if len(pw1.get_text()) < 8:
+                err.set_markup("<span foreground='#e01b24'>Use at least 8 characters.</span>")
+            elif pw1.get_text() != pw2.get_text():
+                err.set_markup("<span foreground='#e01b24'>The two passwords are different.</span>")
+            else:
+                break
+        password, with_files = pw1.get_text(), files.get_active()
+        d.destroy()
+        fc = Gtk.FileChooserNative(title="Save chat backup", transient_for=self.get_toplevel(),
+                                   action=Gtk.FileChooserAction.SAVE)
+        fc.set_do_overwrite_confirmation(True)
+        fc.set_current_name(time.strftime("Arckad-D chats %Y-%m-%d.arckadchat"))
+        fc.set_current_folder(str(downloads_dir()))
+        if fc.run() != Gtk.ResponseType.ACCEPT:
+            fc.destroy()
+            return
+        dest = fc.get_filename()
+        fc.destroy()
+        if not dest.endswith(".arckadchat"):
+            dest += ".arckadchat"
+        self.win.flash_all("Backing up chats…")
+
+        def work():
+            try:
+                res = self.chat.export_backup(dest, password, with_files)
+                GLib.idle_add(done, res, None)
+            except (OSError, ValueError) as ex:
+                GLib.idle_add(done, None, str(ex))
+
+        def done(res, error):
+            if error:
+                self.win.error(f"The backup couldn't be saved: {error}")
+            else:
+                self.win.info(f"Chat backup saved ✓\n\n{dest}\n\n{res[0]} groups · {res[1]} messages · {res[2]} "
+                              f"attachments · {human_size(os.path.getsize(dest))}")
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def restore(self):
+        fc = Gtk.FileChooserNative(title="Restore chats from a backup", transient_for=self.get_toplevel(),
+                                   action=Gtk.FileChooserAction.OPEN)
+        flt = Gtk.FileFilter()
+        flt.set_name("Arckad-D chat backups")
+        flt.add_pattern("*.arckadchat")
+        fc.add_filter(flt)
+        if fc.run() != Gtk.ResponseType.ACCEPT:
+            fc.destroy()
+            return
+        path = fc.get_filename()
+        fc.destroy()
+        password = self.win.ask_text("Restore chats", "The backup's password:", "", password=True)
+        if not password:
+            return
+
+        def work():
+            try:
+                data, key = Chat.read_backup(path, password)
+                GLib.idle_add(ask, data, key)
+            except ValueError as ex:
+                GLib.idle_add(lambda msg=str(ex): self.win.error(msg) and False)
+
+        def ask(data, key):
+            take = False
+            if data["device_id"] != self.chat.me:
+                q = Gtk.MessageDialog(transient_for=self.get_toplevel(), modal=True,
+                                      message_type=Gtk.MessageType.QUESTION, buttons=Gtk.ButtonsType.NONE,
+                                      text=f"This backup is from “{data.get('device_name', 'another device')}”")
+                q.format_secondary_text(
+                    "Continue as that device on this computer? Then you stay a member of its groups, and its owners "
+                    "and colleagues see this computer as that device. Do this when replacing a computer; don't keep "
+                    "using the old one at the same time.\n\nOr only bring back the history to read.")
+                q.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Only the history", 1,
+                              "Continue as that device", Gtk.ResponseType.OK)
+                r = q.run()
+                q.destroy()
+                if r == Gtk.ResponseType.CANCEL or r == Gtk.ResponseType.DELETE_EVENT:
+                    return False
+                take = r == Gtk.ResponseType.OK
+            threading.Thread(target=apply, args=(data, key, take), daemon=True).start()
+            return False
+
+        def apply(data, key, take):
+            res = self.chat.restore_backup(path, data, key, take)
+            GLib.idle_add(finished, res, take)
+
+        def finished(res, take):
+            self.refresh()
+            extra = "\n\nRestart Arckad-D to finish switching to that device." if take else ""
+            self.win.info(f"Chats restored ✓\n\n{res[0]} new groups · {res[1]} messages · {res[2]} attachments{extra}")
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def new_group(self):
         name = self.win.ask_text("New group", "Group name (e.g. Accounts Team):", "")
@@ -6841,10 +7609,19 @@ class ChatPanel(Gtk.Box):
         for c in self.more_menu.get_children():
             self.more_menu.remove(c)
         g = self.chat.groups.get(self.gid) if self.gid else None
+        def backup_items():
+            self.more_menu.append(Gtk.SeparatorMenuItem())
+            for label, cb, ok in (("Back up chats…", self.backup, bool(self.chat.groups)),
+                                  ("Restore chats from a backup…", self.restore, True)):
+                it = Gtk.MenuItem(label=label)
+                it.set_sensitive(ok)
+                it.connect("activate", lambda _i, cb=cb: cb())
+                self.more_menu.append(it)
         if not g:
             it = Gtk.MenuItem(label="Create or join a group first")
             it.set_sensitive(False)
             self.more_menu.append(it)
+            backup_items()
             self.more_menu.show_all()
             return
         owner = self.chat.is_owner(self.gid)
@@ -6864,6 +7641,7 @@ class ChatPanel(Gtk.Box):
             add("Rename group…", self.rename)
         add("Open the attachments folder", lambda: (self.chat.files_dir(self.gid).mkdir(parents=True, exist_ok=True),
                                                     self.win.active.go(str(self.chat.files_dir(self.gid)))))
+        backup_items()
         self.more_menu.append(Gtk.SeparatorMenuItem())
         add("Delete group for everyone…" if owner else "Leave group…", self.leave)
         self.more_menu.show_all()
@@ -7253,7 +8031,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.info(f"You're up to date. {APP_NAME} {APP_VERSION} is the newest version.")
             return False
         self.latest = rel
-        how = {"windows": "Arckad-D closes, a small window shows the install, then it reopens.",
+        how = {"windows": "Arckad-D closes, a small window shows the install (no questions), then Arckad-D reopens.",
                "deb": "You'll be asked for your password once."}.get(install_kind(), "")
         self.update_label.set_markup(f"<b>{APP_NAME} {esc(latest)} is available</b> (you have {APP_VERSION}). "
                                      f"{esc(how)}")
@@ -7328,23 +8106,20 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _run_windows_setup(self, path):
-        """Install after Arckad-D has fully closed, with a visible progress window. If the installer fails,
-        the old Arckad-D is reopened and explains what happened (the installer writes a log)."""
-        q = lambda s: str(s).replace("'", "''")
+        """Start the installer directly (with its progress window). The installer itself waits until this
+        Arckad-D has fully closed (it watches the "ArckadD-Running" mutex), installs, and reopens Arckad-D;
+        if it fails, it reopens this version, which then explains what happened."""
         log = Path(tempfile.gettempdir()) / "arckad-d-update.log"
-        script = (
-            f"Wait-Process -Id {os.getpid()} -Timeout 60 -ErrorAction SilentlyContinue; "
-            "Get-Process -Name 'Arckad-D' -ErrorAction SilentlyContinue | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue; "
-            "Start-Sleep -Seconds 2; "
-            f"$p = Start-Process -FilePath '{q(path)}' -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART',"
-            f"'/CLOSEAPPLICATIONS','/LOG=\"{q(log)}\"' -Wait -PassThru; "
-            f"if ($p.ExitCode -ne 0) {{ Start-Process -FilePath '{q(sys.executable)}' "
-            f"-ArgumentList '--update-failed',$p.ExitCode }}")
-        subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-                          "-Command", script],
-                         creationflags=0x00000008 | 0x00000200 | 0x08000000)   # detached, no console window
+        try:
+            subprocess.Popen([str(path), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", f"/LOG={log}"],
+                             creationflags=0x00000008 | 0x00000200, close_fds=True)   # detached
+        except OSError as ex:
+            self.error(f"Couldn't start the installer: {ex.strerror or ex}\n\nIt was downloaded to:\n{path}\n\n"
+                       "You can run it yourself.")
+            return
         self.on_close()
         self.get_application().quit()
+        GLib.timeout_add(1500, lambda: os._exit(0))           # make sure nothing keeps this process alive
 
     def show_update_failure(self, code):
         """Shown when the Windows installer stopped (Arckad-D was reopened by the update helper)."""
@@ -9312,7 +10087,7 @@ class MainWindow(Gtk.ApplicationWindow):
         d.destroy()
         return ok
 
-    def ask_text(self, title, label, text, select_stem=False):
+    def ask_text(self, title, label, text, select_stem=False, password=False):
         dlg = Gtk.Dialog(title=title, transient_for=self, modal=True)
         dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
         dlg.set_default_response(Gtk.ResponseType.OK)
@@ -9320,7 +10095,7 @@ class MainWindow(Gtk.ApplicationWindow):
         box.set_spacing(8)
         box.set_border_width(12)
         box.add(Gtk.Label(label=label, xalign=0))
-        entry = Gtk.Entry(text=text, activates_default=True, width_chars=44)
+        entry = Gtk.Entry(text=text, activates_default=True, width_chars=44, visibility=not password)
         box.add(entry)
         dlg.show_all()
         stem = os.path.splitext(text)[0] if select_stem and not text.startswith(".") else text
@@ -9438,6 +10213,13 @@ def main():
     if "--autosort" in sys.argv:
         run_autosort_service()
         return
+    if IS_WIN:
+        try:
+            import ctypes
+            global _RUN_MUTEX
+            _RUN_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "ArckadD-Running")   # updates wait for it
+        except Exception:
+            pass
     failed = None
     if "--update-failed" in sys.argv:
         i = sys.argv.index("--update-failed")

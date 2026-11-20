@@ -52,12 +52,57 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#AppExe}"; Flags: runhidden
 Filename: "{sys}\reg.exe"; Parameters: "delete ""HKCU\Software\Microsoft\Windows\CurrentVersion\Run"" /v ""Arckad-D AutoSort"" /f"; Flags: runhidden; RunOnceId: "RemoveAutoSort"
 
 [Code]
-function ShouldRelaunch(): Boolean;
+var
+  InstallFinished: Boolean;
+
+function HasParam(const Name: String): Boolean;
 var
   i: Integer;
 begin
-  Result := WizardSilent;
+  Result := False;
   for i := 1 to ParamCount do
-    if CompareText(ParamStr(i), '/NOLAUNCH') = 0 then
-      Result := False;
+    if CompareText(ParamStr(i), Name) = 0 then
+      Result := True;
+end;
+
+function ShouldRelaunch(): Boolean;
+begin
+  Result := WizardSilent and not HasParam('/NOLAUNCH');
+end;
+
+{ An update started from inside Arckad-D: wait (up to 60 s) until that Arckad-D has fully closed,
+  so none of its files are still in use. Arckad-D holds this named mutex while it runs. }
+function InitializeSetup(): Boolean;
+var
+  waited: Integer;
+begin
+  waited := 0;
+  while CheckForMutexes('ArckadD-Running') and (waited < 240) do
+  begin
+    Sleep(250);
+    waited := waited + 1;
+  end;
+  Result := True;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssDone then
+    InstallFinished := True;
+end;
+
+{ If a silent update didn't finish, reopen the installed Arckad-D so it can say what happened. }
+procedure DeinitializeSetup();
+var
+  code: Integer;
+  exe: String;
+begin
+  if WizardSilent and (not InstallFinished) and (not HasParam('/NOLAUNCH')) then
+  begin
+    exe := ExpandConstant('{autopf}') + '\Arckad-D\Arckad-D.exe';
+    if not FileExists(exe) then
+      exe := ExpandConstant('{localappdata}') + '\Programs\Arckad-D\Arckad-D.exe';
+    if FileExists(exe) then
+      Exec(exe, '--update-failed 4', '', SW_SHOWNORMAL, ewNoWait, code);
+  end;
 end;
