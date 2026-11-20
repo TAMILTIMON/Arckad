@@ -45,3 +45,12 @@ The repository must stay **public**, and its name is set in `UPDATE_REPO` (in `a
 * **Windows (installed with Setup):** downloads the new Setup and installs it silently, then reopens.
 * **Linux (.deb):** downloads the new .deb and installs it after one password prompt.
 * **Android:** downloads the new .apk; tap it and choose **Update** (Android always asks once).
+
+
+Ports need to be allowed in Ubuntu 
+
+sudo ufw allow 47830/udp
+sudo ufw allow 47831:47833/tcp
+sudo ufw allow 47820/udp
+sudo ufw allow 47821:47823/tcp
+sudo ufw allow 8765:8767/tcp
