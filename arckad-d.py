@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.14.1"
+APP_VERSION = "3.15.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5152,7 +5152,7 @@ def make_pair_handler(pr):
         def do_GET(self):
             try:
                 path = self.path.split("?")[0]
-                if path.startswith("/c/file/") and getattr(pr.win, "chat", None):
+                if (path.startswith("/c/file/") or path == "/f/photo") and getattr(pr.win, "chat", None):
                     return pr.win.chat.handle_get(self, path)
                 self._plain(404, {"ok": False})
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -5160,7 +5160,7 @@ def make_pair_handler(pr):
 
         def _post(self):
             path = self.path.split("?")[0]
-            if (path.startswith("/c/") or path.startswith("/cj/")) and getattr(pr.win, "chat", None):
+            if path.startswith(("/c/", "/cj/", "/f/")) and getattr(pr.win, "chat", None):
                 return pr.win.chat.handle_post(self, path)
             if path == "/pair/start":                     # step 1: exchange keys (needs the code to be shown)
                 if not pr.code_active():
@@ -5932,6 +5932,11 @@ class Chat:
         self._tag_cache = (None, {})
         self.last_sync = 0
         self.ident = None
+        self.people = {}                 # devices seen on the network: id -> {"name", "ip", "port", "ph", "os", "seen"}
+        self.contacts = read_json(CHAT_DIR / "contacts.json", {})
+        for k in ("friends", "incoming", "outgoing"):
+            self.contacts.setdefault(k, {})
+        self.profile = self.contacts.setdefault("profile", {"name": "", "visible": True, "setup": False})
         self.load()
         threading.Thread(target=self.identity, daemon=True).start()     # make the signing key in the background
 
@@ -6021,7 +6026,7 @@ class Chat:
         return self.win.cfg["device_id"]
 
     def my_name(self):
-        return self.win.nearby.name()
+        return (self.profile.get("name") or "").strip() or self.win.nearby.name()
 
     def key(self, gid):
         g = self.groups.get(gid)
@@ -6036,7 +6041,8 @@ class Chat:
         return bool(g) and not g.get("removed") and (not g.get("owner_only") or g.get("owner") == self.me)
 
     def active(self):
-        return any(not g.get("removed") for g in self.groups.values()) or self.join_active()
+        return (any(not g.get("removed") for g in self.groups.values()) or self.join_active()
+                or (self.profile.get("setup") and self.profile.get("visible")) or bool(self.contacts["outgoing"]))
 
     def is_online(self, did):
         o = self.online.get(did)
@@ -6126,6 +6132,9 @@ class Chat:
         """Member: tell the owner and stop. Owner: delete the group for everyone."""
         g = self.groups.get(gid)
         if not g:
+            return
+        if g.get("kind") == "direct":
+            self.remove_friend(g["peer"])
             return
         if self.is_owner(gid):
             for did, hexkey in list(g.get("pair_keys", {}).items()):
@@ -6332,6 +6341,11 @@ class Chat:
             out["ctags"] = tags
         if self.join_active():
             out["chatjoin"] = hashlib.sha256(f"arckad-chat-code|{self.join['code']}".encode()).hexdigest()[:20]
+        if self.profile.get("setup") and self.profile.get("visible"):
+            out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash()}
+        elif self.contacts["outgoing"] or self.contacts["friends"]:
+            out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
+                          "hidden": True}            # friends and people I asked still see me
         return out
 
     def _expected(self):
@@ -6353,6 +6367,9 @@ class Chat:
     def on_udp(self, msg, ip):
         if msg.get("chatjoin") and msg.get("port"):
             self.code_seen[str(msg["chatjoin"])] = (ip, int(msg["port"]), time.time())
+        who = msg.get("who")
+        if isinstance(who, dict) and isinstance(who.get("id"), str) and who["id"] != self.me and msg.get("port"):
+            self._saw_person(who, ip, int(msg["port"]))
         tags = msg.get("ctags") or []
         if not tags:
             return False
@@ -6573,6 +6590,329 @@ class Chat:
                 self._try(lambda: self._request(gid, did, "POST", "/c/msg", {"msg": msg}, timeout=10))
         threading.Thread(target=work, daemon=True).start()
 
+    # ---------- profile
+    def save_contacts(self):
+        with self.lock:
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+            write_json(CHAT_DIR / "contacts.json", self.contacts)
+            if not IS_WIN:
+                try:
+                    os.chmod(CHAT_DIR / "contacts.json", 0o600)
+                except OSError:
+                    pass
+
+    def photo_path(self):
+        return CHAT_DIR / "profile.jpg"
+
+    def photo_bytes(self):
+        try:
+            return self.photo_path().read_bytes()
+        except OSError:
+            return b""
+
+    def photo_hash(self):
+        data = self.photo_bytes()
+        return hashlib.sha256(data).hexdigest()[:16] if data else ""
+
+    def set_profile(self, name, photo_source=None, remove_photo=False, visible=True):
+        """photo_source: any image; it's cropped to a square and stored small (256 px)."""
+        if remove_photo:
+            try:
+                self.photo_path().unlink()
+            except OSError:
+                pass
+        elif photo_source:
+            pb = GdkPixbuf.Pixbuf.new_from_file(photo_source)
+            pb = pb.apply_embedded_orientation() or pb
+            side = min(pb.get_width(), pb.get_height())
+            sq = pb.new_subpixbuf((pb.get_width() - side) // 2, (pb.get_height() - side) // 2, side, side)
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+            sq.scale_simple(256, 256, GdkPixbuf.InterpType.HYPER).savev(str(self.photo_path()), "jpeg",
+                                                                        ["quality"], ["88"])
+        self.profile.update({"name": name.strip()[:40], "visible": bool(visible), "setup": True})
+        self.save_contacts()
+        self.pr.last_beacon = 0
+        self.start()
+        self.ui("on_chat_changed", None)
+
+    def avatar_file(self, pid):
+        """Path of someone's cached profile photo (or this device's own), or None."""
+        if pid == self.me:
+            p = self.photo_path()
+        else:
+            p = CHAT_DIR / "avatars" / f"{pid}.jpg"
+        return str(p) if p.exists() else None
+
+    # ---------- people on the network
+    def _saw_person(self, who, ip, port):
+        pid = who["id"][:40]
+        name = str(who.get("name") or "Someone")[:40]
+        ph = str(who.get("ph") or "")[:16]
+        old = self.people.get(pid)
+        self.people[pid] = {"name": name, "ip": ip, "port": port, "ph": ph, "os": str(who.get("os", ""))[:10],
+                            "seen": time.time(), "hidden": bool(who.get("hidden"))}
+        f = self.contacts["friends"].get(pid)
+        changed = old is None or old.get("name") != name or old.get("ph") != ph
+        if f and (f.get("name") != name or f.get("ph") != ph):
+            f["name"] = name
+            if f.get("ph") != ph:
+                threading.Thread(target=self._fetch_photo, args=(pid, ip, port, ph), daemon=True).start()
+            for g in self.groups.values():
+                if g.get("kind") == "direct" and g.get("peer") == pid:
+                    g["name"] = name
+            self.save_contacts()
+            self.save()
+        elif not f and ph and (old is None or old.get("ph") != ph):
+            threading.Thread(target=self._fetch_photo, args=(pid, ip, port, ph), daemon=True).start()
+        # an acceptance that couldn't be delivered earlier (they were offline)
+        out = self.contacts["friends"].get(pid, {}).get("pending_accept")
+        if out and time.time() - out.get("tried", 0) > 10:
+            out["tried"] = time.time()
+            threading.Thread(target=self._deliver_accept, args=(pid,), daemon=True).start()
+        if changed:
+            self.ui("on_people_changed")
+
+    def _fetch_photo(self, pid, ip, port, ph):
+        import http.client
+        try:
+            c = http.client.HTTPConnection(ip, port, timeout=8)
+            c.request("GET", "/f/photo")
+            r = c.getresponse()
+            data = r.read(2_000_000)
+            c.close()
+            folder = CHAT_DIR / "avatars"
+            folder.mkdir(parents=True, exist_ok=True)
+            if r.status == 200 and data[:2] == b"\xff\xd8":
+                (folder / f"{pid}.jpg").write_bytes(data)
+            elif r.status == 404:
+                (folder / f"{pid}.jpg").unlink(missing_ok=True)
+            f = self.contacts["friends"].get(pid)
+            if f:
+                f["ph"] = ph
+                self.save_contacts()
+        except (OSError, ValueError):
+            return
+        _avatar_cache.clear()
+        self.ui("on_people_changed")
+        self.ui("on_chat_changed", None)
+
+    def people_list(self):
+        """People seen on the network recently who chose to be visible (not hidden)."""
+        now = time.time()
+        return sorted(((pid, p) for pid, p in self.people.items() if now - p["seen"] < 20 and not p.get("hidden")),
+                      key=lambda kv: kv[1]["name"].lower())
+
+    def person_online(self, pid):
+        p = self.people.get(pid)
+        return (bool(p) and time.time() - p["seen"] < 20) or self.is_online(pid)
+
+    def relation(self, pid):
+        if pid in self.contacts["friends"]:
+            return "friend"
+        if pid in self.contacts["incoming"]:
+            return "incoming"
+        if pid in self.contacts["outgoing"]:
+            return "outgoing"
+        return "none"
+
+    # ---------- friend requests (keys exchanged with Diffie-Hellman, signed with each person's signing key)
+    def _call(self, pid, path, obj):
+        import http.client
+        p = self.people.get(pid) or {}
+        ip, port = p.get("ip"), p.get("port")
+        if not ip or not port:
+            o = self.online.get(pid) or {}
+            ip, port = o.get("ip"), o.get("port")
+        if not ip or not port:
+            raise OSError("they're not on the network right now")
+        c = http.client.HTTPConnection(ip, port, timeout=12)
+        c.request("POST", path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
+        r = c.getresponse()
+        data = json.loads(r.read() or b"{}")
+        c.close()
+        return data
+
+    def _dh_offer(self, to):
+        x = secrets.randbits(320)
+        pub = format(pow(2, x, DH_P), "x")
+        sig = rsa_sign(self.identity(), f"arckad-friend|{self.me}|{to}|{pub}".encode())
+        return x, {"id": self.me, "name": self.my_name(), "os": OS_NAME, "sigpub": self.my_pub(), "dh": pub,
+                   "dhsig": sig, "port": self.pr.port, "ph": self.photo_hash()}
+
+    @staticmethod
+    def _friend_key(x, their_dh_hex, mine_hex):
+        theirs = int(their_dh_hex, 16)
+        if not 1 < theirs < DH_P - 1:
+            raise ValueError("bad key")
+        shared = pow(theirs, x, DH_P).to_bytes(256, "big")
+        a, b = sorted([mine_hex, their_dh_hex])
+        return hashlib.sha256(b"arckad-friend-key|" + shared + a.encode() + b.encode()).digest()
+
+    def safety_code(self, pid):
+        """A code both people see; if it matches on both screens, nobody intercepted the friendship."""
+        f = self.contacts["friends"].get(pid) or {}
+        a, b = sorted([self.my_pub(), f.get("sigpub", "")])
+        digits = str(int(hashlib.sha256((a + "|" + b).encode()).hexdigest(), 16))[:30]
+        return " ".join(digits[i:i + 5] for i in range(0, 30, 5))
+
+    def send_request(self, pid):
+        """Background thread. Returns (ok, message)."""
+        self.start()
+        x, offer = self._dh_offer(pid)
+        try:
+            r = self._call(pid, "/f/request", offer)
+        except (OSError, ValueError) as ex:
+            return False, f"Couldn't reach them ({ex})."
+        if not r.get("ok"):
+            return False, r.get("reason", "The request wasn't accepted.")
+        p = self.people.get(pid, {})
+        self.contacts["outgoing"][pid] = {"name": p.get("name", "?"), "x": format(x, "x"), "dh": offer["dh"],
+                                          "ts": time.time()}
+        self.save_contacts()
+        self.ui("on_people_changed")
+        return True, f"Friend request sent to {p.get('name', 'them')}."
+
+    def accept_request(self, pid):
+        req = self.contacts["incoming"].pop(pid, None)
+        if not req:
+            return
+        x, offer = self._dh_offer(pid)
+        key = self._friend_key(x, req["dh"], offer["dh"])
+        self._become_friends(pid, req["name"], req.get("os", ""), req["sigpub"], key, req.get("ph", ""))
+        self.contacts["friends"][pid]["pending_accept"] = {"offer": offer, "tried": 0}
+        self.save_contacts()
+        threading.Thread(target=self._deliver_accept, args=(pid,), daemon=True).start()
+        self.ui("on_people_changed")
+
+    def _deliver_accept(self, pid):
+        f = self.contacts["friends"].get(pid)
+        if not f or not f.get("pending_accept"):
+            return
+        try:
+            r = self._call(pid, "/f/accept", f["pending_accept"]["offer"])
+        except (OSError, ValueError):
+            return                                    # tried again when they're next seen
+        if r.get("ok") or r.get("reason") == "already friends":
+            f.pop("pending_accept", None)
+            self.save_contacts()
+            self.ui("on_people_changed")
+
+    def decline_request(self, pid):
+        if self.contacts["incoming"].pop(pid, None) is not None:
+            self.save_contacts()
+            threading.Thread(target=lambda: self._try(lambda: self._call(pid, "/f/decline", {"id": self.me})),
+                             daemon=True).start()
+        self.ui("on_people_changed")
+
+    def cancel_request(self, pid):
+        self.contacts["outgoing"].pop(pid, None)
+        self.save_contacts()
+        threading.Thread(target=lambda: self._try(lambda: self._call(pid, "/f/cancel", {"id": self.me})),
+                         daemon=True).start()
+        self.ui("on_people_changed")
+
+    def _direct_gid(self, pid):
+        a, b = sorted([self.me, pid])
+        return "dm-" + hashlib.sha256(f"{a}|{b}".encode()).hexdigest()[:14]
+
+    def _become_friends(self, pid, name, os_name, sigpub, key, ph=""):
+        self.contacts["friends"][pid] = {"name": name, "os": os_name, "sigpub": sigpub, "since": time.time(), "ph": ph}
+        self.contacts["outgoing"].pop(pid, None)
+        self.contacts["incoming"].pop(pid, None)
+        gid = self._direct_gid(pid)
+        with self.lock:
+            g = self.groups.get(gid)
+            if g is None or g.get("removed"):
+                self.groups[gid] = {"id": gid, "kind": "direct", "peer": pid, "name": name, "owner": None,
+                                    "key": key.hex(), "version": 1, "owner_only": False, "created": time.time(),
+                                    "files": {}, "members": {self.me: {"name": self.my_name(), "pub": self.my_pub(),
+                                                                       "os": OS_NAME, "role": "member"},
+                                                             pid: {"name": name, "pub": sigpub, "os": os_name,
+                                                                   "role": "member"}}}
+                self.msgs.setdefault(gid, [])
+                self.ids.setdefault(gid, set())
+            else:
+                g["key"] = key.hex()
+        self.save()
+        self.save_contacts()
+        self._tag_cache = (None, {})
+        self.start()
+        p = self.people.get(pid)
+        if p and p.get("ph"):
+            threading.Thread(target=self._fetch_photo, args=(pid, p["ip"], p["port"], p["ph"]), daemon=True).start()
+        self.ui("on_chat_changed", gid)
+        return gid
+
+    def remove_friend(self, pid):
+        """Tell them (if they're online), then forget the friendship here. The chat history stays, read-only."""
+        gid = self._direct_gid(pid)
+
+        def work():
+            if gid in self.groups and self.groups[gid].get("key"):
+                self._try(lambda: self._request(gid, pid, "POST", "/c/unfriend", {}, timeout=6))
+            GLib.idle_add(lambda: self._forget_friend(pid) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _forget_friend(self, pid):
+        self.contacts["friends"].pop(pid, None)
+        gid = self._direct_gid(pid)
+        g = self.groups.get(gid)
+        if g:
+            g["removed"], g["key"] = True, ""
+            self.save()
+        self.save_contacts()
+        self._tag_cache = (None, {})
+        self.ui("on_people_changed")
+        self.ui("on_chat_changed", None)
+
+    def _friend_post(self, path, req, ip):
+        pid = str(req.get("id", ""))[:40]
+        if not pid or pid == self.me:
+            return {"ok": False, "reason": "bad request"}
+        if path == "/f/request":
+            if pid in self.contacts["friends"] and not self.contacts["friends"][pid].get("pending_accept"):
+                return {"ok": False, "reason": "You're already friends."}
+            dh, sigpub, sig = str(req.get("dh", "")), str(req.get("sigpub", ""))[:1100], str(req.get("dhsig", ""))
+            if not rsa_verify(sigpub, f"arckad-friend|{pid}|{self.me}|{dh}".encode(), sig):
+                return {"ok": False, "reason": "bad signature"}
+            if pid in self.contacts["outgoing"]:              # both asked each other: that's a yes from both
+                out = self.contacts["outgoing"][pid]
+                key = self._friend_key(int(out["x"], 16), dh, out["dh"])
+                self._become_friends(pid, str(req.get("name", "?"))[:40], str(req.get("os", ""))[:10], sigpub, key,
+                                     str(req.get("ph", ""))[:16])
+                return {"ok": True}
+            self.contacts["incoming"][pid] = {"name": str(req.get("name", "?"))[:40], "os": str(req.get("os", ""))[:10],
+                                              "sigpub": sigpub, "dh": dh, "ph": str(req.get("ph", ""))[:16],
+                                              "ts": time.time()}
+            self.save_contacts()
+            self.people.setdefault(pid, {"name": str(req.get("name", "?"))[:40], "ip": ip, "port": req.get("port"),
+                                         "ph": str(req.get("ph", ""))[:16], "os": "", "seen": time.time()})
+            self.ui("on_friend_request", pid)
+            return {"ok": True}
+        if path == "/f/accept":
+            out = self.contacts["outgoing"].get(pid)
+            if not out:
+                return {"ok": False, "reason": "already friends" if pid in self.contacts["friends"] else "no request"}
+            dh, sigpub, sig = str(req.get("dh", "")), str(req.get("sigpub", ""))[:1100], str(req.get("dhsig", ""))
+            if not rsa_verify(sigpub, f"arckad-friend|{pid}|{self.me}|{dh}".encode(), sig):
+                return {"ok": False, "reason": "bad signature"}
+            key = self._friend_key(int(out["x"], 16), dh, out["dh"])
+            self._become_friends(pid, str(req.get("name", out["name"]))[:40], str(req.get("os", ""))[:10], sigpub, key,
+                                 str(req.get("ph", ""))[:16])
+            self.ui("on_pair_event", f"🤝 {req.get('name', 'Someone')} accepted your friend request")
+            return {"ok": True}
+        if path == "/f/decline":
+            if self.contacts["outgoing"].pop(pid, None) is not None:
+                self.save_contacts()
+                self.ui("on_people_changed")
+            return {"ok": True}
+        if path == "/f/cancel":
+            if self.contacts["incoming"].pop(pid, None) is not None:
+                self.save_contacts()
+                self.ui("on_people_changed")
+            return {"ok": True}
+        return {"ok": False, "reason": "unknown"}
+
     # ---------- backup: one password-protected .arckadchat file
     def export_backup(self, dest, password, with_files=True):
         """Returns (number of groups, messages, files) written."""
@@ -6582,7 +6922,9 @@ class Chat:
         with self.lock:
             data = {"format": 1, "made": time.time(), "app": APP_VERSION, "device_id": self.me,
                     "device_name": self.my_name(), "identity": self.identity(),
-                    "groups": json.loads(json.dumps(self.groups)), "msgs": json.loads(json.dumps(self.msgs))}
+                    "groups": json.loads(json.dumps(self.groups)), "msgs": json.loads(json.dumps(self.msgs)),
+                    "contacts": json.loads(json.dumps(self.contacts)),
+                    "photo": base64.b64encode(self.photo_bytes()).decode()}
         files = []
         if with_files:
             for gid, g in data["groups"].items():
@@ -6632,6 +6974,14 @@ class Chat:
         """Merge a backup into this device. take_identity: continue as the device that made the backup
         (so you stay a member of its groups). Returns (groups added, messages added, files restored)."""
         if take_identity:
+            for k in ("friends", "outgoing"):
+                self.contacts[k].update((data.get("contacts") or {}).get(k, {}))
+            if (data.get("contacts") or {}).get("profile"):
+                self.contacts["profile"] = self.profile = data["contacts"]["profile"]
+            if data.get("photo"):
+                CHAT_DIR.mkdir(parents=True, exist_ok=True)
+                self.photo_path().write_bytes(base64.b64decode(data["photo"]))
+            self.save_contacts()
             self.win.cfg["device_id"] = data["device_id"]
             write_json(CONFIG_FILE, self.win.cfg)
             with self.lock:
@@ -6793,6 +7143,9 @@ class Chat:
         return gid, did, (key, pair)
 
     def handle_post(self, h, path):
+        if path.startswith("/f/"):
+            r = self._friend_post(path, json.loads(h._body(200_000) or b"{}"), h.client_address[0])
+            return h._plain(200 if r.get("ok") else 403, r)
         if path == "/cj/start":
             return h._plain(200, self._join_start(json.loads(h._body(100_000)), h.client_address[0]))
         if path == "/cj/confirm":
@@ -6836,6 +7189,10 @@ class Chat:
             if did not in g["members"]:
                 return reply({"id": gid, "removed": True})
             return reply(self._meta_for_members(g))
+        if path == "/c/unfriend" and not pair and g.get("kind") == "direct" and did == g.get("peer"):
+            h._raw(200, seal(key, b'{"ok": true}'))
+            self._forget_friend(did)
+            return
         if path == "/c/setpub" and pair and g.get("owner") == self.me and did in g["members"]:
             pub = str(req.get("pub") or "")[:1100]
             if pub and not g["members"][did].get("pub"):          # set once; a changed key needs re-joining
@@ -6857,6 +7214,11 @@ class Chat:
         return reply({"ok": False, "reason": "unknown request"}, 404)
 
     def handle_get(self, h, path):
+        if path == "/f/photo":
+            data = self.photo_bytes()
+            if not data:
+                return h._plain(404, {"ok": False})
+            return h._raw(200, data, "image/jpeg")
         gid, did, auth = self._auth(h)
         if not gid or auth[1]:
             return h._plain(401, {"ok": False})
@@ -6908,6 +7270,135 @@ def _load_chat_css():
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         _chat_css_loaded.append(prov)
+
+
+# ---------- round avatars: a photo, or coloured initials
+_avatar_cache = {}
+_AVATAR_COLOURS = ("#1c71d8", "#26a269", "#c64600", "#9141ac", "#0e8a84", "#a51d2d", "#865e3c", "#3d3a9e", "#d63384")
+
+
+def _initials(name):
+    words = [w for w in name.replace("(", " ").split() if w[:1].isalnum()]
+    return ((words[0][0] + (words[1][0] if len(words) > 1 else "")) if words else "?").upper()
+
+
+def _round(pb, size):
+    """Cut a square pixbuf to a circle (smooth edge)."""
+    pb = pb.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR).add_alpha(False, 0, 0, 0)
+    rs, nch = pb.get_rowstride(), pb.get_n_channels()
+    px = bytearray(pb.get_pixels())
+    r = size / 2
+    for y in range(size):
+        for x in range(size):
+            d = ((x + 0.5 - r) ** 2 + (y + 0.5 - r) ** 2) ** 0.5
+            a = 1.0 if d <= r - 1 else (0.0 if d >= r else r - d)
+            if a < 1.0:
+                i = y * rs + x * nch + 3
+                px[i] = int(px[i] * a)
+    return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(px)), GdkPixbuf.Colorspace.RGB, True, 8,
+                                           size, size, rs)
+
+
+def avatar_pixbuf(name, photo, size, group=False):
+    stamp = os.path.getmtime(photo) if photo and os.path.exists(photo) else 0
+    key = (name, photo, size, group, stamp)
+    if key in _avatar_cache:
+        return _avatar_cache[key]
+    pb = None
+    if photo and stamp:
+        try:
+            src = GdkPixbuf.Pixbuf.new_from_file(photo)
+            side = min(src.get_width(), src.get_height())
+            src = src.new_subpixbuf((src.get_width() - side) // 2, (src.get_height() - side) // 2, side, side)
+            pb = _round(src, size)
+        except GLib.Error:
+            pb = None
+    if pb is None:
+        colour = _AVATAR_COLOURS[int(hashlib.md5(name.encode()).hexdigest(), 16) % len(_AVATAR_COLOURS)]
+        shape = (f'<rect width="100" height="100" rx="26" fill="{colour}"/>' if group
+                 else f'<circle cx="50" cy="50" r="50" fill="{colour}"/>')
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">{shape}<text x="50" y="64" '
+               f'text-anchor="middle" fill="#fff" font-size="40" font-weight="700" '
+               f'font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif">{esc(_initials(name))}</text></svg>')
+        try:
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.set_size(size, size)
+            loader.write(svg.encode())
+            loader.close()
+            pb = loader.get_pixbuf()
+        except Exception:
+            pb = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, size, size)
+            pb.fill(0x2f7fd8ff)
+    _avatar_cache[key] = pb
+    return pb
+
+
+class ProfileDialog(Gtk.Dialog):
+    """Your chat profile: name, photo, and whether people on the network can find you."""
+
+    def __init__(self, parent, chat):
+        super().__init__(title="Your profile", transient_for=parent, modal=True)
+        self.chat = chat
+        self.new_photo, self.remove_photo = None, False
+        self.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        self.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        self.set_default_response(Gtk.ResponseType.OK)
+        box = self.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        self.pic = Gtk.Image(halign=Gtk.Align.CENTER)
+        box.add(self.pic)
+        pr = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        choose = Gtk.Button(label="Choose photo…")
+        choose.connect("clicked", lambda *_: self.choose())
+        self.rm = Gtk.Button(label="Remove photo")
+        self.rm.connect("clicked", lambda *_: self.drop_photo())
+        pr.add(choose)
+        pr.add(self.rm)
+        box.add(pr)
+        box.add(Gtk.Label(label="Your name (what colleagues see):", xalign=0))
+        self.name = Gtk.Entry(text=chat.my_name(), activates_default=True, max_length=40)
+        self.name.connect("changed", lambda *_: self.update_pic())
+        box.add(self.name)
+        vr = Gtk.Box(spacing=8)
+        vl = Gtk.Label(xalign=0, wrap=True, hexpand=True, max_width_chars=40)
+        vl.set_markup("<b>Let people on my network find me</b>\n<small>Your name and photo appear in other people's "
+                      "<b>People</b> list so they can send you a friend request. Turn off to be invisible "
+                      "(your friends still find you).</small>")
+        self.visible = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.visible.set_active(chat.profile.get("visible", True))
+        vr.pack_start(vl, True, True, 0)
+        vr.add(self.visible)
+        box.add(vr)
+        self.update_pic()
+        self.show_all()
+
+    def current_photo(self):
+        if self.new_photo:
+            return self.new_photo
+        return None if self.remove_photo else self.chat.avatar_file(self.chat.me)
+
+    def update_pic(self):
+        photo = self.current_photo()
+        self.pic.set_from_pixbuf(avatar_pixbuf(self.name.get_text() or "?", photo, 112))
+        self.rm.set_sensitive(bool(photo))
+
+    def choose(self):
+        dlg = Gtk.FileChooserNative(title="Choose your photo", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        flt = Gtk.FileFilter()
+        flt.set_name("Photos")
+        for e in ("jpg", "jpeg", "png", "webp", "bmp", "gif"):
+            flt.add_pattern(f"*.{e}")
+            flt.add_pattern(f"*.{e.upper()}")
+        dlg.add_filter(flt)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            self.new_photo, self.remove_photo = dlg.get_filename(), False
+            self.update_pic()
+        dlg.destroy()
+
+    def drop_photo(self):
+        self.new_photo, self.remove_photo = None, True
+        self.update_pic()
 
 
 def _gst():
@@ -7040,53 +7531,69 @@ class ChatPanel(Gtk.Box):
         _load_chat_css()
         self.win, self.chat, self.in_window = win, win.chat, in_window
         self.gid = None
-        self._combo_ids = []
-        self._syncing = False
         self.set_size_request(340, -1)
+        self.pages = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT, transition_duration=150)
+        self.pack_start(self.pages, True, True, 0)
 
+        # ===== page 1: the list of chats (friends and groups)
+        lst = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         top = Gtk.Box(spacing=4)
-        self.combo = Gtk.ComboBoxText(hexpand=True)
-        self.combo.connect("changed", self.on_group_changed)
-        top.pack_start(self.combo, True, True, 0)
+        self.me_btn = Gtk.Button()
+        self.me_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.me_btn.set_tooltip_text("Your profile: name and photo")
+        self.me_btn.connect("clicked", lambda *_: self.edit_profile())
+        top.add(self.me_btn)
+        title = Gtk.Label(xalign=0, hexpand=True)
+        title.set_markup("<b>Chats</b>")
+        top.pack_start(title, True, True, 0)
+        self.people_btn = Gtk.Button()
+        pbx = Gtk.Box(spacing=3)
+        pbx.add(Gtk.Image.new_from_icon_name("system-users-symbolic", Gtk.IconSize.BUTTON))
+        self.people_badge = Gtk.Label()
+        pbx.add(self.people_badge)
+        self.people_btn.add(pbx)
+        self.people_btn.set_tooltip_text("People: find friends on your network, friend requests")
+        self.people_btn.connect("clicked", lambda *_: self.show_people())
+        top.add(self.people_btn)
         plus = Gtk.Menu()
-        for label, cb in (("New group…", self.new_group), ("Join a group with a code…", self.show_join)):
+        for label, cb in (("Add friends…", self.show_people), ("New group…", self.new_group),
+                          ("Join a group with a code…", self.show_join)):
             it = Gtk.MenuItem(label=label)
             it.connect("activate", lambda _i, cb=cb: cb())
             plus.append(it)
         plus.show_all()
         pb = Gtk.MenuButton(popup=plus)
         pb.add(Gtk.Image.new_from_icon_name("list-add-symbolic", Gtk.IconSize.BUTTON))
-        pb.set_tooltip_text("New group or join one")
+        pb.set_tooltip_text("Add friends, new group, join a group")
         top.add(pb)
-        self.more_menu = Gtk.Menu()
-        self.more_btn = Gtk.MenuButton(popup=self.more_menu)
-        self.more_btn.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
-        self.more_btn.set_tooltip_text("Group: invite people, members, settings")
-        self.more_btn.connect("toggled", lambda b: self.build_more_menu() if b.get_active() else None)
-        top.add(self.more_btn)
+        lmenu = Gtk.Menu()
+        for label, cb in (("Profile…", self.edit_profile), ("Back up chats…", self.backup),
+                          ("Restore chats from a backup…", self.restore)):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            lmenu.append(it)
+        lmenu.show_all()
+        lm = Gtk.MenuButton(popup=lmenu)
+        lm.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
+        top.add(lm)
         if not in_window:
             pop = Gtk.Button.new_from_icon_name("window-new-symbolic", Gtk.IconSize.BUTTON)
             pop.set_tooltip_text("Open the chat in its own window")
             pop.connect("clicked", lambda *_: win.open_chat_window())
             top.add(pop)
-        self.add(top)
-        self.info = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
-        self.info.get_style_context().add_class("dim-label")
-        self.add(self.info)
+        lst.add(top)
+        self.setup_bar = Gtk.Box(spacing=6)
+        sl = Gtk.Label(xalign=0, wrap=True, hexpand=True)
+        sl.set_markup("<b>Set up your profile</b> (name and photo) so colleagues can find you and add you as a friend.")
+        sb = Gtk.Button(label="Set up")
+        sb.get_style_context().add_class("suggested-action")
+        sb.connect("clicked", lambda *_: self.edit_profile())
+        self.setup_bar.pack_start(sl, True, True, 0)
+        self.setup_bar.add(sb)
+        self.setup_bar.set_no_show_all(True)
+        lst.add(self.setup_bar)
 
-        # join code shown by the owner
-        self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        self.code_label = Gtk.Label(selectable=True)
-        self.code_label.get_style_context().add_class("chat-code")
-        self.code_hint = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
-        stop = Gtk.Button(label="Stop inviting", halign=Gtk.Align.CENTER)
-        stop.connect("clicked", lambda *_: (self.chat.stop_join(), self.code_box.hide()))
-        for w in (self.code_label, self.code_hint, stop):
-            self.code_box.add(w)
-        self.code_box.set_no_show_all(True)
-        self.add(self.code_box)
-
-        # joining with a code
+        # joining a group with a code
         self.join_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         jr = Gtk.Box(spacing=4)
         self.join_code = Gtk.Entry(placeholder_text="Join code", max_length=6, width_chars=8)
@@ -7102,23 +7609,68 @@ class ChatPanel(Gtk.Box):
         self.join_box.add(jr)
         self.join_box.add(self.join_status)
         self.join_box.set_no_show_all(True)
-        self.add(self.join_box)
+        lst.add(self.join_box)
 
-        # messages
-        self.stack = Gtk.Stack()
+        self.list_stack = Gtk.Stack()
         empty = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, valign=Gtk.Align.CENTER)
-        empty.set_markup("<big>💬</big>\n\n<b>Chat with your team</b>\n\nCreate a group with <b>＋ → New group</b>, "
-                         "or join one with a code from its owner.\n\n<small>Private and encrypted: it stays inside your "
-                         "network and only members can read it.</small>")
+        empty.set_markup("<big>💬</big>\n\n<b>Chat with your colleagues</b>\n\nAdd friends with <b>👥 People</b>, or "
+                         "create a group with <b>＋</b>.\n\n<small>Private and encrypted: everything stays inside your "
+                         "network.</small>")
         empty.set_margin_start(12)
         empty.set_margin_end(12)
-        self.stack.add_named(empty, "empty")
+        self.list_stack.add_named(empty, "empty")
+        sc = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.chat_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.chat_list.connect("row-activated", lambda lb, row: self.open_chat(row.gid))
+        sc.add(self.chat_list)
+        self.list_stack.add_named(sc, "chats")
+        lst.pack_start(self.list_stack, True, True, 0)
+        self.pages.add_named(lst, "list")
+
+        # ===== page 2: one conversation
+        conv = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        head = Gtk.Box(spacing=6)
+        back = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
+        back.set_tooltip_text("All chats")
+        back.connect("clicked", lambda *_: self.show_list())
+        head.add(back)
+        self.conv_avatar = Gtk.Image()
+        head.add(self.conv_avatar)
+        tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.conv_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.info = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.info.get_style_context().add_class("dim-label")
+        tb.add(self.conv_title)
+        tb.add(self.info)
+        head.pack_start(tb, True, True, 0)
+        self.more_menu = Gtk.Menu()
+        self.more_btn = Gtk.MenuButton(popup=self.more_menu)
+        self.more_btn.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
+        self.more_btn.set_tooltip_text("Members, invite people, settings")
+        self.more_btn.connect("toggled", lambda b: self.build_more_menu() if b.get_active() else None)
+        head.add(self.more_btn)
+        conv.add(head)
+
+        # join code shown by a group's owner
+        self.code_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.code_label = Gtk.Label(selectable=True)
+        self.code_label.get_style_context().add_class("chat-code")
+        self.code_hint = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+        stop = Gtk.Button(label="Stop inviting", halign=Gtk.Align.CENTER)
+        stop.connect("clicked", lambda *_: (self.chat.stop_join(), self.code_box.hide()))
+        for w in (self.code_label, self.code_hint, stop):
+            self.code_box.add(w)
+        self.code_box.set_no_show_all(True)
+        conv.add(self.code_box)
+
+        self.stack = Gtk.Stack()
+        self.stack.add_named(Gtk.Label(), "empty")
         self.scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.list.get_style_context().add_class("view")
         self.scroll.add(self.list)
         self.stack.add_named(self.scroll, "messages")
-        self.pack_start(self.stack, True, True, 0)
+        conv.pack_start(self.stack, True, True, 0)
 
         # composer
         comp = Gtk.Box(spacing=4)
@@ -7159,64 +7711,268 @@ class ChatPanel(Gtk.Box):
         comp.pack_start(self.entry, True, True, 0)
         comp.add(self.send_btn)
         self.composer = comp
-        self.add(comp)
+        conv.add(comp)
         self.readonly = Gtk.Label(label="Only the group owner can post here.")
         self.readonly.get_style_context().add_class("dim-label")
         self.readonly.set_no_show_all(True)
-        self.add(self.readonly)
+        conv.add(self.readonly)
+
+        self.pages.add_named(conv, "conv")
+
+        # ===== page 3: people (friend requests, people on the network, friends)
+        ppl = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        ph = Gtk.Box(spacing=6)
+        back2 = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
+        back2.connect("clicked", lambda *_: self.show_list())
+        ph.add(back2)
+        pt = Gtk.Label(xalign=0)
+        pt.set_markup("<b>People</b>")
+        ph.add(pt)
+        ppl.add(ph)
+        psc = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.people_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        psc.add(self.people_box)
+        ppl.pack_start(psc, True, True, 0)
+        self.pages.add_named(ppl, "people")
 
         self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
                            Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
         self.connect("drag-data-received", self.on_drop)
+        self.pages.show_all()
+        self.pages.set_visible_child_name("list")
         self.refresh()
 
-    # ---------- state
-    def refresh(self, gid=None):
-        ids = sorted(self.chat.groups, key=lambda g: self.chat.groups[g].get("name", "").lower())
-        if ids != self._combo_ids or gid is None:
-            self._syncing = True
-            self.combo.remove_all()
-            for g in ids:
-                grp = self.chat.groups[g]
-                n = self.chat.unread.get(g, 0) if g != self.gid else 0
-                label = grp["name"] + ("  (left)" if grp.get("removed") else "") + (f"  • {n} new" if n else "")
-                self.combo.append(g, label)
-            self._combo_ids = ids
-            if self.gid not in ids:
-                self.gid = ids[0] if ids else None
-            if self.gid:
-                self.combo.set_active_id(self.gid)
-            self._syncing = False
-        if gid in (None, self.gid):
-            self.show_messages()
-        self.update_info()
+    # ---------- navigation
+    def show_list(self):
+        self.gid = None
+        self.pages.set_visible_child_name("list")
+        self.refresh()
 
-    def on_group_changed(self, combo):
-        if self._syncing:
+    def open_chat(self, gid):
+        if gid not in self.chat.groups:
             return
-        self.gid = combo.get_active_id()
+        self.gid = gid
+        self.pages.set_visible_child_name("conv")
         self.show_messages()
         self.update_info()
+        self.chat.unread[gid] = 0
+        self.win.update_chat_button()
+        self.entry.grab_focus()
+
+    def show_people(self):
+        if not self.chat.profile.get("setup"):
+            self.edit_profile(then_people=True)
+            return
+        self.chat.start()
+        self.pages.set_visible_child_name("people")
+        self.refresh_people()
+
+    # ---------- state
+    def chat_title(self, gid):
+        g = self.chat.groups[gid]
+        if g.get("kind") == "direct":
+            return self.chat.contacts["friends"].get(g["peer"], {}).get("name") or g.get("name", "?")
+        return g.get("name", "?")
+
+    def chat_avatar(self, gid, size):
+        g = self.chat.groups[gid]
+        if g.get("kind") == "direct":
+            return avatar_pixbuf(self.chat_title(gid), self.chat.avatar_file(g["peer"]), size)
+        return avatar_pixbuf(g.get("name", "?"), None, size, group=True)
+
+    def refresh(self, gid=None):
+        self.me_btn.set_image(Gtk.Image.new_from_pixbuf(avatar_pixbuf(self.chat.my_name(),
+                                                                      self.chat.avatar_file(self.chat.me), 30)))
+        self.setup_bar.set_visible(not self.chat.profile.get("setup"))
+        n = len(self.chat.contacts["incoming"])
+        self.people_badge.set_markup(f"<b>{n}</b>" if n else "")
+        # chats, newest activity first
+        for r in self.chat_list.get_children():
+            self.chat_list.remove(r)
+        order = sorted(self.chat.groups, key=lambda g: -((self.chat.msgs.get(g) or [{}])[-1].get("ts", 0)
+                                                          or self.chat.groups[g].get("created", 0)))
+        for g in order:
+            self.chat_list.add(self._chat_row(g))
+        self.chat_list.show_all()
+        self.list_stack.set_visible_child_name("chats" if order else "empty")
+        if self.gid and self.gid not in self.chat.groups:
+            self.show_list()
+            return
+        if self.gid and self.pages.get_visible_child_name() == "conv" and gid in (None, self.gid):
+            self.show_messages()
+            self.update_info()
+        if self.pages.get_visible_child_name() == "people":
+            self.refresh_people()
+
+    def _chat_row(self, gid):
+        g = self.chat.groups[gid]
+        row = Gtk.ListBoxRow()
+        row.gid = gid
+        box = Gtk.Box(spacing=10, margin=6)
+        box.add(Gtk.Image.new_from_pixbuf(self.chat_avatar(gid, 42)))
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        top = Gtk.Box(spacing=6)
+        name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
+        icon = "" if g.get("kind") == "direct" else "👥 "
+        name.set_markup(f"<b>{esc(icon + self.chat_title(gid))}</b>" + (" <small>(left)</small>" if g.get("removed") else ""))
+        top.pack_start(name, True, True, 0)
+        last = (self.chat.msgs.get(gid) or [None])[-1]
+        if last:
+            when = last.get("ts", 0)
+            stamp = time.strftime("%H:%M", time.localtime(when)) if time.time() - when < 86400 else \
+                time.strftime("%d %b", time.localtime(when))
+            t = Gtk.Label()
+            t.set_markup(f"<small>{stamp}</small>")
+            t.get_style_context().add_class("dim-label")
+            top.add(t)
+        texts.add(top)
+        bottom = Gtk.Box(spacing=6)
+        if last:
+            who = "You: " if last.get("from") == self.chat.me and last["kind"] != "system" else \
+                ("" if g.get("kind") == "direct" or last["kind"] == "system" else f"{last.get('name', '?')}: ")
+            what = {"file": "📎 " + (last.get("file") or {}).get("name", "file"), "sticker": "🏷 Sticker"}.get(
+                last["kind"], last.get("text", ""))
+            prev = (who + what).replace("\n", " ")
+        else:
+            prev = "Say hello 👋" if g.get("kind") == "direct" else "No messages yet"
+        pl = Gtk.Label(label=prev[:80], xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
+        pl.get_style_context().add_class("dim-label")
+        bottom.pack_start(pl, True, True, 0)
+        n = self.chat.unread.get(gid, 0)
+        if n:
+            badge = Gtk.Label()
+            badge.set_markup(f"<span background='#2f7fd8' foreground='#ffffff'><b> {n} </b></span>")
+            bottom.add(badge)
+        texts.add(bottom)
+        box.pack_start(texts, True, True, 0)
+        row.add(box)
+        return row
 
     def update_info(self):
         g = self.chat.groups.get(self.gid) if self.gid else None
         if not g:
-            self.info.set_text("")
-            self.composer.set_sensitive(False)
-            self.stack.set_visible_child_name("empty")
             return
-        members = g.get("members", {})
-        online = len(self.chat.online_members(self.gid))
-        owner = members.get(g.get("owner"), {}).get("name", "?")
-        you = " (you)" if g.get("owner") == self.chat.me else ""
-        self.info.set_text(f"{len(members)} member{'s' if len(members) != 1 else ''} · {online} online · "
-                           f"owner: {owner}{you}" + (" · announcements only" if g.get("owner_only") else ""))
+        self.conv_title.set_markup(f"<b>{esc(self.chat_title(self.gid))}</b>")
+        self.conv_avatar.set_from_pixbuf(self.chat_avatar(self.gid, 34))
+        if g.get("kind") == "direct":
+            pid = g["peer"]
+            f = self.chat.contacts["friends"].get(pid)
+            if g.get("removed") or not f:
+                self.info.set_text("not friends any more")
+            elif f.get("pending_accept"):
+                self.info.set_text("waiting for them to come online to finish the friendship")
+            else:
+                self.info.set_text("online" if self.chat.person_online(pid) else "offline")
+        else:
+            members = g.get("members", {})
+            online = len(self.chat.online_members(self.gid))
+            owner = members.get(g.get("owner"), {}).get("name", "?")
+            you = " (you)" if g.get("owner") == self.chat.me else ""
+            self.info.set_text(f"{len(members)} member{'s' if len(members) != 1 else ''} · {online} online · "
+                               f"owner: {owner}{you}" + (" · announcements only" if g.get("owner_only") else ""))
         can = self.chat.can_post(self.gid)
         self.composer.set_visible(can)
         self.composer.set_sensitive(can)
         self.readonly.set_visible(not can)
-        self.readonly.set_text("You're no longer a member of this group." if g.get("removed")
+        self.readonly.set_text("You're no longer friends." if g.get("kind") == "direct" and g.get("removed") else
+                               "You're no longer a member of this group." if g.get("removed")
                                else "Only the group owner can post here.")
+
+    # ---------- people page
+    def refresh_people(self):
+        for c in self.people_box.get_children():
+            self.people_box.remove(c)
+        ch = self.chat
+
+        def section(title):
+            l = Gtk.Label(xalign=0, margin_top=10)
+            l.set_markup(f"<b>{esc(title)}</b>")
+            self.people_box.add(l)
+
+        def person(pid, name, sub, buttons, online=None):
+            row = Gtk.Box(spacing=10, margin=4)
+            row.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, ch.avatar_file(pid), 40)))
+            t = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+            dot = "" if online is None else (" <span foreground='#2ec27e'>●</span>" if online
+                                             else " <span foreground='#9a9996'>●</span>")
+            t.set_markup(f"<b>{esc(name)}</b>{dot}\n<small>{esc(sub)}</small>")
+            row.pack_start(t, True, True, 0)
+            for label, cb, style in buttons:
+                b = Gtk.Button(label=label)
+                if style:
+                    b.get_style_context().add_class(style)
+                if cb is None:
+                    b.set_sensitive(False)
+                else:
+                    b.connect("clicked", lambda _b, cb=cb: cb())
+                row.add(b)
+            self.people_box.add(row)
+
+        inc = ch.contacts["incoming"]
+        if inc:
+            section(f"Friend requests ({len(inc)})")
+            for pid, r in sorted(inc.items(), key=lambda kv: -kv[1].get("ts", 0)):
+                person(pid, r["name"], "wants to be your friend",
+                       [("Accept", lambda pid=pid: ch.accept_request(pid), "suggested-action"),
+                        ("Decline", lambda pid=pid: ch.decline_request(pid), None)])
+        section("People on your network")
+        found = [(pid, p) for pid, p in ch.people_list() if ch.relation(pid) != "friend"]
+        if not found:
+            l = Gtk.Label(xalign=0, wrap=True)
+            l.set_markup("<small>Nobody else found yet. Colleagues appear here when they open Arckad-D with their "
+                         "profile set up. If someone is missing, a firewall may be blocking it: use "
+                         "<b>Send &amp; Receive → Allow through firewall</b> on both computers.</small>")
+            l.get_style_context().add_class("dim-label")
+            self.people_box.add(l)
+        for pid, p in found:
+            rel = ch.relation(pid)
+            if rel == "outgoing":
+                btns = [("Request sent", None, None), ("Cancel", lambda pid=pid: ch.cancel_request(pid), None)]
+            elif rel == "incoming":
+                btns = [("Accept", lambda pid=pid: ch.accept_request(pid), "suggested-action")]
+            else:
+                btns = [("Add friend", lambda pid=pid: self.add_friend(pid), "suggested-action")]
+            person(pid, p["name"], f"{p.get('os', '')} · on your network", btns)
+        out_only = [(pid, o) for pid, o in ch.contacts["outgoing"].items() if pid not in dict(found)]
+        if out_only:
+            section("Requests you sent")
+            for pid, o in out_only:
+                person(pid, o["name"], "waiting for an answer",
+                       [("Cancel", lambda pid=pid: ch.cancel_request(pid), None)])
+        friends = ch.contacts["friends"]
+        section(f"Friends ({len(friends)})")
+        if not friends:
+            l = Gtk.Label(xalign=0, label="No friends yet: use Add friend above.")
+            l.get_style_context().add_class("dim-label")
+            self.people_box.add(l)
+        for pid, f in sorted(friends.items(), key=lambda kv: kv[1]["name"].lower()):
+            sub = "finishing… (they need to come online)" if f.get("pending_accept") else \
+                ("online" if ch.person_online(pid) else "offline")
+            person(pid, f["name"], sub, [("Message", lambda pid=pid: self.open_chat(ch._direct_gid(pid)),
+                                          "suggested-action")], online=ch.person_online(pid))
+        self.people_box.show_all()
+
+    def add_friend(self, pid):
+        def work():
+            ok, msg = self.chat.send_request(pid)
+            GLib.idle_add(lambda: (self.win.flash_all(msg), self.refresh_people()) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def edit_profile(self, then_people=False):
+        d = ProfileDialog(self.get_toplevel(), self.chat)
+        if d.run() == Gtk.ResponseType.OK:
+            try:
+                self.chat.set_profile(d.name.get_text() or self.chat.my_name(), d.new_photo, d.remove_photo,
+                                      d.visible.get_active())
+            except GLib.Error as ex:
+                self.win.error(f"That photo couldn't be used: {ex.message}")
+            d.destroy()
+            _avatar_cache.clear()
+            self.refresh()
+            if then_people:
+                self.show_people()
+            return
+        d.destroy()
 
     def show_messages(self):
         for r in self.list.get_children():
@@ -7262,7 +8018,7 @@ class ChatPanel(Gtk.Box):
         ctx = bubble.get_style_context()
         ctx.add_class("chat-bubble")
         ctx.add_class("chat-mine" if mine else "chat-theirs")
-        if not mine:
+        if not mine and (self.chat.groups.get(self.gid) or {}).get("kind") != "direct":
             nm = Gtk.Label(xalign=0)
             nm.set_markup(f"<small><b>{esc(m.get('name', '?'))}</b></small>")
             bubble.add(nm)
@@ -7677,11 +8433,11 @@ class ChatPanel(Gtk.Box):
         name = self.win.ask_text("New group", "Group name (e.g. Accounts Team):", "")
         if name and name.strip():
             try:
-                self.gid = self.chat.create_group(name.strip())
+                gid = self.chat.create_group(name.strip())
             except OSError as ex:
                 self.win.error(f"Couldn't start chat sharing: {ex}")
                 return
-            self.refresh()
+            self.open_chat(gid)
             self.invite()
 
     def show_join(self):
@@ -7711,9 +8467,9 @@ class ChatPanel(Gtk.Box):
                 self.join_code.set_text("")
                 self.join_ip.set_text("")
                 gid = next((g for g, v in self.chat.groups.items() if v["name"] == msg), None)
-                if gid:
-                    self.gid = gid
                 self.refresh()
+                if gid:
+                    self.open_chat(gid)
                 self.win.flash_all(f"Joined “{msg}”")
             else:
                 self.join_status.set_text("✗ " + msg)
@@ -7766,6 +8522,22 @@ class ChatPanel(Gtk.Box):
             self.more_menu.show_all()
             return
         owner = self.chat.is_owner(self.gid)
+        if g.get("kind") == "direct":
+            for label, cb, ok in (("Safety code…", self.show_safety_code, not g.get("removed")),
+                                  ("Open the attachments folder", lambda: (
+                                      self.chat.files_dir(self.gid).mkdir(parents=True, exist_ok=True),
+                                      self.win.active.go(str(self.chat.files_dir(self.gid)))), True),
+                                  (None, None, None),
+                                  ("Remove friend…", self.leave, not g.get("removed"))):
+                if label is None:
+                    self.more_menu.append(Gtk.SeparatorMenuItem())
+                    continue
+                it = Gtk.MenuItem(label=label)
+                it.set_sensitive(ok)
+                it.connect("activate", lambda _i, cb=cb: cb())
+                self.more_menu.append(it)
+            self.more_menu.show_all()
+            return
 
         def add(label, cb, ok=True):
             it = Gtk.MenuItem(label=label)
@@ -7787,6 +8559,17 @@ class ChatPanel(Gtk.Box):
         add("Delete group for everyone…" if owner else "Leave group…", self.leave)
         self.more_menu.show_all()
 
+    def show_safety_code(self):
+        pid = self.chat.groups[self.gid]["peer"]
+        name = self.chat_title(self.gid)
+        d = Gtk.MessageDialog(transient_for=self.get_toplevel(), modal=True, message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.CLOSE, text=f"Safety code with {name}")
+        d.format_secondary_markup(f"<span size='x-large' font_family='monospace'><b>{self.chat.safety_code(pid)}</b>"
+                                  f"</span>\n\nOpen this on {esc(name)}'s computer too. If both screens show the same "
+                                  "numbers, your chat is private: nobody on the network got in between.")
+        d.run()
+        d.destroy()
+
     def rename(self):
         name = self.win.ask_text("Rename group", "New name:", self.chat.groups[self.gid]["name"])
         if name and name.strip():
@@ -7794,13 +8577,19 @@ class ChatPanel(Gtk.Box):
 
     def leave(self):
         g = self.chat.groups[self.gid]
+        if g.get("kind") == "direct":
+            name = self.chat_title(self.gid)
+            if self.win.confirm(f"Remove {name} from your friends?\n\nYou can't message each other until one of you "
+                                "sends a new friend request. Your chat history stays here."):
+                self.chat.remove_friend(g["peer"])
+                self.show_list()
+            return
         owner = self.chat.is_owner(self.gid)
         q = (f"Delete “{g['name']}” for everyone?\n\nAll members are removed. Each keeps their own copy of the history."
              if owner else f"Leave “{g['name']}”?\n\nYou'd need a new join code from the owner to come back.")
         if self.win.confirm(q):
             self.chat.leave_group(self.gid)
-            self.gid = None
-            self.refresh()
+            self.show_list()
 
     def members_dialog(self):
         g = self.chat.groups.get(self.gid)
@@ -8003,6 +8792,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("New folder… (Ctrl+Shift+N)", lambda: self.new_folder(self.active)),
             ("New empty file…", lambda: self.new_file(self.active)),
             ("Team chat in its own window", lambda: self.open_chat_window()),
+            ("Chat profile (name and photo)…", lambda: self.chat_panel.edit_profile()),
             ("Open terminal here (F4)", lambda: self.open_terminal(self.active.location
                                                                    if is_folder_loc(self.active.location) else str(HOME))),
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
@@ -9881,6 +10671,24 @@ class MainWindow(Gtk.ApplicationWindow):
         self.update_chat_button()
         return False
 
+    def on_people_changed(self):
+        for p in self.chat_panels():
+            p.refresh()
+        self.update_chat_button()
+        return False
+
+    def on_friend_request(self, pid):
+        self.on_people_changed()
+        name = self.chat.contacts["incoming"].get(pid, {}).get("name", "Someone")
+        self.flash_all(f"👋 {name} sent you a friend request (Chat → People)")
+        try:
+            n = Gio.Notification.new(f"{name} wants to be your friend")
+            n.set_body("Open Chat → 👥 People to accept or decline.")
+            self.get_application().send_notification(f"friend-{pid}", n)
+        except Exception:
+            pass
+        return False
+
     def on_chat_presence(self):
         for p in self.chat_panels():
             p.update_info()
@@ -9904,7 +10712,7 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def update_chat_button(self):
-        total = sum(n for g, n in self.chat.unread.items() if g in self.chat.groups)
+        total = sum(n for g, n in self.chat.unread.items() if g in self.chat.groups) + len(self.chat.contacts["incoming"])
         self.chat_btn.set_label(f"💬 Chat ({total})" if total else "💬 Chat")
         return False
 
