@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.12.0"
+APP_VERSION = "3.12.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2499,6 +2499,8 @@ class FilePane(Gtk.Box):
                 add(f"Move to other pane ({other.title()})", lambda: win.transfer(paths, True, other.location))
             if is_dir:
                 add("Pin to sidebar", lambda: win.pin(first))
+                for item in win.terminal_menu_items(first):
+                    menu.append(item)
             add("Rename… (F2)", lambda: win.rename(self, first), len(paths) == 1)
             add("Duplicate", lambda: win.duplicate(self, paths))
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
@@ -2513,7 +2515,9 @@ class FilePane(Gtk.Box):
             add("Paste (Ctrl+V)", lambda: win.paste_into(self), in_folder and win.clipboard is not None)
             add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
             add("New empty file…", lambda: win.new_file(self), in_folder)
-            add("Open terminal here", lambda: win.open_terminal(self.location), in_folder)
+            for item in win.terminal_menu_items(self.location):
+                item.set_sensitive(in_folder)
+                menu.append(item)
             add("Properties of this folder", lambda: win.properties([self.location]), in_folder)
             menu.append(Gtk.SeparatorMenuItem())
             add("Organize this folder…", lambda: win.organize(self), in_folder)
@@ -2533,6 +2537,10 @@ class FilePane(Gtk.Box):
             self.edit_path()
         elif key == "F5":
             self.refresh()
+        elif key == "F4":
+            sel = [p for p in self.selected_paths() if os.path.isdir(p)]
+            folder = sel[0] if len(sel) == 1 else (self.location if is_folder_loc(self.location) else str(HOME))
+            self.win.open_terminal(folder)
         elif (alt and key == "Left") or (key == "BackSpace" and not typing):
             self.go_back()
         elif alt and key == "Right":
@@ -5558,6 +5566,7 @@ Space  preview panel      Ctrl+1 / Ctrl+2  list / grid
 Ctrl+F  filter            Ctrl+L  type a path
 Ctrl+C / X / V  copy, cut, paste files
 Ctrl+Shift+N  new folder  Alt+Enter  properties
+F4  open a terminal / Command Prompt in this folder
 F2  rename                Delete  move to Trash
 Shift+Delete  delete permanently   Ctrl+A  select all
 Ctrl+H  hidden files      F5  refresh
@@ -5700,6 +5709,8 @@ class MainWindow(Gtk.ApplicationWindow):
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
             ("New folder… (Ctrl+Shift+N)", lambda: self.new_folder(self.active)),
             ("New empty file…", lambda: self.new_file(self.active)),
+            ("Open terminal here (F4)", lambda: self.open_terminal(self.active.location
+                                                                   if is_folder_loc(self.active.location) else str(HOME))),
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
             None,
         ] + ([] if INSTALLED or IS_WIN else [(f"Add {APP_NAME} to app menu", self.on_install)]) + [
@@ -5854,7 +5865,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.info(f"You're up to date. {APP_NAME} {APP_VERSION} is the newest version.")
             return False
         self.latest = rel
-        how = {"windows": "It installs quietly and reopens by itself.",
+        how = {"windows": "Arckad-D closes, a small window shows the install, then it reopens.",
                "deb": "You'll be asked for your password once."}.get(install_kind(), "")
         self.update_label.set_markup(f"<b>{APP_NAME} {esc(latest)} is available</b> (you have {APP_VERSION}). "
                                      f"{esc(how)}")
@@ -5929,16 +5940,48 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def _run_windows_setup(self, path):
-        """Start the installer only after Arckad-D has fully closed, so none of its files are still in use."""
-        setup = str(path).replace("'", "''")
-        script = (f"Wait-Process -Id {os.getpid()} -Timeout 60 -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1; "
-                  f"Start-Process -FilePath '{setup}' -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"
-                  f"'/CLOSEAPPLICATIONS'")
+        """Install after Arckad-D has fully closed, with a visible progress window. If the installer fails,
+        the old Arckad-D is reopened and explains what happened (the installer writes a log)."""
+        q = lambda s: str(s).replace("'", "''")
+        log = Path(tempfile.gettempdir()) / "arckad-d-update.log"
+        script = (
+            f"Wait-Process -Id {os.getpid()} -Timeout 60 -ErrorAction SilentlyContinue; "
+            "Get-Process -Name 'Arckad-D' -ErrorAction SilentlyContinue | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue; "
+            "Start-Sleep -Seconds 2; "
+            f"$p = Start-Process -FilePath '{q(path)}' -ArgumentList '/SILENT','/SUPPRESSMSGBOXES','/NORESTART',"
+            f"'/CLOSEAPPLICATIONS','/LOG=\"{q(log)}\"' -Wait -PassThru; "
+            f"if ($p.ExitCode -ne 0) {{ Start-Process -FilePath '{q(sys.executable)}' "
+            f"-ArgumentList '--update-failed',$p.ExitCode }}")
         subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
                           "-Command", script],
                          creationflags=0x00000008 | 0x00000200 | 0x08000000)   # detached, no console window
         self.on_close()
         self.get_application().quit()
+
+    def show_update_failure(self, code):
+        """Shown when the Windows installer stopped (Arckad-D was reopened by the update helper)."""
+        reasons = {"1": "the installer couldn't start", "2": "it was cancelled before installing",
+                   "3": "a problem while preparing", "4": "a problem while copying files",
+                   "5": "it was cancelled while installing", "7": "a program was still using Arckad-D's files",
+                   "8": "Windows needs a restart first"}
+        log = Path(tempfile.gettempdir()) / "arckad-d-update.log"
+        tail = ""
+        try:
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(l for l in lines[-12:] if l.strip())
+        except OSError:
+            pass
+        d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.NONE, text="The update wasn't installed")
+        d.format_secondary_text(
+            f"The installer stopped ({reasons.get(str(code), 'error code ' + str(code))}). Arckad-D is still on "
+            f"version {APP_VERSION}.\n\nYou can try again from ☰ → Check for updates, or install the new version "
+            f"yourself from the Releases page.\n\nInstaller log: {log}\n\n{tail[-1200:]}")
+        d.add_buttons("Close", Gtk.ResponseType.CLOSE, "Open Releases page", Gtk.ResponseType.ACCEPT)
+        if d.run() == Gtk.ResponseType.ACCEPT:
+            open_default(f"https://github.com/{UPDATE_REPO}/releases/latest")
+        d.destroy()
+        return False
 
     def _deb_installed(self, dlg, ok, msg, path):
         dlg.destroy()
@@ -6954,15 +6997,33 @@ class MainWindow(Gtk.ApplicationWindow):
         if errors:
             self.error("Some items couldn't be deleted:\n\n" + "\n".join(errors[:10]))
 
-    def open_terminal(self, folder):
-        """A terminal window in this folder."""
+    @staticmethod
+    def terminal_choices():
+        """[(label, kind)] of terminals on this computer."""
+        if IS_WIN:
+            out = []
+            if shutil.which("wt.exe") or shutil.which("wt"):
+                out.append(("Windows Terminal", "wt"))
+            out.append(("Command Prompt (cmd)", "cmd"))
+            out.append(("PowerShell", "powershell"))
+            return out
+        return [("Terminal", "linux")]
+
+    def open_terminal(self, folder, kind=None):
+        """A terminal window in this folder (Windows: Windows Terminal, Command Prompt or PowerShell)."""
+        folder = folder if folder and os.path.isdir(folder) else str(HOME)
         try:
             if IS_WIN:
-                wt = shutil.which("wt.exe") or shutil.which("wt")
-                if wt:
-                    subprocess.Popen([wt, "-d", folder])
+                kind = kind or self.terminal_choices()[0][1]
+                new_console = 0x00000010
+                if kind == "wt":
+                    subprocess.Popen([shutil.which("wt.exe") or shutil.which("wt"), "-d", folder])
+                elif kind == "powershell":
+                    ps = shutil.which("pwsh.exe") or shutil.which("powershell.exe") or "powershell.exe"
+                    subprocess.Popen([ps, "-NoExit", "-NoLogo"], cwd=folder, creationflags=new_console)
                 else:
-                    subprocess.Popen(["cmd.exe", "/K", f'cd /d "{folder}"'], creationflags=0x00000010)  # new console
+                    comspec = os.environ.get("ComSpec", "cmd.exe")
+                    subprocess.Popen([comspec, "/K"], cwd=folder, creationflags=new_console)
                 return
             for cmd in (["x-terminal-emulator"], ["gnome-terminal", f"--working-directory={folder}"],
                         ["kgx", f"--working-directory={folder}"], ["konsole", "--workdir", folder],
@@ -6974,6 +7035,16 @@ class MainWindow(Gtk.ApplicationWindow):
             self.error("No terminal app was found on this computer.")
         except OSError as ex:
             self.error(f"Couldn't open a terminal: {ex.strerror or ex}")
+
+    def terminal_menu_items(self, folder):
+        """Menu entries: one on Linux, Windows Terminal / Command Prompt / PowerShell on Windows."""
+        items = []
+        for label, kind in self.terminal_choices():
+            text = f"Open {label} here" + ("  (F4)" if kind == self.terminal_choices()[0][1] else "")
+            item = Gtk.MenuItem(label=text)
+            item.connect("activate", lambda _i, k=kind: self.open_terminal(folder, k))
+            items.append(item)
+        return items
 
     def properties(self, paths):
         paths = [p for p in paths if p and os.path.exists(p)]
@@ -7883,6 +7954,10 @@ def main():
     if "--autosort" in sys.argv:
         run_autosort_service()
         return
+    failed = None
+    if "--update-failed" in sys.argv:
+        i = sys.argv.index("--update-failed")
+        failed = sys.argv[i + 1] if len(sys.argv) > i + 1 else "?"
     start = next((os.path.abspath(os.path.expanduser(a)) for a in sys.argv[1:]
                   if os.path.isdir(os.path.expanduser(a))), None)
     fix_user_launcher()
@@ -7892,7 +7967,10 @@ def main():
 
     def activate(a):
         try:
-            MainWindow(a, start).present()
+            win = MainWindow(a, start)
+            win.present()
+            if failed:
+                GLib.timeout_add(800, lambda: win.show_update_failure(failed) or False)
         except Exception:
             import traceback
             show_crash(traceback.format_exc())
