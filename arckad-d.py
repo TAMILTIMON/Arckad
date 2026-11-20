@@ -47,13 +47,32 @@ try:
     gi.require_version("Gdk", "3.0")
     gi.require_version("GdkPixbuf", "2.0")
     from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango
-except (ImportError, ValueError):
-    sys.exit("GTK for Python is missing. Install it with:\n"
-             "  sudo apt install python3-gi gir1.2-gtk-3.0")
+except Exception:                       # also broken installs, not just missing GTK
+    import traceback
+    _err = traceback.format_exc()
+    if "--selftest" in sys.argv:         # the automatic build test reads this file
+        _i = sys.argv.index("--selftest")
+        with open(sys.argv[_i + 1] if len(sys.argv) > _i + 1 else "selftest.txt", "w", encoding="utf-8") as _f:
+            _f.write("SELFTEST FAILED while loading GTK\n" + _err)
+        sys.exit(1)
+    if sys.platform == "win32":
+        _log = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "arckad-d-error.log")
+        try:
+            with open(_log, "w", encoding="utf-8") as _f:
+                _f.write(_err)
+        except OSError:
+            pass
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, "Arckad-D couldn't start because part of it is missing or damaged.\n\n"
+                                         "Please reinstall it from the Releases page.\n\nDetails were saved to:\n" + _log,
+                                         "Arckad-D", 0x10)
+        sys.exit(1)
+    sys.exit("GTK for Python is missing or broken. Install it with:\n"
+             "  sudo apt install python3-gi gir1.2-gtk-3.0\n\n" + _err)
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.9.0"
+APP_VERSION = "3.9.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1560,7 +1579,7 @@ class FilePane(Gtk.Box):
         self.add(flow)
 
         # list view
-        self.tree = Gtk.TreeView(enable_search=False, rubber_banding=True)
+        self.tree = Gtk.TreeView(enable_search=False, rubber_banding=False)   # press-and-drag = drag files
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.get_selection().connect("changed", self.on_selection_changed)
         self.tree.connect("row-activated", lambda t, p, c: self.activate_row(p))
@@ -1616,7 +1635,62 @@ class FilePane(Gtk.Box):
         self.status = Gtk.Label(xalign=0, margin=5, ellipsize=Pango.EllipsizeMode.END)
         self.status.get_style_context().add_class("dim-label")
         self.add(self.status)
+        self._setup_dnd()
         self.connect("map", lambda *_: self.view_stack.set_visible_child_name(self.view_mode))
+
+    # ---------- drag and drop
+    def _setup_dnd(self):
+        targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
+        actions = Gdk.DragAction.MOVE | Gdk.DragAction.COPY
+        self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
+        self.tree.enable_model_drag_dest(targets, actions)
+        self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
+        self.icons.enable_model_drag_dest(targets, actions)
+        for view in (self.tree, self.icons):
+            view.connect("drag-data-get", self.on_drag_get)
+            view.connect("drag-data-received", self.on_drag_received)
+            view.connect("drag-drop", self.on_drag_drop)
+            view.connect("drag-begin", self.on_drag_begin)
+
+    def on_drag_begin(self, view, context):
+        n = len(self.selected_paths())
+        Gtk.drag_set_icon_name(context, "folder-documents" if n > 1 else "text-x-generic", 0, 0)
+
+    def on_drag_get(self, view, context, selection, info, time_):
+        uris = [Gio.File.new_for_path(p).get_uri() for p in self.selected_paths()]
+        selection.set_uris(uris)
+
+    def drop_target(self, view, x, y):
+        """The folder under the pointer, or this pane's folder."""
+        if view is self.tree:
+            hit = self.tree.get_dest_row_at_pos(x, y)
+            if hit and hit[1] in (Gtk.TreeViewDropPosition.INTO_OR_BEFORE, Gtk.TreeViewDropPosition.INTO_OR_AFTER):
+                row = self.sorted[hit[0]]
+                if row[C_ISDIR]:
+                    return row[C_PATH]
+        else:
+            hit = self.icons.get_dest_item_at_pos(x, y)
+            if hit:
+                row = self.sorted[hit[0]]
+                if row[C_ISDIR]:
+                    return row[C_PATH]
+        return self.location if self.mode == "folder" else None
+
+    def on_drag_drop(self, view, context, x, y, time_):
+        view.stop_emission_by_name("drag-drop")            # sorted lists can't take rows; ask for the files instead
+        view.drag_get_data(context, Gdk.Atom.intern("text/uri-list", False), time_)
+        return True
+
+    def on_drag_received(self, view, context, x, y, selection, info, time_):
+        view.stop_emission_by_name("drag-data-received")      # we handle it; don't let GTK reorder rows
+        dest = self.drop_target(view, x, y)
+        paths = [Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])]
+        paths = [p for p in paths if p]
+        internal = Gtk.drag_get_source_widget(context) is not None
+        mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
+        ok = self.win.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
+                                  bool(mods & Gdk.ModifierType.SHIFT_MASK))
+        Gtk.drag_finish(context, ok, False, time_)
 
     def _text_col(self, title, text_col, sort_col, xalign=0.0):
         r = Gtk.CellRendererText(xalign=xalign, ellipsize=Pango.EllipsizeMode.END)
@@ -4263,6 +4337,8 @@ F2  rename                Delete  move to Trash
 Ctrl+H  hidden files      F5  refresh
 Ctrl+Shift+D  switch theme (system / light / dark)
 Alt+← / Alt+→ / Alt+↑  back, forward, up
+Drag files onto a folder, a tab or the sidebar to move them
+   (hold Ctrl to copy; files dragged in from other apps are copied)
 Middle-click a folder  open it in a new tab
 Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
 
@@ -4472,6 +4548,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.sidebar.get_style_context().add_class("navigation-sidebar")
         self.sidebar.connect("row-activated", lambda lb, row: self.active.go(row.key))
         self.sidebar.connect("button-press-event", self.on_sidebar_click)
+        self.sidebar.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                                   Gdk.DragAction.MOVE | Gdk.DragAction.COPY)
+        self.sidebar.connect("drag-data-received", self.on_sidebar_drop)
+        self.sidebar.connect("drag-motion", self.on_sidebar_motion)
         side_scroll = Gtk.ScrolledWindow(vexpand=True)
         side_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         side_scroll.add(self.sidebar)
@@ -4953,6 +5033,26 @@ class MainWindow(Gtk.ApplicationWindow):
         menu.popup_at_pointer(event)
         return True
 
+    def on_sidebar_motion(self, lb, context, x, y, time_):
+        row = lb.get_row_at_y(y)
+        if row is not None and is_folder_loc(getattr(row, "key", "") or ""):
+            lb.drag_highlight_row(row)
+        else:
+            lb.drag_unhighlight_row()
+        return False
+
+    def on_sidebar_drop(self, lb, context, x, y, selection, info, time_):
+        lb.drag_unhighlight_row()
+        row = lb.get_row_at_y(y)
+        dest = getattr(row, "key", None) if row else None
+        if not dest or not is_folder_loc(dest):
+            return
+        paths = [p for p in (Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])) if p]
+        internal = Gtk.drag_get_source_widget(context) is not None
+        mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
+        self.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
+                         bool(mods & Gdk.ModifierType.SHIFT_MASK))
+
     def pin(self, path):
         if is_folder_loc(path) and path not in self.cfg["pinned"]:
             self.cfg["pinned"].append(path)
@@ -5325,6 +5425,22 @@ class MainWindow(Gtk.ApplicationWindow):
             self.error("Some items couldn't be " + ("moved" if move else "copied") + ":\n\n"
                        + "\n".join(state["errors"][:15]))
         return False
+
+    def handle_drop(self, paths, dest, internal, ctrl, shift):
+        """Dropped files: inside Arckad-D they move (hold Ctrl to copy); from other apps they copy
+        (hold Shift to move). Name clashes ask, like paste does."""
+        if not paths or not dest or not os.path.isdir(dest):
+            if self.active:
+                self.active.flash("Drop files on a folder, or into an open folder")
+            return False
+        move = (internal and not ctrl) or (not internal and shift)
+        if move and all(os.path.dirname(p.rstrip(os.sep)) == dest for p in paths):
+            return False                                # dropped where they already are
+        if any(os.path.isdir(p) and (dest + os.sep).startswith(p.rstrip(os.sep) + os.sep) for p in paths):
+            self.error("A folder can't be moved or copied into itself.")
+            return False
+        self.transfer(paths, move, dest)
+        return True
 
     def refresh_all(self):
         for pane in self.all_panes():
