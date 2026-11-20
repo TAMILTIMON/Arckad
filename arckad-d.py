@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.11.4"
+APP_VERSION = "3.12.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1715,6 +1715,22 @@ class FilePane(Gtk.Box):
         self.grid_btn.set_active(self.view_mode == "grid")
         self.list_btn.connect("toggled", lambda b: self.set_view("list" if b.get_active() else "grid"))
         self.row1.add(views)
+        new_menu = Gtk.Menu()
+        for label, cb in (("New folder (Ctrl+Shift+N)", lambda: self.win.new_folder(self)),
+                          ("New empty file", lambda: self.win.new_file(self))):
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate", lambda _i, cb=cb: cb())
+            new_menu.append(item)
+        new_menu.show_all()
+        self.new_btn = Gtk.MenuButton(popup=new_menu)
+        nb = Gtk.Box(spacing=4)
+        nb.add(Gtk.Image.new_from_icon_name("folder-new-symbolic", Gtk.IconSize.BUTTON))
+        nb.add(Gtk.Label(label="New"))
+        self.new_btn.add(nb)
+        self.new_btn.set_tooltip_text("Create a new folder or file here")
+        self.new_btn.get_style_context().add_class("suggested-action")
+        self.row1.add(self.new_btn)
+        self.row1.reorder_child(self.new_btn, 1)          # right after Back / Forward / Up
         self.add(self.row1)
 
         # filters (wrap onto two lines when the pane is narrow)
@@ -2484,12 +2500,21 @@ class FilePane(Gtk.Box):
             if is_dir:
                 add("Pin to sidebar", lambda: win.pin(first))
             add("Rename… (F2)", lambda: win.rename(self, first), len(paths) == 1)
+            add("Duplicate", lambda: win.duplicate(self, paths))
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
+            add("Properties (Alt+Enter)", lambda: win.properties(paths))
+            menu.append(Gtk.SeparatorMenuItem())
+            add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
+            add("New empty file…", lambda: win.new_file(self), in_folder)
             menu.append(Gtk.SeparatorMenuItem())
             add("Move to Trash (Delete)", lambda: win.trash(self, paths))
+            add("Delete permanently (Shift+Delete)", lambda: win.delete_forever(self, paths))
         else:
             add("Paste (Ctrl+V)", lambda: win.paste_into(self), in_folder and win.clipboard is not None)
-            add("New folder…", lambda: win.new_folder(self), in_folder)
+            add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
+            add("New empty file…", lambda: win.new_file(self), in_folder)
+            add("Open terminal here", lambda: win.open_terminal(self.location), in_folder)
+            add("Properties of this folder", lambda: win.properties([self.location]), in_folder)
             menu.append(Gtk.SeparatorMenuItem())
             add("Organize this folder…", lambda: win.organize(self), in_folder)
             add("Find duplicates here…", lambda: win.duplicates(self.location), in_folder)
@@ -2516,8 +2541,18 @@ class FilePane(Gtk.Box):
             self.go_up()
         elif key == "Escape" and self.path_stack.get_visible_child_name() == "entry":
             self.path_stack.set_visible_child_name("crumbs")
+        elif ctrl and key in ("N", "n") and bool(Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
+                                                       & Gdk.ModifierType.SHIFT_MASK):
+            self.win.new_folder(self)
+        elif ctrl and low == "a" and not typing:
+            (self.icons.select_all if self.view_mode == "grid" else self.tree.get_selection().select_all)()
+        elif alt and key in ("Return", "KP_Enter") and not typing:
+            self.win.properties(self.selected_paths() or ([self.location] if self.mode == "folder" else []))
         elif key == "Delete" and not typing and self.selected_paths():
-            self.win.trash(self, self.selected_paths())
+            if Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state() & Gdk.ModifierType.SHIFT_MASK:
+                self.win.delete_forever(self, self.selected_paths())
+            else:
+                self.win.trash(self, self.selected_paths())
         elif key == "F2" and not typing and len(self.selected_paths()) == 1:
             self.win.rename(self, self.selected_paths()[0])
         else:
@@ -5522,7 +5557,9 @@ F3  dual pane on/off      F6  jump to other pane
 Space  preview panel      Ctrl+1 / Ctrl+2  list / grid
 Ctrl+F  filter            Ctrl+L  type a path
 Ctrl+C / X / V  copy, cut, paste files
+Ctrl+Shift+N  new folder  Alt+Enter  properties
 F2  rename                Delete  move to Trash
+Shift+Delete  delete permanently   Ctrl+A  select all
 Ctrl+H  hidden files      F5  refresh
 Ctrl+Shift+D  switch theme (system / light / dark)
 Alt+← / Alt+→ / Alt+↑  back, forward, up
@@ -5661,7 +5698,8 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_end(self._menu_button(None, "open-menu-symbolic", [
             self.hidden_item, self.icons_item, None,
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
-            ("New folder…", lambda: self.new_folder(self.active)),
+            ("New folder… (Ctrl+Shift+N)", lambda: self.new_folder(self.active)),
+            ("New empty file…", lambda: self.new_file(self.active)),
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
             None,
         ] + ([] if INSTALLED or IS_WIN else [(f"Add {APP_NAME} to app menu", self.on_install)]) + [
@@ -6845,6 +6883,176 @@ class MainWindow(Gtk.ApplicationWindow):
                 break
         pane.refresh()
         pane.flash(f"Moved {done} item{'s' if done != 1 else ''} to Trash (restore from Trash in the Files app)")
+
+    def new_file(self, pane):
+        if pane.mode != "folder":
+            self.info("Open a normal folder first, then create the new file there.")
+            return
+        name = self.ask_text("New empty file", "File name (include the type, e.g. notes.txt):", "New file.txt",
+                             select_stem=True)
+        if not name:
+            return
+        bad = set('/\\:*?"<>|') if IS_WIN else {"/"}
+        if any(c in bad for c in name):
+            self.error("A name can't contain any of these characters:  " + " ".join(sorted(bad)))
+            return
+        target = unique_target(Path(pane.location) / name)
+        try:
+            with open(target, "x"):
+                pass
+        except OSError as ex:
+            self.error(f"Couldn't create the file: {ex.strerror}")
+            return
+        pane.pending_select = [str(target)]
+        pane.refresh()
+
+    def duplicate(self, pane, paths):
+        def work():
+            made, errors = [], []
+            for src in paths:
+                p = Path(src)
+                stem, suffix = (p.name, "") if p.is_dir() else (p.stem, p.suffix)
+                target = unique_target(p.with_name(f"{stem} (copy){suffix}"))
+                try:
+                    if p.is_dir():
+                        shutil.copytree(src, target, symlinks=True)
+                    else:
+                        shutil.copy2(src, target)
+                    made.append(str(target))
+                except (OSError, shutil.Error) as ex:
+                    errors.append(f"{p.name}: {getattr(ex, 'strerror', None) or ex}")
+            GLib.idle_add(done, made, errors)
+
+        def done(made, errors):
+            self.update_spinner()
+            pane.pending_select = made
+            pane.refresh()
+            pane.flash(f"Duplicated {len(made)} item{'s' if len(made) != 1 else ''}")
+            if errors:
+                self.error("Some items couldn't be duplicated:\n\n" + "\n".join(errors[:10]))
+            return False
+        self.spinner.start()
+        threading.Thread(target=work, daemon=True).start()
+
+    def delete_forever(self, pane, paths):
+        n = len(paths)
+        names = ", ".join(os.path.basename(p) for p in paths[:3]) + ("…" if n > 3 else "")
+        if not self.confirm(f"Delete {n} item{'s' if n != 1 else ''} permanently?\n\n{names}\n\n"
+                            "They will NOT go to the Trash and can't be restored."):
+            return
+        errors = []
+        for p in paths:
+            try:
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+            except OSError as ex:
+                errors.append(f"{os.path.basename(p)}: {ex.strerror}")
+        pane.refresh()
+        pane.flash(f"Deleted {n - len(errors)} item{'s' if n - len(errors) != 1 else ''} permanently")
+        if errors:
+            self.error("Some items couldn't be deleted:\n\n" + "\n".join(errors[:10]))
+
+    def open_terminal(self, folder):
+        """A terminal window in this folder."""
+        try:
+            if IS_WIN:
+                wt = shutil.which("wt.exe") or shutil.which("wt")
+                if wt:
+                    subprocess.Popen([wt, "-d", folder])
+                else:
+                    subprocess.Popen(["cmd.exe", "/K", f'cd /d "{folder}"'], creationflags=0x00000010)  # new console
+                return
+            for cmd in (["x-terminal-emulator"], ["gnome-terminal", f"--working-directory={folder}"],
+                        ["kgx", f"--working-directory={folder}"], ["konsole", "--workdir", folder],
+                        ["xfce4-terminal", f"--working-directory={folder}"], ["mate-terminal", f"--working-directory={folder}"],
+                        ["tilix", "-w", folder], ["xterm"]):
+                if shutil.which(cmd[0]):
+                    subprocess.Popen(cmd, cwd=folder, start_new_session=True)
+                    return
+            self.error("No terminal app was found on this computer.")
+        except OSError as ex:
+            self.error(f"Couldn't open a terminal: {ex.strerror or ex}")
+
+    def properties(self, paths):
+        paths = [p for p in paths if p and os.path.exists(p)]
+        if not paths:
+            return
+        dlg = Gtk.Dialog(title="Properties", transient_for=self, modal=False)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        dlg.connect("response", lambda d, r: d.destroy())
+        dlg.set_default_size(460, -1)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=7, border_width=16)
+        dlg.get_content_area().add(grid)
+        rows = []
+        first = paths[0]
+        if len(paths) == 1:
+            st = os.stat(first)
+            is_dir = os.path.isdir(first)
+            rows += [("Name", os.path.basename(first.rstrip(os.sep)) or first),
+                     ("Type", type_description(first, is_dir)),
+                     ("Location", os.path.dirname(first.rstrip(os.sep)) or first)]
+            rows.append(("Size", "counting…" if is_dir else f"{human_size(st.st_size)} ({st.st_size:,} bytes)"))
+            if is_dir:
+                rows.append(("Contains", "counting…"))
+            rows.append(("Modified", fmt_full(st.st_mtime)))
+            rows.append(("Accessed", fmt_full(st.st_atime)))
+            try:
+                info = Gio.File.new_for_path(first).query_info("time::created", Gio.FileQueryInfoFlags.NONE, None)
+                if info.has_attribute("time::created"):
+                    rows.append(("Created", fmt_full(info.get_attribute_uint64("time::created"))))
+            except GLib.Error:
+                pass
+            if not IS_WIN:
+                try:
+                    import grp
+                    import pwd
+                    rows.append(("Permissions", statmod.filemode(st.st_mode)))
+                    rows.append(("Owner", f"{pwd.getpwuid(st.st_uid).pw_name} (group {grp.getgrgid(st.st_gid).gr_name})"))
+                except (ImportError, KeyError):
+                    rows.append(("Permissions", statmod.filemode(st.st_mode)))
+            if is_dir:
+                label, free = self.drive_info(first)
+                if free:
+                    rows.append(("Drive space", free))
+        else:
+            rows += [("Selected", f"{len(paths)} items"), ("Location", os.path.dirname(first)),
+                     ("Size", "counting…"), ("Contains", "counting…")]
+        values = {}
+        for i, (k, v) in enumerate(rows):
+            kl = Gtk.Label(xalign=1, yalign=0)
+            kl.set_markup(f"<b>{esc(k)}</b>")
+            vl = Gtk.Label(label=v, xalign=0, wrap=True, selectable=True, width_chars=34, max_width_chars=48)
+            vl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            grid.attach(kl, 0, i, 1, 1)
+            grid.attach(vl, 1, i, 1, 1)
+            values[k] = vl
+        dlg.show_all()
+        if "counting…" in [v for _, v in rows]:
+            def work():
+                files = folders = size = 0
+                for p in paths:
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        for _q, s, d in walk_entries(p, hidden=True):
+                            if d:
+                                folders += 1
+                            else:
+                                files += 1
+                                size += s.st_size
+                    else:
+                        files += 1
+                        size += os.path.getsize(p)
+                GLib.idle_add(show, files, folders, size)
+
+            def show(files, folders, size):
+                if "Size" in values:
+                    values["Size"].set_text(f"{human_size(size)} ({size:,} bytes)")
+                if "Contains" in values:
+                    values["Contains"].set_text(f"{files:,} file{'s' if files != 1 else ''}, "
+                                                f"{folders:,} folder{'s' if folders != 1 else ''}")
+                return False
+            threading.Thread(target=work, daemon=True).start()
 
     def new_folder(self, pane):
         if pane.mode != "folder":

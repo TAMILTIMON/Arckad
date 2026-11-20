@@ -176,6 +176,7 @@ final class FilesScreen implements MainActivity.Screen {
         boolean atRoot = cwd.equals(Fs.root()) && !searching;
         if (!atRoot) bar.addView(Ui.icon(a, "←", "Back", v -> back()));
         bar.addView(a.title(atRoot ? "Arckad-D" : searching ? "Search" : cwd.getName()), MainActivity.grow());
+        if (!searching) bar.addView(Ui.icon(a, "＋", "New folder or file", v -> newMenu()));
         bar.addView(Ui.icon(a, searching ? "✕" : "🔍", "Search", v -> toggleSearch()));
         bar.addView(Ui.icon(a, grid() ? "☰" : "▦", "List or grid", v -> {
             prefs.edit().putBoolean("grid", !grid()).apply();
@@ -411,6 +412,8 @@ final class FilesScreen implements MainActivity.Screen {
             labels.add("Rename");
             acts.add(() -> rename(sel.get(0)));
         }
+        labels.add("Duplicate");
+        acts.add(() -> duplicate(sel));
         labels.add("Compress to ZIP");
         acts.add(() -> compress(sel));
         if (allZip) {
@@ -438,6 +441,7 @@ final class FilesScreen implements MainActivity.Screen {
                 (sort.equals("size") ? "✓ " : "") + "Sort by size (largest first)",
                 hidden ? "Hide hidden files" : "Show hidden files",
                 "New folder",
+                "New empty file",
                 "Received files",
                 "Theme: " + prefs.getString("theme", "system") + " (tap to change)",
                 "Check for updates",
@@ -452,9 +456,10 @@ final class FilesScreen implements MainActivity.Screen {
                     reload();
                     break;
                 case 4: newFolder(); break;
-                case 5: open(Fs.received(), true); break;
-                case 6: a.cycleTheme(); break;
-                case 7: Updater.check(a, true); break;
+                case 5: newFile(); break;
+                case 6: open(Fs.received(), true); break;
+                case 7: a.cycleTheme(); break;
+                case 8: Updater.check(a, true); break;
                 default:
                     Ui.info(a, "Arckad-D " + BuildInfo.VERSION, "A file manager that remembers what you worked on.\n\n"
                             + "Send and receive files with Arckad-D on Linux, Windows and other phones on the same Wi-Fi.");
@@ -465,6 +470,55 @@ final class FilesScreen implements MainActivity.Screen {
     private void setSort(String by) {
         prefs.edit().putString("sort", by).apply();
         reload();
+    }
+
+    private void newMenu() {
+        Ui.dialog(a).setTitle("Create in " + (cwd.equals(Fs.root()) ? "Internal storage" : cwd.getName()))
+                .setItems(new String[]{"📁  New folder", "📄  New empty file"}, (d, w) -> {
+                    if (w == 0) newFolder();
+                    else newFile();
+                }).show();
+    }
+
+    private void newFile() {
+        Ui.askText(a, "New empty file", "New file.txt", "Create", name -> {
+            if (name.isEmpty() || name.contains("/")) return;
+            File f = Fs.unique(new File(cwd, name));
+            try {
+                if (!f.createNewFile()) Ui.toast(a, "Couldn't create it here");
+                else Android.mediaScan(a, f);
+            } catch (java.io.IOException e) {
+                Ui.toast(a, "Couldn't create it: " + e.getMessage());
+            }
+            reload();
+        });
+    }
+
+    private void duplicate(final List<File> files) {
+        clearSelection();
+        io.execute(() -> {
+            int n = 0;
+            for (File src : files) {
+                String name = src.getName(), stem = name, ext = "";
+                int dot = name.lastIndexOf('.');
+                if (dot > 0 && !src.isDirectory()) {
+                    stem = name.substring(0, dot);
+                    ext = name.substring(dot);
+                }
+                File t = Fs.unique(new File(src.getParentFile(), stem + " (copy)" + ext));
+                try {
+                    Fs.copy(src, t);
+                    Android.mediaScan(a, t);
+                    n++;
+                } catch (Exception ignored) {
+                }
+            }
+            final int done = n;
+            main.post(() -> {
+                reload();
+                Ui.toast(a, "Duplicated " + done + (done == 1 ? " item" : " items"));
+            });
+        });
     }
 
     private void newFolder() {
