@@ -81,6 +81,7 @@ final class ShareScreens {
         private final EditText ipBox;
         private final TextView ipStatus, ipAdd;
         private final LinearLayout savedBox;
+        private final TextView myAddr;
         private boolean sending, syncing;
 
         Send(MainActivity a) {
@@ -125,6 +126,10 @@ final class ShareScreens {
             savedBox = new LinearLayout(a);
             savedBox.setOrientation(LinearLayout.VERTICAL);
             devices.addView(savedBox);
+            myAddr = Ui.text(a, "", 12, Ui.DIM, false);
+            myAddr.setTextIsSelectable(true);
+            myAddr.setPadding(0, Ui.dp(a, 8), 0, 0);
+            devices.addView(myAddr);
             box.addView(devices, Ui.matchWrap(a, 12));
             loadSaved();
 
@@ -392,6 +397,9 @@ final class ShareScreens {
         }
 
         void tick() {
+            List<String> ips = Net.lanAddresses();
+            myAddr.setText(ips.get(0).startsWith("127.") ? "This phone isn't connected to Wi-Fi"
+                    : "This phone is " + android.text.TextUtils.join(", ", ips));
             Net.Link link = MainActivity.link;
             if (link.active()) {
                 linkState.setText("On · " + mmss(link.remaining()) + " left");
@@ -417,6 +425,8 @@ final class ShareScreens {
         private final Switch toggle;
         private final Spinner mins;
         private final TextView state, log;
+        private TextView addr;
+        private long addrAt;
         private boolean syncing;
         private final StringBuilder lines = new StringBuilder();
 
@@ -478,6 +488,15 @@ final class ShareScreens {
                 }
             });
             card2.addView(name);
+            addr = Ui.text(a, "", 14, Ui.TEXT, false);
+            addr.setTextIsSelectable(true);
+            addr.setPadding(0, Ui.dp(a, 10), 0, Ui.dp(a, 4));
+            card2.addView(addr);
+            card2.addView(Ui.row(a, Ui.button(a, "Copy IP address", false, v -> {
+                ClipboardManager cm = (ClipboardManager) a.getSystemService(Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(ClipData.newPlainText("IP address", Net.lanAddresses().get(0)));
+                Ui.toast(a, "IP address copied");
+            })), Ui.matchWrap(a, 4));
             card2.addView(Ui.button(a, "Open received files", false, v -> {
                 a.showTab("files");
                 a.files.open(Fs.received(), true);
@@ -552,7 +571,24 @@ final class ShareScreens {
                     + Fs.size(in.received) + ")");
         }
 
+        void refreshAddress() {
+            addrAt = System.currentTimeMillis();
+            List<String> ips = Net.lanAddresses();
+            if (ips.isEmpty() || ips.get(0).startsWith("127.")) {
+                addr.setText("This phone's IP address: not connected to Wi-Fi");
+                return;
+            }
+            String extra = ips.size() > 1 ? "\n(also " + android.text.TextUtils.join(", ", ips.subList(1, ips.size())) + ")" : "";
+            android.text.SpannableString s = new android.text.SpannableString("This phone's IP address:  " + ips.get(0) + extra
+                    + "\nOn another network or VLAN, the sender types this under Send.");
+            int st = "This phone's IP address:  ".length();
+            s.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), st, st + ips.get(0).length(), 0);
+            s.setSpan(new android.text.style.RelativeSizeSpan(1.25f), st, st + ips.get(0).length(), 0);
+            addr.setText(s);
+        }
+
         void tick() {
+            if (System.currentTimeMillis() - addrAt > 10_000) refreshAddress();      // can change (Wi-Fi ↔ mobile data)
             Net.Nearby nb = MainActivity.nearby;
             if (nb.visible()) {
                 if (!nb.busyReceiving()) {

@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.10.0"
+APP_VERSION = "3.10.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -4098,6 +4098,14 @@ class ShareWindow(Gtk.Window):
         open_recv.connect("clicked", lambda *_: self.win.open_path(str(received_dir())))
         name_row.add(open_recv)
         box.add(name_row)
+        addr_row = Gtk.Box(spacing=6)
+        self.addr_label = Gtk.Label(xalign=0, hexpand=True, wrap=True, selectable=True)
+        addr_row.pack_start(self.addr_label, True, True, 0)
+        copy_addr = Gtk.Button(label="Copy")
+        copy_addr.set_tooltip_text("Copy this address, to paste into a chat or read out")
+        copy_addr.connect("clicked", lambda *_: self.win.copy_text(lan_addresses()[0]))
+        addr_row.add(copy_addr)
+        box.add(addr_row)
         box = outer
 
         # ---- activity (shared by both tabs)
@@ -4164,6 +4172,9 @@ class ShareWindow(Gtk.Window):
         self.saved_box = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=4,
                                      column_spacing=6, row_spacing=6)
         page.add(self.saved_box)
+        self.my_addr = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.my_addr.get_style_context().add_class("dim-label")
+        page.add(self.my_addr)
         self.refresh_saved()
         return page
 
@@ -4344,7 +4355,20 @@ class ShareWindow(Gtk.Window):
             self.store.append([icon_for(p, is_dir), os.path.basename(p.rstrip("/\\")), size, p])
         self.update_state()
 
+    def refresh_addresses(self):
+        ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
+        if not ips:
+            self.addr_label.set_markup("<b>This computer's IP address:</b> not connected to a network")
+            self.my_addr.set_text("")
+            return
+        extra = f"  <small>(also {esc(', '.join(ips[1:]))})</small>" if len(ips) > 1 else ""
+        self.addr_label.set_markup(f"<b>This computer's IP address:</b>  <big><b>{esc(ips[0])}</b></big>{extra}\n"
+                                   "<small>On another network or VLAN, the sender types this under Send.</small>")
+        self.my_addr.set_markup(f"<small>This computer is <b>{esc(ips[0])}</b>"
+                                + (f" (also {esc(', '.join(ips[1:]))})" if len(ips) > 1 else "") + "</small>")
+
     def on_mapped(self):
+        self.refresh_addresses()
         try:
             self.nearby.start_scan()
         except OSError as ex:
@@ -4438,6 +4462,9 @@ class ShareWindow(Gtk.Window):
             self.link_box.set_no_show_all(True)
 
         visible = self.nearby.visible()
+        if time.time() - getattr(self, "_addr_at", 0) > 10:      # the address can change (Wi-Fi ↔ cable)
+            self._addr_at = time.time()
+            self.refresh_addresses()
         self._sync_switch(self.vis_switch, self.on_vis_switch, visible)
         if visible:
             left = self.nearby.remaining()
