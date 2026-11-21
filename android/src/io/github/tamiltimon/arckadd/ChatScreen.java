@@ -951,12 +951,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 labels.add("Safety code");
                 acts.add(() -> Ui.info(a, "Safety code with " + title(gid), e.safetyCode(g.optString("peer"))
                         + "\n\nOpen this on your friend's device too. If both show the same numbers, your chat is private."));
-                labels.add("Remove friend");
-                acts.add(() -> Ui.confirm(a, "Remove " + title(gid) + "?", "You can't message each other until one of you "
-                        + "sends a new friend request. Your history stays here.", "Remove", () -> {
-                    e.removeFriend(g.optString("peer"));
-                    show("list", null);
-                }));
+                labels.add("Remove friend completely");
+                acts.add(() -> removeFriendDialog(g.optString("peer"), title(gid)));
             }
         } else {
             boolean owner = e.isOwner(gid);
@@ -988,6 +984,24 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         labels.add("Open received files");
         acts.add(() -> a.openFolder(e.filesDir(gid)));
         Ui.dialog(a).setItems(labels.toArray(new String[0]), (d, w) -> acts.get(w).run()).show();
+    }
+
+    private void removeFriendDialog(String pid, String name) {
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
+        box.addView(Ui.text(a, name + " is removed from your friends, and your chat with them, its history and their photo "
+                + "are deleted from this phone and your linked devices. To talk again, one of you sends a new friend request.",
+                14, Ui.TEXT, false));
+        android.widget.CheckBox files = new android.widget.CheckBox(a);
+        files.setText("Also delete the files " + name + " sent me");
+        files.setTextColor(Ui.TEXT);
+        box.addView(files);
+        Ui.dialog(a).setTitle("Remove " + name + " completely?").setView(box).setPositiveButton("Remove", (d, w) -> {
+            e.removeFriend(pid, files.isChecked());
+            show("list", null);
+            Ui.toast(a, name + " was removed");
+        }).setNegativeButton("Cancel", null).show();
     }
 
     private void members() {
@@ -1445,10 +1459,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
 
     @Override
     public void askLink(ChatEngine.Ask ev) {
-        Ui.dialog(a).setTitle("Link " + ev.name + " to your account?")
+        Ui.dialog(a).setTitle("Add " + ev.name + " to your account “" + e.myName() + "”?")
                 .setMessage(ev.name + " (" + ev.os + ") typed your link code. It gets your profile, friends, groups and chat "
                         + "history, and can send messages as you. Only link your own devices.")
-                .setPositiveButton("Link", (d, w) -> {
+                .setPositiveButton("Add", (d, w) -> {
                     ev.accepted = true;
                     ev.done.countDown();
                 })
@@ -1487,8 +1501,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         }
         if (tw.length() == 0) box.addView(Ui.text(a, "No linked devices yet.", 14, Ui.DIM, false));
         d[0] = Ui.dialog(a).setTitle("Linked devices").setView(box)
-                .setPositiveButton("Link a new device", (x, w) -> showLinkCode())
-                .setNeutralButton("Link THIS phone", (x, w) -> linkThisPhone())
+                .setPositiveButton("💻 Join my PC's account", (x, w) -> linkThisPhone())
+                .setNeutralButton("Add my PC to this phone", (x, w) -> showLinkCode())
                 .setNegativeButton("Close", null).show();
     }
 
@@ -1516,8 +1530,9 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         TextView t = Ui.text(a, code.substring(0, 3) + " " + code.substring(3), 34, Ui.TEXT, true);
         t.setGravity(Gravity.CENTER);
         List<String> ips = Net.lanAddresses();
-        TextView h = Ui.text(a, "On your PC: Chat → ⋯ → Linked devices → Link THIS device, and type this code. Then "
-                + "confirm here. From another network it also needs this phone's address: " + (ips.isEmpty() ? "?" : ips.get(0))
+        TextView h = Ui.text(a, "Code to add your PC to “" + e.myName() + "” (this phone's profile stays). On the PC: Chat → ⋯ → "
+                + "Linked devices → Move this PC into another device's account, type this code, then confirm here. "
+                + "From another network it also needs this phone's address: " + (ips.isEmpty() ? "?" : ips.get(0))
                 + "\nValid 10 minutes.", 13, Ui.DIM, false);
         h.setGravity(Gravity.CENTER);
         LinearLayout box = new LinearLayout(a);
@@ -1525,7 +1540,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         box.setPadding(Ui.dp(a, 16), Ui.dp(a, 12), Ui.dp(a, 16), 0);
         box.addView(t);
         box.addView(h);
-        Ui.dialog(a).setTitle("Link code").setView(box).setPositiveButton("Done", null)
+        Ui.dialog(a).setTitle("Add my PC to this phone's account").setView(box).setPositiveButton("Done", null)
                 .setNegativeButton("Stop", (x, w) -> e.link.stopCode()).show();
     }
 
@@ -1533,9 +1548,9 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         LinearLayout box = new LinearLayout(a);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
-        box.addView(Ui.text(a, "This phone will JOIN the account on your PC. On the PC: Chat → ⋯ → Linked devices → Link a "
-                + "new device, then type its code here. To keep THIS phone's profile instead, show the code here and type "
-                + "it on the PC.", 13, Ui.DIM, false));
+        box.addView(Ui.text(a, "This phone will use your PC's account. On the PC: Chat → ⋯ → Linked devices → 📱 Add my "
+                + "phone to this PC's account, then type the code it shows here. (To keep THIS phone's profile instead, "
+                + "use “Add my PC to this phone”.)", 13, Ui.DIM, false));
         Switch replace = new Switch(a);
         if (e.link.hasData()) {
             int[] s = e.link.summary();
@@ -1554,7 +1569,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         ip.setHint("PC's IP (only if on another network)");
         box.addView(code);
         box.addView(ip);
-        Ui.dialog(a).setTitle("Link this phone to my account").setView(box).setPositiveButton("Link", (x, w) -> {
+        Ui.dialog(a).setTitle("Join my PC's account").setView(box).setPositiveButton("Join", (x, w) -> {
             String c = code.getText().toString().replaceAll("[^0-9]", ""), host = ip.getText().toString().trim();
             if (!replace.isChecked()) {
                 Ui.toast(a, "Tick “Replace …” to continue, or link the other way round to keep this profile");

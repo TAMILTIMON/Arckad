@@ -94,6 +94,7 @@ final class ChatEngine {
     private String tagStamp = "";
     int port;
     String inst = "phone";                        // this install (linked devices tell each other apart by it)
+    volatile boolean linking;                     // joining an account: run the service even without a profile
     final ChatLink link;
 
     ChatEngine(File dir, File downloads, String deviceId, String deviceName, String osName, Ui ui) {
@@ -350,7 +351,7 @@ final class ChatEngine {
     boolean active() {
         for (JSONObject g : groups.values()) if (!g.optBoolean("removed")) return true;
         return joinActive() || profile.optBoolean("setup") || contacts.has("link") || (link != null && link.codeActive())
-                || contacts.optJSONObject("outgoing").length() > 0 || contacts.optJSONObject("friends").length() > 0
+                || linking || contacts.optJSONObject("outgoing").length() > 0 || contacts.optJSONObject("friends").length() > 0
                 || fcodeActive();
     }
 
@@ -1000,6 +1001,11 @@ final class ChatEngine {
     }
 
     void removeFriend(String pid) {
+        removeFriend(pid, false);
+    }
+
+    /** Tell them, then remove them completely here and on linked devices (deleteFiles: their files too). */
+    void removeFriend(String pid, boolean deleteFiles) {
         String gid = directGid(pid);
         bg(() -> {
             JSONObject g = groups.get(gid);
@@ -1009,8 +1015,46 @@ final class ChatEngine {
                 } catch (Exception ignored) {
                 }
             }
-            forgetFriend(pid);
+            purgeFriend(pid, deleteFiles, false);
         });
+    }
+
+    void purgeFriend(String pid, boolean deleteFiles, boolean fromTwin) {
+        String gid = directGid(pid);
+        JSONObject g = groups.get(gid);
+        if (deleteFiles && g != null && g.optJSONObject("files") != null) {
+            for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
+                JSONObject f = m.optJSONObject("file");
+                if (f != null && pid.equals(m.optString("from"))) {
+                    String p = g.optJSONObject("files").optString(f.optString("id"));
+                    if (!p.isEmpty()) new File(p).delete();
+                }
+            }
+            File folder = filesDir(gid);
+            String[] left = folder.list();
+            if (left != null && left.length == 0) folder.delete();
+        }
+        synchronized (lock) {
+            for (String k : new String[]{"friends", "incoming", "outgoing"}) contacts.optJSONObject(k).remove(pid);
+            groups.remove(gid);
+            msgs.remove(gid);
+            ids.remove(gid);
+            unread.remove(gid);
+            new File(dir, gid + ".jsonl").delete();
+            new File(new File(dir, "avatars"), pid + ".jpg").delete();
+            people.remove(pid);
+            online.remove(pid);
+            save();
+        }
+        if (!fromTwin) {
+            link.tomb("friend", pid);
+            link.tomb("purge", pid);
+            if (deleteFiles) link.tomb("purgefiles", pid);
+        }
+        saveContacts();
+        tagStamp = "";
+        ui.people();
+        ui.changed(null);
     }
 
     void forgetFriend(String pid) {
@@ -1938,6 +1982,10 @@ final class ChatEngine {
 
     private void cameOnline(String did) {
         deliverGroupAdds(did);
+        for (Map.Entry<String, List<JSONObject>> en : new ArrayList<>(msgs.entrySet()))      // missed attachments
+            for (JSONObject m : new ArrayList<>(en.getValue()))
+                if (did.equals(m.optString("from")) && m.optJSONObject("file") != null && !m.has("deleted")
+                        && !downloading.contains(m.optJSONObject("file").optString("id"))) maybeDownload(en.getKey(), m);
         for (Map.Entry<String, JSONObject> e : new ArrayList<>(groups.entrySet())) {
             JSONObject g = e.getValue();
             if (g.optBoolean("removed") || g.optJSONObject("members") == null || !g.optJSONObject("members").has(did)) continue;

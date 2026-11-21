@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.23.1"
+APP_VERSION = "3.23.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -6437,7 +6437,18 @@ class Chat:
             self._try(lambda: self._request(gid, g["owner"], "POST", "/c/setpub", {"pub": self.my_pub()},
                                             pair_key=bytes.fromhex(g["owner_key"]), timeout=8))
 
+    def _retry_downloads(self, did):
+        """Attachments that couldn't be fetched earlier: try again now that the sender is here."""
+        for gid, lst in list(self.msgs.items()):
+            for m in list(lst):
+                f = m.get("file")
+                if f and m.get("from") == did and not m.get("deleted") and f["size"] <= CHAT_AUTO_DOWNLOAD \
+                        and f["id"] not in self.downloading and not self.local_file(gid, f["id"]) \
+                        and (m.get("from") != self.me):
+                    self.download(gid, m)
+
     def _came_online(self, did):
+        self._retry_downloads(did)
         if any(did in (g.get("pending_adds") or {}) for g in self.groups.values()):
             self.deliver_group_adds(only=did)
         for gid, g in list(self.groups.items()):
@@ -7671,15 +7682,65 @@ class Chat:
             self.save_contacts()
         return ok_msg
 
-    def remove_friend(self, pid):
-        """Tell them (if they're online), then forget the friendship here. The chat history stays, read-only."""
+    def remove_friend(self, pid, delete_files=False):
+        """Tell them (if they're online), then remove them completely: friendship, chat, photo, everything
+        about them here and on my linked devices. delete_files: also the files they sent me."""
         gid = self._direct_gid(pid)
 
         def work():
             if gid in self.groups and self.groups[gid].get("key"):
                 self._try(lambda: self._request(gid, pid, "POST", "/c/unfriend", {}, timeout=6))
-            GLib.idle_add(lambda: self._forget_friend(pid) or False)
+            GLib.idle_add(lambda: self.purge_friend(pid, delete_files) or False)
         threading.Thread(target=work, daemon=True).start()
+
+    def purge_friend(self, pid, delete_files=False, from_twin=False):
+        """Everything about this person goes: friendship, requests, the chat and its history, their photo,
+        and (if asked) the files they sent me. Linked devices do the same."""
+        gid = self._direct_gid(pid)
+        g = self.groups.get(gid) or {}
+        if delete_files:
+            for fid, path in list((g.get("files") or {}).items()):
+                m = next((x for x in self.msgs.get(gid, []) if (x.get("file") or {}).get("id") == fid), None)
+                if m and m.get("from") == pid:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+            try:
+                folder = self.files_dir(gid)
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+            except OSError:
+                pass
+        with self.lock:
+            for kind in ("friends", "incoming", "outgoing"):
+                self.contacts[kind].pop(pid, None)
+            self.groups.pop(gid, None)
+            self.msgs.pop(gid, None)
+            self.ids.pop(gid, None)
+            self.unread.pop(gid, None)
+            try:
+                (CHAT_DIR / f"{gid}.jsonl").unlink()
+            except OSError:
+                pass
+            try:
+                (CHAT_DIR / "avatars" / f"{pid}.jpg").unlink()
+            except OSError:
+                pass
+            self.people.pop(pid, None)
+            self.online.pop(pid, None)
+            self.receipts_out.pop(pid, None)
+            self.save()
+        if not from_twin:
+            self.linked.tomb("friend", pid)
+            self.linked.tomb("purge", pid)
+            if delete_files:
+                self.linked.tomb("purgefiles", pid)
+        self.save_contacts()
+        self._tag_cache = (None, {})
+        _avatar_cache.clear()
+        self.ui("on_people_changed")
+        self.ui("on_chat_changed", None)
 
     def _forget_friend(self, pid):
         self.contacts["friends"].pop(pid, None)
@@ -7917,9 +7978,7 @@ class Chat:
         try:
             sources = [msg["from"]] + [d for d in self.online_members(gid) if d != msg["from"]]
             for did in sources:
-                if not self.is_online(did):
-                    continue
-                key = self.key(gid)
+                key = self.key(gid)                       # try even if not seen "online" yet (new friend, other VLAN)
                 try:
                     c, r = self._request(gid, did, "GET", f"/c/file/{fid}", None, timeout=60, raw=True)
                 except Exception:
@@ -8999,8 +9058,11 @@ class LinkedDevices:
                     changed = True
         # groups (including friend chats)
         gt = tombs.get("group", {})
+        purged = tombs.get("purge", {})
         for gid, g in (st.get("groups") or {}).items():
             if gt.get(gid, 0) > g.get("created", 0) and not g.get("kind") == "direct":
+                continue
+            if g.get("kind") == "direct" and purged.get(g.get("peer"), 0) > g.get("created", 0):
                 continue
             mine = c.groups.get(gid)
             if mine is None:
@@ -9027,6 +9089,15 @@ class LinkedDevices:
             if gt.get(gid, 0) > c.groups[gid].get("created", 0) and c.groups[gid].get("kind") != "direct":
                 c.groups.pop(gid)
                 changed = True
+        # a friend removed completely on the other device goes completely here too
+        purge, pfiles = tombs.get("purge", {}), tombs.get("purgefiles", {})
+        for pid, ts in list(purge.items()):
+            f = c.contacts["friends"].get(pid)
+            gid = c._direct_gid(pid)
+            if (f is None or f.get("since", 0) < ts) and (gid in c.groups or f is not None):
+                if c.groups.get(gid, {}).get("created", 0) < ts:
+                    c.purge_friend(pid, delete_files=pfiles.get(pid, 0) >= ts, from_twin=True)
+                    changed = True
         if changed:
             c.save()
             c.save_contacts()
@@ -10171,6 +10242,8 @@ class ChatPanel(Gtk.Box):
             add("Mark as unread", lambda: self.chat.mark_unread(gid))
         add("Clear chat (delete all messages here)", lambda: self.win.confirm(
             f"Delete all messages in “{self.chat_title(gid)}” from this computer?") and self.chat.clear_chat(gid))
+        if g.get("kind") == "direct" and not g.get("removed"):
+            add("Remove friend completely…", lambda: self.remove_friend_dialog(g["peer"], self.chat_title(gid)))
         if g.get("kind") == "direct":
             add("Delete chat", lambda: self.win.confirm(
                 f"Delete the chat with {self.chat_title(gid)}?\n\nIts messages are removed from this computer and it "
@@ -10509,7 +10582,8 @@ class ChatPanel(Gtk.Box):
             none.get_style_context().add_class("dim-label")
             lb.add(none)
         box.add(lb)
-        b1 = Gtk.Button(label="＋ Link a new device (show a link code)")
+        b1 = Gtk.Button(label="📱 Add my phone to this PC's account")
+        b1.set_tooltip_text("This PC's profile stays; the phone (or another computer) gets it")
         b1.get_style_context().add_class("suggested-action")
         box.add(b1)
         code_lbl = Gtk.Label(selectable=True)
@@ -10521,11 +10595,13 @@ class ChatPanel(Gtk.Box):
             code = L.new_code()
             ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
             code_lbl.set_markup(f"<span size='xx-large' weight='bold' letter_spacing='6000'>{code[:3]} {code[3:]}</span>")
-            hint.set_markup(f"<small>On your phone or other computer: Chat → ⋯ → <b>Link this device to my account</b>, "
-                            f"type this code, then confirm here. From another network it also needs this computer's "
-                            f"address: <b>{esc(ips[0] if ips else '?')}</b> · valid 10 minutes</small>")
+            hint.set_markup(f"<small>Code to <b>add a device to “{esc(self.chat.my_name())}”</b>. On your phone: Chat → ⋮ "
+                            f"→ Linked devices → <b>Join my PC's account</b>, type this code, then confirm here. From "
+                            f"another network it also needs this computer's address: <b>{esc(ips[0] if ips else '?')}</b>"
+                            f" · valid 10 minutes</small>")
         b1.connect("clicked", show_code)
-        b2 = Gtk.Button(label="Link THIS device to my account on another device…")
+        b2 = Gtk.Button(label="💻 Move this PC into another device's account…")
+        b2.set_tooltip_text("This PC's profile is replaced by the other device's (a safety copy is kept)")
         b2.connect("clicked", lambda *_: (d.response(Gtk.ResponseType.CLOSE), self.link_this_device()))
         box.add(b2)
         d.show_all()
@@ -10571,16 +10647,16 @@ class ChatPanel(Gtk.Box):
         d.destroy()
 
     def link_this_device(self):
-        d = Gtk.Dialog(title="Link this device to my account", transient_for=self.get_toplevel(), modal=True)
+        d = Gtk.Dialog(title="Move this PC into another device's account", transient_for=self.get_toplevel(), modal=True)
         d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Link", Gtk.ResponseType.OK)
         box = d.get_content_area()
         box.set_spacing(8)
         box.set_border_width(14)
         warn = Gtk.Label(xalign=0, wrap=True, max_width_chars=54)
-        warn.set_markup("This device will <b>join the account shown on your other device</b>. On that device: ⋯ → "
-                        "<b>Linked devices</b> → <b>Link a new device</b>, then type the code it shows here.\n\n"
-                        "<small>To keep THIS device's profile instead, do it the other way round: show the code here "
-                        "(⋯ → Linked devices → Link a new device) and type it on the other device.</small>")
+        warn.set_markup("This PC will <b>use the account of your other device</b>. On that device: ⋮ → <b>Linked "
+                        "devices</b> → <b>Add my PC to this phone's account</b>, then type the code it shows here.\n\n"
+                        "<small>To keep THIS PC's profile instead (the usual case), close this and use <b>📱 Add my "
+                        "phone to this PC's account</b>.</small>")
         box.add(warn)
         L = self.chat.linked
         replace_ok = Gtk.CheckButton()
@@ -12018,6 +12094,24 @@ class ChatPanel(Gtk.Box):
             return False
         threading.Thread(target=work, daemon=True).start()
 
+    def remove_friend_dialog(self, pid, name):
+        d = Gtk.MessageDialog(transient_for=self.get_toplevel(), modal=True, message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.NONE, text=f"Remove {name} completely?")
+        d.format_secondary_text(f"{name} is removed from your friends, and your chat with them, its history and their "
+                                "photo are deleted from this device and your linked devices. To talk again, one of you "
+                                "sends a new friend request.")
+        files = Gtk.CheckButton(label=f"Also delete the files {name} sent me")
+        files.set_margin_start(12)
+        d.get_message_area().add(files)
+        files.show()
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Remove", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("destructive-action")
+        if d.run() == Gtk.ResponseType.OK:
+            self.chat.remove_friend(pid, files.get_active())
+            self.show_list()
+            self.win.flash_all(f"{name} was removed")
+        d.destroy()
+
     def show_safety_code(self):
         pid = self.chat.groups[self.gid]["peer"]
         name = self.chat_title(self.gid)
@@ -12037,11 +12131,7 @@ class ChatPanel(Gtk.Box):
     def leave(self):
         g = self.chat.groups[self.gid]
         if g.get("kind") == "direct":
-            name = self.chat_title(self.gid)
-            if self.win.confirm(f"Remove {name} from your friends?\n\nYou can't message each other until one of you "
-                                "sends a new friend request. Your chat history stays here."):
-                self.chat.remove_friend(g["peer"])
-                self.show_list()
+            self.remove_friend_dialog(g["peer"], self.chat_title(self.gid))
             return
         owner = self.chat.is_owner(self.gid)
         q = (f"Delete “{g['name']}” for everyone?\n\nAll members are removed. Each keeps their own copy of the history."
@@ -14683,7 +14773,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def ask_link(self, ev):
         d = Gtk.MessageDialog(transient_for=self if self.get_visible() else None, modal=False,
-                              message_type=Gtk.MessageType.QUESTION, text=f"Link {ev['name']} to your chat account?")
+                              message_type=Gtk.MessageType.QUESTION,
+                              text=f"Add {ev['name']} to your account “{self.chat.my_name()}”?")
         d.format_secondary_text(f"{ev['name']} ({ev['os']}) typed your link code. It will get your profile, friends, "
                                 "groups and chat history, and can send messages as you. Only link your own devices.")
         d.add_buttons("Cancel", Gtk.ResponseType.REJECT, "Link", Gtk.ResponseType.ACCEPT)

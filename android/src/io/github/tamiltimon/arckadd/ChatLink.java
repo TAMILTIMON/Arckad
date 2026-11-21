@@ -124,9 +124,9 @@ final class ChatLink {
 
     // ---------- linking
     String newCode() {
-        e.start();
         code = new Obj().putOpt("code", String.format(java.util.Locale.ROOT, "%06d", RNG.nextInt(1_000_000)))
                 .putOpt("until", now() + 600).putOpt("tries", 0).putOpt("pending", new JSONObject());
+        e.start();                                   // the code needs the service (also on a phone without a profile)
         return code.optString("code");
     }
 
@@ -208,6 +208,7 @@ final class ChatLink {
 
     /** Background thread on the NEW device. Returns null when linked (the engine then restarts), or why not. */
     String linkWithCode(String c, String host) {
+        e.linking = true;                            // run the service even on a phone with no chat profile yet
         e.start();
         String[] where = null;
         if (host != null && !host.isEmpty()) {
@@ -229,7 +230,10 @@ final class ChatLink {
                 if (where == null) sleep(200);
             }
         }
-        if (where == null) return "No device showing that link code was found. On another network, also type its IP address.";
+        if (where == null) {
+            e.linking = false;
+            return "No device showing that link code was found. On another network, also type its IP address.";
+        }
         try {
             BigInteger x = dhSecret(), pub = dhPublic(x);
             JSONObject r1 = post(where, "/t/start", new Obj().putOpt("inst", e.inst).putOpt("name", e.deviceName)
@@ -497,6 +501,7 @@ final class ChatLink {
             JSONObject g = gs.optJSONObject(gid);
             boolean direct = "direct".equals(g.optString("kind"));
             if (!direct && ts(tombs, "group", gid) > g.optDouble("created", 0)) continue;
+            if (direct && ts(tombs, "purge", g.optString("peer")) > g.optDouble("created", 0)) continue;
             JSONObject mine = e.groups.get(gid);
             if (mine == null) {
                 put(g, "files", new JSONObject());
@@ -536,6 +541,18 @@ final class ChatLink {
             JSONObject g = e.groups.get(gid);
             if (!"direct".equals(g.optString("kind")) && ts(tombs, "group", gid) > g.optDouble("created", 0)) {
                 e.groups.remove(gid);
+                changed = true;
+            }
+        }
+        JSONObject purge = tombs.optJSONObject("purge");
+        if (purge != null) for (String pid : list(purge.keys())) {
+            double when = purge.optDouble(pid);
+            JSONObject f = e.friends().optJSONObject(pid);
+            String dgid = e.directGid(pid);
+            JSONObject dg = e.groups.get(dgid);
+            if ((f == null || f.optDouble("since", 0) < when) && (dg != null || f != null)
+                    && (dg == null || dg.optDouble("created", 0) < when)) {
+                e.purgeFriend(pid, ts(tombs, "purgefiles", pid) >= when, true);
                 changed = true;
             }
         }
