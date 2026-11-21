@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.16.0"
+APP_VERSION = "3.17.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -6013,9 +6013,11 @@ class Chat:
     @staticmethod
     def _sig_payload(gid, m):
         f = m.get("file") or {}
-        return json.dumps([gid, m.get("id"), m.get("from"), int(round(float(m.get("ts", 0)) * 1000)), m.get("kind"),
-                           m.get("text", ""), [f.get("id"), f.get("name"), f.get("size")] if f else None,
-                           m.get("sticker")], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        parts = [gid, m.get("id"), m.get("from"), int(round(float(m.get("ts", 0)) * 1000)), m.get("kind"),
+                 m.get("text", ""), [f.get("id"), f.get("name"), f.get("size")] if f else None, m.get("sticker")]
+        if m.get("voice") or m.get("once"):
+            parts += [round(float(m.get("voice") or 0), 1), bool(m.get("once"))]
+        return json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     def _sign(self, gid, m):
         m["sig"] = rsa_sign(self.identity(), self._sig_payload(gid, m))
@@ -6520,6 +6522,10 @@ class Chat:
                 return None
             name = os.path.basename(str(f.get("name", "file")).replace("\\", "/"))[:200] or "file"
             out["file"] = {"id": f["id"][:40], "name": name, "size": max(0, f["size"])}
+        if m.get("voice"):
+            out["voice"] = round(float(m["voice"]), 1)
+        if m.get("once"):
+            out["once"] = True
         if kind == "sticker":
             out["sticker"] = str(m.get("sticker", ""))[:40]
             if out["sticker"] != "custom" and not sticker_svg(out["sticker"]):
@@ -6535,17 +6541,20 @@ class Chat:
         return out
 
     # ---------- sending
-    def send_text(self, gid, text):
+    def send_text(self, gid, text, once=False):
         text = text.strip()
         if not text or not self.can_post(gid):
             return
-        msg = self._sign(gid, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
-                               "kind": "text", "text": text[:8000]})
+        msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+               "kind": "text", "text": text[:8000]}
+        if once:
+            msg["once"] = True
+        msg = self._sign(gid, msg)
         self._append(gid, msg)
         self.ui("on_chat_changed", gid)
         self._deliver(gid, msg)
 
-    def send_files(self, gid, paths):
+    def send_files(self, gid, paths, voice=None, once=False):
         if not self.can_post(gid):
             return 0
         n = 0
@@ -6555,9 +6564,13 @@ class Chat:
                 continue
             fid = secrets.token_hex(8)
             g.setdefault("files", {})[fid] = p
-            msg = self._sign(gid, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(),
-                                   "ts": time.time(), "kind": "file", "text": "",
-                                   "file": {"id": fid, "name": os.path.basename(p), "size": os.path.getsize(p)}})
+            msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+                   "kind": "file", "text": "", "file": {"id": fid, "name": os.path.basename(p), "size": os.path.getsize(p)}}
+            if voice:
+                msg["voice"] = round(float(voice), 1)
+            if once:
+                msg["once"] = True
+            msg = self._sign(gid, msg)
             self._append(gid, msg)
             self._deliver(gid, msg)
             n += 1
@@ -6988,6 +7001,199 @@ class Chat:
             return {"ok": True, "proof": _hm(st["key"], "fcode-host", code).hex()}
         return {"ok": False, "reason": "unknown"}
 
+    # ---------- one-time messages
+    def _rewrite(self, gid):
+        with self.lock:
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = CHAT_DIR / f"{gid}.jsonl.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for m in self.msgs.get(gid, []):
+                    f.write(json.dumps(m, ensure_ascii=False) + "\n")
+            os.replace(tmp, CHAT_DIR / f"{gid}.jsonl")
+
+    def find_msg(self, gid, mid):
+        return next((m for m in self.msgs.get(gid, []) if m.get("id") == mid), None)
+
+    def consume_once(self, gid, mid):
+        """After a one-time message was viewed: delete its content here and tell the sender."""
+        m = self.find_msg(gid, mid)
+        if not m or m.get("from") == self.me or m.get("opened"):
+            return
+        f = m.get("file")
+        if f:
+            path = self.local_file(gid, f["id"])
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self.groups[gid].get("files", {}).pop(f["id"], None)
+            self.save()
+        m["text"], m["opened"] = "", True
+        self._rewrite(gid)
+        sender = m.get("from")
+        threading.Thread(target=lambda: self._try(lambda: self._request(gid, sender, "POST", "/c/viewed",
+                                                                         {"id": mid}, timeout=6)), daemon=True).start()
+        self.ui("on_chat_changed", gid)
+
+    def _viewed_by(self, gid, mid, did):
+        m = self.find_msg(gid, mid)
+        if not m or m.get("from") != self.me or not m.get("once"):
+            return
+        if did not in m.setdefault("opened_by", []):
+            m["opened_by"].append(did)
+        g = self.groups.get(gid) or {}
+        others = [d for d in g.get("members", {}) if d != self.me]
+        if m.get("file") and all(d in m["opened_by"] for d in others):
+            path = g.get("files", {}).pop(m["file"]["id"], None)       # nobody can download it any more
+            if path and str(path).startswith(str(CHAT_DIR)):            # only files Arckad-D made (voice notes)
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            self.save()
+        self._rewrite(gid)
+        self.ui("on_chat_changed", gid)
+
+    # ---------- intercom calls between friends
+    call = None
+
+    def _call_log(self, gid, text):
+        msg = {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+               "kind": "system", "text": text, "local": True}
+        if self._append(gid, msg):
+            self.ui("on_chat_changed", gid)
+
+    def _peer_address(self, pid):
+        o = self.online.get(pid) or self.people.get(pid) or self.contacts["friends"].get(pid) or {}
+        return o.get("ip"), o.get("port")
+
+    def start_call(self, pid):
+        """Caller side. Returns an error text, or None when the call started ringing."""
+        if self.call:
+            return "You're already in a call."
+        ok, why = audio_supported()
+        if not ok:
+            return why
+        gid = self._direct_gid(pid)
+        if gid not in self.groups or self.groups[gid].get("removed"):
+            return "You can only call friends."
+        cid = secrets.token_hex(8)
+        self.call = {"id": cid, "peer": pid, "gid": gid, "role": "caller", "state": "calling", "started": 0}
+        self.ui("on_call_changed")
+        threading.Thread(target=self._dial, args=(cid,), daemon=True).start()
+        return None
+
+    def _dial(self, cid):
+        c = self.call
+        gid, pid = c["gid"], c["peer"]
+        try:
+            r = self._request(gid, pid, "POST", "/c/call", {"call": cid}, timeout=45)
+        except PermissionError as ex:
+            r = {"ok": False, "reason": str(ex)}
+        except Exception:
+            r = {"ok": False, "reason": "unreachable"}
+        if self.call is not c or c.get("cancelled"):
+            return
+        if not r.get("ok"):
+            reason = r.get("reason", "")
+            text = {"declined": "📞 Call declined", "busy": "📞 Busy: they're in another call",
+                    "no answer": "📞 No answer", "unreachable": "📞 Couldn't reach them"}.get(reason, f"📞 Call failed ({reason})")
+            self._call_log(gid, text)
+            self.call = None
+            self.ui("on_call_changed", text)
+            return
+        ip, port = self._peer_address(pid)
+        key = bytes.fromhex(self.groups[gid]["key"])
+        try:
+            sock = socket.create_connection((ip, port), timeout=10)
+            path, ts = "/c/callaudio", int(time.time())
+            sig = _hm(key, "POST", path, ts, self.me, gid).hex()
+            sock.sendall((f"POST {path} HTTP/1.1\r\nHost: {ip}\r\nX-Chat-Group: {gid}\r\nX-Chat-From: {self.me}\r\n"
+                          f"X-Chat-Time: {ts}\r\nX-Chat-Sig: {sig}\r\nX-Call: {cid}\r\nContent-Length: 0\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 4096:
+                chunk = sock.recv(1)
+                if not chunk:
+                    raise OSError("closed")
+                head += chunk
+            if b" 200 " not in head.split(b"\r\n")[0]:
+                raise OSError("refused")
+        except OSError:
+            self._call_log(gid, "📞 Call couldn't connect")
+            self.call = None
+            self.ui("on_call_changed", "The call couldn't connect.")
+            return
+        self._run_stream(c, sock, _hm(key, "call", cid), "c2e", "e2c")
+
+    def _run_stream(self, c, sock, key, send_label, recv_label):
+        def ended(error):
+            if c.get("logged"):
+                return
+            c["logged"] = True
+            secs = int(time.time() - c["started"]) if c.get("started") else 0
+            arrow = "Outgoing" if c["role"] == "caller" else "Incoming"
+            self._call_log(c["gid"], f"📞 {arrow} call · {secs // 60}:{secs % 60:02d}" +
+                           (f" ({error})" if error else ""))
+            if self.call is c:
+                self.call = None
+            self.ui("on_call_changed", error)
+        stream = CallStream(sock, key, send_label, recv_label, ended)
+        c.update(state="active", started=time.time(), stream=stream)
+        self.ui("on_call_changed")
+        stream.run()
+
+    def _incoming_call(self, gid, did, cid):
+        if self.call:
+            return {"ok": False, "reason": "busy"}
+        ev = {"event": threading.Event(), "accepted": False, "cancelled": False, "gid": gid, "peer": did,
+              "name": self.contacts["friends"].get(did, {}).get("name", "A friend")}
+        self.call = c = {"id": cid, "peer": did, "gid": gid, "role": "callee", "state": "ringing", "ev": ev, "started": 0}
+        self.ui("ask_call", ev)
+        ev["event"].wait(35)
+        if not ev["accepted"]:
+            if self.call is c:
+                self.call = None
+            self._call_log(gid, "📞 Missed call" if not ev.get("declined") else "📞 You declined a call")
+            self.ui("on_call_changed")
+            return {"ok": False, "reason": "declined" if ev.get("declined") else "no answer"}
+        c["state"] = "connecting"
+        self.ui("on_call_changed")
+        return {"ok": True}
+
+    def _call_audio(self, h):
+        gid, did, auth = self._auth(h)
+        c = self.call
+        if not gid or auth[1] or not c or c.get("state") != "connecting" or c["peer"] != did \
+                or h.headers.get("X-Call") != c["id"]:
+            return h._plain(403, {"ok": False})
+        h.close_connection = True
+        h.send_response(200)
+        h.end_headers()
+        h.wfile.flush()
+        self._run_stream(c, h.connection, _hm(auth[0], "call", c["id"]), "e2c", "c2e")
+
+    def hang_up(self):
+        c = self.call
+        if not c:
+            return
+        if c.get("stream"):
+            c["stream"].hang_up()
+            return
+        c["cancelled"] = True
+        self.call = None
+        if c["role"] == "caller":
+            self._call_log(c["gid"], "📞 Call cancelled")
+            threading.Thread(target=lambda: self._try(lambda: self._request(c["gid"], c["peer"], "POST", "/c/callcancel",
+                                                                             {"call": c["id"]}, timeout=5)),
+                             daemon=True).start()
+        self.ui("on_call_changed")
+
+    def answer(self, ev, accept):
+        if not ev["event"].is_set():
+            ev["accepted"], ev["declined"] = accept, not accept
+            ev["event"].set()
+
     # ---------- chat lock: a 4-digit PIN in front of the chat (on this computer)
     def has_pin(self):
         return bool(self.contacts.get("pin"))
@@ -7286,7 +7492,7 @@ class Chat:
                     r.read()
                     c.close()
                     continue
-                folder = self.files_dir(gid)
+                folder = CHAT_DIR / "once" if msg.get("once") else self.files_dir(gid)
                 folder.mkdir(parents=True, exist_ok=True)
                 dest = unique_target(folder / msg["file"]["name"])
                 tmp = dest.with_name(dest.name + ".part")
@@ -7350,6 +7556,8 @@ class Chat:
         return gid, did, (key, pair)
 
     def handle_post(self, h, path):
+        if path == "/c/callaudio":
+            return self._call_audio(h)
         if path in ("/f/codestart", "/f/codeconfirm"):
             r = self._code_post(path, json.loads(h._body(200_000) or b"{}"), h.client_address[0])
             return h._plain(200 if r.get("ok") else 403, r)
@@ -7389,8 +7597,10 @@ class Chat:
             known = set(req.get("ids") or [])
             cutoff = time.time() - CHAT_HISTORY_DAYS * 86400
             with self.lock:
-                out = [{k: v for k, v in m.items() if k != "local"} for m in self.msgs.get(gid, [])
-                       if m["id"] not in known and m.get("ts", 0) > cutoff and not m.get("local")]
+                out = [{k: v for k, v in m.items() if k not in ("local", "opened_by")} for m in self.msgs.get(gid, [])
+                       if m["id"] not in known and m.get("ts", 0) > cutoff and not m.get("local")
+                       and not m.get("opened")
+                       and not (m.get("once") and (m.get("from") != self.me or did in m.get("opened_by", [])))]
             return reply({"ok": True, "msgs": out[-2000:]})
         if path == "/c/meta" and pair and did == g.get("owner"):
             self._apply_meta(gid, req)
@@ -7399,6 +7609,17 @@ class Chat:
             if did not in g["members"]:
                 return reply({"id": gid, "removed": True})
             return reply(self._meta_for_members(g))
+        if path == "/c/viewed" and not pair:
+            self._viewed_by(gid, str(req.get("id", "")), did)
+            return reply({"ok": True})
+        if path == "/c/call" and not pair and g.get("kind") == "direct" and did == g.get("peer"):
+            return reply(self._incoming_call(gid, did, str(req.get("call", ""))[:20]))
+        if path == "/c/callcancel" and not pair and self.call and self.call.get("id") == req.get("call"):
+            ev = self.call.get("ev")
+            if ev and not ev["event"].is_set():
+                ev["cancelled"] = True
+                ev["event"].set()
+            return reply({"ok": True})
         if path == "/c/unfriend" and not pair and g.get("kind") == "direct" and did == g.get("peer"):
             h._raw(200, seal(key, b'{"ok": true}'))
             self._forget_friend(did)
@@ -7458,6 +7679,389 @@ class Chat:
         h.wfile.write(mac.digest())
 
 
+# ---------------------------------------------------------------- Audio: intercom calls and voice messages
+# 16 kHz mono 16-bit sound in 20 ms frames. Linux: the system's sound tools (parec/pacat, or PipeWire's
+# pw-record/pw-play). Windows: the built-in waveIn/waveOut API through ctypes (nothing to install).
+import struct
+
+AUDIO_RATE = 16000
+AUDIO_FRAME = 640                    # bytes = 20 ms
+
+
+def _linux_audio_cmds():
+    if shutil.which("parec") and shutil.which("pacat"):
+        fmt = ["--raw", "--format=s16le", f"--rate={AUDIO_RATE}", "--channels=1"]
+        return (["parec"] + fmt + ["--latency-msec=40"], ["pacat", "--playback"] + fmt + ["--latency-msec=80"])
+    if shutil.which("pw-record") and shutil.which("pw-play"):
+        fmt = ["--rate", str(AUDIO_RATE), "--channels", "1", "--format", "s16"]
+        return (["pw-record"] + fmt + ["-"], ["pw-play"] + fmt + ["-"])
+    return None
+
+
+def audio_supported():
+    """(True, "") or (False, why)."""
+    if IS_WIN:
+        return True, ""
+    if _linux_audio_cmds():
+        return True, ""
+    return False, "Calls and voice messages need the system sound tools. Install them with:\n  sudo apt install pulseaudio-utils"
+
+
+class _ProcCapture:
+    def __init__(self, cmd):
+        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
+    def read(self):
+        buf = b""
+        while len(buf) < AUDIO_FRAME:
+            chunk = self.p.stdout.read(AUDIO_FRAME - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def close(self):
+        try:
+            self.p.kill()
+        except OSError:
+            pass
+
+
+class _ProcPlayback:
+    def __init__(self, cmd):
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def write(self, data):
+        try:
+            self.p.stdin.write(data)
+            self.p.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.p.kill()
+        except OSError:
+            pass
+
+
+if IS_WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    class _WAVEFORMATEX(ctypes.Structure):
+        _pack_ = 1
+        _fields_ = [("wFormatTag", wintypes.WORD), ("nChannels", wintypes.WORD), ("nSamplesPerSec", wintypes.DWORD),
+                    ("nAvgBytesPerSec", wintypes.DWORD), ("nBlockAlign", wintypes.WORD),
+                    ("wBitsPerSample", wintypes.WORD), ("cbSize", wintypes.WORD)]
+
+    class _WAVEHDR(ctypes.Structure):
+        pass
+    _WAVEHDR._fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", wintypes.DWORD),
+                         ("dwBytesRecorded", wintypes.DWORD), ("dwUser", ctypes.c_size_t),
+                         ("dwFlags", wintypes.DWORD), ("dwLoops", wintypes.DWORD),
+                         ("lpNext", ctypes.POINTER(_WAVEHDR)), ("reserved", ctypes.c_size_t)]
+    _WHDR_DONE, _WAVE_MAPPER = 0x1, 0xFFFFFFFF
+
+    def _wave_format():
+        return _WAVEFORMATEX(1, 1, AUDIO_RATE, AUDIO_RATE * 2, 2, 16, 0)
+
+    class _WinCapture:
+        """Microphone through waveIn: a ring of buffers that Windows fills; we poll for finished ones."""
+
+        def __init__(self, n=8):
+            self.w = ctypes.windll.winmm
+            self.h = ctypes.c_void_p()
+            fmt = _wave_format()
+            if self.w.waveInOpen(ctypes.byref(self.h), _WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0) != 0:
+                raise OSError("no microphone available")
+            self.bufs = [ctypes.create_string_buffer(AUDIO_FRAME) for _ in range(n)]
+            self.hdrs = [_WAVEHDR() for _ in range(n)]
+            for b, hd in zip(self.bufs, self.hdrs):
+                hd.lpData, hd.dwBufferLength = ctypes.cast(b, ctypes.c_void_p), AUDIO_FRAME
+                self.w.waveInPrepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+                self.w.waveInAddBuffer(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            self.i = 0
+            self.closed = False
+            self.w.waveInStart(self.h)
+
+        def read(self):
+            hd = self.hdrs[self.i]
+            while not (hd.dwFlags & _WHDR_DONE):
+                if self.closed:
+                    return None
+                time.sleep(0.003)
+            data = ctypes.string_at(self.bufs[self.i], hd.dwBytesRecorded)
+            hd.dwFlags &= ~_WHDR_DONE
+            self.w.waveInAddBuffer(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            self.i = (self.i + 1) % len(self.hdrs)
+            return data.ljust(AUDIO_FRAME, b"\0")
+
+        def close(self):
+            if self.closed:
+                return
+            self.closed = True
+            self.w.waveInReset(self.h)
+            for hd in self.hdrs:
+                self.w.waveInUnprepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            self.w.waveInClose(self.h)
+
+    class _WinPlayback:
+        """Speaker through waveOut: up to 12 queued frames (240 ms)."""
+
+        def __init__(self, n=12):
+            self.w = ctypes.windll.winmm
+            self.h = ctypes.c_void_p()
+            fmt = _wave_format()
+            if self.w.waveOutOpen(ctypes.byref(self.h), _WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0) != 0:
+                raise OSError("no speaker available")
+            self.bufs = [ctypes.create_string_buffer(AUDIO_FRAME) for _ in range(n)]
+            self.hdrs = [_WAVEHDR() for _ in range(n)]
+            self.busy = [False] * n
+            self.closed = False
+
+        def write(self, data):
+            for _ in range(200):
+                for i, hd in enumerate(self.hdrs):
+                    if self.busy[i] and (hd.dwFlags & _WHDR_DONE):
+                        self.w.waveOutUnprepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+                        self.busy[i] = False
+                    if not self.busy[i]:
+                        ctypes.memmove(self.bufs[i], data, min(len(data), AUDIO_FRAME))
+                        hd.lpData, hd.dwBufferLength, hd.dwFlags = ctypes.cast(self.bufs[i], ctypes.c_void_p), \
+                            min(len(data), AUDIO_FRAME), 0
+                        self.w.waveOutPrepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+                        self.w.waveOutWrite(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+                        self.busy[i] = True
+                        return
+                if self.closed:
+                    return
+                time.sleep(0.005)                       # all buffers queued: the speaker is behind; drop if it stays so
+
+        def close(self):
+            if self.closed:
+                return
+            self.closed = True
+            self.w.waveOutReset(self.h)
+            for i, hd in enumerate(self.hdrs):
+                if self.busy[i]:
+                    self.w.waveOutUnprepareHeader(self.h, ctypes.byref(hd), ctypes.sizeof(hd))
+            self.w.waveOutClose(self.h)
+
+
+def open_capture():
+    if IS_WIN:
+        return _WinCapture()
+    cmds = _linux_audio_cmds()
+    if not cmds:
+        raise OSError(audio_supported()[1])
+    return _ProcCapture(cmds[0])
+
+
+def open_playback():
+    if IS_WIN:
+        return _WinPlayback()
+    cmds = _linux_audio_cmds()
+    if not cmds:
+        raise OSError(audio_supported()[1])
+    return _ProcPlayback(cmds[1])
+
+
+def write_wav(path, pcm):
+    import wave as _wave
+    with _wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(AUDIO_RATE)
+        w.writeframes(pcm)
+
+
+def wav_seconds(path):
+    import wave as _wave
+    try:
+        with _wave.open(str(path)) as w:
+            return w.getnframes() / float(w.getframerate())
+    except (OSError, EOFError, _wave.Error):
+        return 0.0
+
+
+class Recorder:
+    """Records a voice message from the microphone (max 5 minutes)."""
+    LIMIT = 300
+
+    def __init__(self):
+        self.cap = open_capture()
+        self.frames, self.running = [], True
+        self.started = time.time()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while self.running and time.time() - self.started < self.LIMIT:
+            data = self.cap.read()
+            if data is None:
+                break
+            self.frames.append(data)
+        self.running = False
+
+    def seconds(self):
+        return len(self.frames) * 0.02
+
+    def stop(self):
+        self.running = False
+        self.cap.close()
+        return b"".join(self.frames)
+
+
+class WavPlayer:
+    """Plays a WAV file; stop() ends it early."""
+
+    def __init__(self, path, on_done=None):
+        self.path, self.on_done, self.proc = str(path), on_done, None
+        self.stopped = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            if IS_WIN:
+                import winsound
+                winsound.PlaySound(self.path, winsound.SND_FILENAME | winsound.SND_NODEFAULT)
+            else:
+                for cmd in (["pw-play", self.path], ["paplay", self.path], ["aplay", "-q", self.path]):
+                    if shutil.which(cmd[0]):
+                        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        self.proc.wait()
+                        break
+        except Exception:
+            pass
+        if self.on_done and not self.stopped:
+            GLib.idle_add(lambda: self.on_done() or False)
+
+    def stop(self):
+        self.stopped = True
+        if IS_WIN:
+            try:
+                import winsound
+                winsound.PlaySound(None, 0)
+            except Exception:
+                pass
+        elif self.proc:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+
+
+class CallStream:
+    """Both directions of a call's sound over one connection. Each 20 ms frame is encrypted and
+    tamper-checked with a key made for this call only."""
+
+    def __init__(self, sock, key, send_label, recv_label, on_end):
+        self.sock, self.key = sock, key
+        self.send_label, self.recv_label = send_label, recv_label
+        self.on_end = on_end
+        self.active, self.muted = True, False
+        self.rx_level = self.tx_level = 0.0
+        self.cap = self.play = None
+
+    @staticmethod
+    def _level(pcm):
+        if not pcm:
+            return 0.0
+        n = len(pcm) // 2
+        samples = struct.unpack(f"<{n}h", pcm[:n * 2])
+        return min(1.0, (sum(abs(s) for s in samples[::8]) / max(1, len(samples[::8]))) / 6000)
+
+    def run(self):
+        """Runs until either side hangs up (call from a background thread)."""
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock.settimeout(15)
+            self.cap, self.play = open_capture(), open_playback()
+        except OSError as ex:
+            self.end(str(ex))
+            return
+        threading.Thread(target=self._send_loop, daemon=True).start()
+        enc_key, mac_key = _hm(self.key, "enc", self.recv_label), _hm(self.key, "mac", self.recv_label)
+        try:
+            while self.active:
+                head = self._recv(2)
+                n = struct.unpack(">H", head)[0]
+                if n == 0:
+                    break                                 # the other side hung up
+                frame = self._recv(n)
+                seq, ct, tag = frame[:4], frame[4:-8], frame[-8:]
+                if not hmacmod.compare_digest(tag, _hm(mac_key, seq + ct)[:8]):
+                    continue
+                pcm = StreamCipher(enc_key, seq.rjust(16, b"\0")).apply(ct)
+                self.rx_level = self._level(pcm)
+                self.play.write(pcm)
+        except (OSError, struct.error, ValueError):
+            pass
+        self.end(None)
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        return buf
+
+    def _send_loop(self):
+        enc_key, mac_key = _hm(self.key, "enc", self.send_label), _hm(self.key, "mac", self.send_label)
+        seq = 0
+        try:
+            while self.active:
+                pcm = self.cap.read()
+                if pcm is None:
+                    break
+                if self.muted:
+                    pcm = b"\0" * len(pcm)
+                self.tx_level = self._level(pcm)
+                s = seq.to_bytes(4, "big")
+                ct = StreamCipher(enc_key, s.rjust(16, b"\0")).apply(pcm)
+                frame = s + ct + _hm(mac_key, s + ct)[:8]
+                self.sock.sendall(struct.pack(">H", len(frame)) + frame)
+                seq = (seq + 1) & 0xFFFFFFFF
+        except OSError:
+            pass
+        self.end(None)
+
+    def hang_up(self):
+        if self.active:
+            try:
+                self.sock.sendall(b"\0\0")
+            except OSError:
+                pass
+        self.end(None)
+
+    def end(self, error):
+        if not self.active:
+            return
+        self.active = False
+        for x in (self.cap, self.play):
+            if x:
+                try:
+                    x.close()
+                except Exception:
+                    pass
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        if self.on_end:
+            self.on_end(error)
+
+
 # ---------------------------------------------------------------- Chat panel (right pane and its own window)
 CHAT_CSS = b"""
 .chat-bubble { border-radius: 14px; padding: 6px 11px; }
@@ -7484,13 +8088,13 @@ def _load_chat_css():
 
 # ---------- Arckad-D's own notification sounds (synthesised here: no sound files, nothing to license)
 import wave
-import struct
 import math
 
 _SOUNDS = {
     # name: [(frequency Hz, start s, length s, loudness)]
     "message": [(1046.5, 0.00, 0.55, 0.55), (1318.5, 0.09, 0.55, 0.50), (1568.0, 0.18, 0.75, 0.45)],   # C6 E6 G6
     "request": [(784.0, 0.00, 0.70, 0.50), (1174.7, 0.16, 0.90, 0.45)],                                   # G5 D6
+    "ring": [(659.3, 0.00, 0.30, 0.5), (830.6, 0.13, 0.30, 0.5), (659.3, 0.42, 0.30, 0.5), (830.6, 0.55, 0.45, 0.5)],
 }
 _last_sound = [0.0]
 
@@ -7526,7 +8130,7 @@ def _sound_file(name):
 
 def play_sound(name):
     """Play one of Arckad-D's sounds without blocking (at most one every 1.5 s)."""
-    if time.time() - _last_sound[0] < 1.5:
+    if time.time() - _last_sound[0] < (1.0 if name == "ring" else 1.5):
         return
     _last_sound[0] = time.time()
 
@@ -7932,6 +8536,11 @@ class ChatPanel(Gtk.Box):
         tb.add(self.conv_title)
         tb.add(self.info)
         head.pack_start(tb, True, True, 0)
+        self.call_btn = Gtk.Button(label="📞")
+        self.call_btn.set_tooltip_text("Call (intercom)")
+        self.call_btn.connect("clicked", lambda *_: self.start_call())
+        self.call_btn.set_no_show_all(True)
+        head.add(self.call_btn)
         self.more_menu = Gtk.Menu()
         self.more_btn = Gtk.MenuButton(popup=self.more_menu)
         self.more_btn.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
@@ -7995,12 +8604,33 @@ class ChatPanel(Gtk.Box):
         self.send_btn.get_style_context().add_class("suggested-action")
         self.send_btn.set_tooltip_text("Send (Enter)")
         self.send_btn.connect("clicked", lambda *_: self.send())
-        for w in (self.emo_btn, self.sticker_btn, self.cam_btn, self.attach_btn):
+        self.mic_btn = Gtk.Button(label="🎤")
+        self.mic_btn.set_tooltip_text("Record a voice message")
+        self.mic_btn.connect("clicked", lambda *_: self.start_recording())
+        self.once_btn = Gtk.ToggleButton(label="1×")
+        self.once_btn.set_tooltip_text("One-time: the next message, photo, file or voice message can be viewed once, "
+                                       "then it's deleted")
+        self.once_btn.connect("toggled", lambda b: self.entry.set_placeholder_text(
+            "One-time message (deleted after viewing)…" if b.get_active() else "Message"))
+        for w in (self.emo_btn, self.sticker_btn, self.cam_btn, self.attach_btn, self.mic_btn, self.once_btn):
             comp.add(w)
         comp.pack_start(self.entry, True, True, 0)
         comp.add(self.send_btn)
         self.composer = comp
         conv.add(comp)
+        self.rec_bar = Gtk.Box(spacing=8)
+        self.rec_label = Gtk.Label(xalign=0, hexpand=True)
+        rc = Gtk.Button(label="Cancel")
+        rc.connect("clicked", lambda *_: self.stop_recording(send=False))
+        rs = Gtk.Button(label="Send ➤")
+        rs.get_style_context().add_class("suggested-action")
+        rs.connect("clicked", lambda *_: self.stop_recording(send=True))
+        self.rec_bar.pack_start(self.rec_label, True, True, 0)
+        self.rec_bar.add(rc)
+        self.rec_bar.add(rs)
+        self.rec_bar.set_no_show_all(True)
+        conv.add(self.rec_bar)
+        self.recorder, self.players = None, {}
         self.readonly = Gtk.Label(label="Only the group owner can post here.")
         self.readonly.get_style_context().add_class("dim-label")
         self.readonly.set_no_show_all(True)
@@ -8158,6 +8788,10 @@ class ChatPanel(Gtk.Box):
                 ("" if g.get("kind") == "direct" or last["kind"] == "system" else f"{last.get('name', '?')}: ")
             what = {"file": "📎 " + (last.get("file") or {}).get("name", "file"), "sticker": "🏷 Sticker"}.get(
                 last["kind"], last.get("text", ""))
+            if last.get("voice"):
+                what = "🎤 Voice message"
+            if last.get("once"):
+                what = "👁 One-time message"
             prev = (who + what).replace("\n", " ")
         else:
             prev = "Say hello 👋" if g.get("kind") == "direct" else "No messages yet"
@@ -8183,6 +8817,8 @@ class ChatPanel(Gtk.Box):
         if g.get("kind") == "direct":
             pid = g["peer"]
             f = self.chat.contacts["friends"].get(pid)
+            self.call_btn.set_visible(bool(f) and not g.get("removed"))
+            self.call_btn.set_sensitive(self.chat.call is None)
             if g.get("removed") or not f:
                 self.info.set_text("not friends any more")
             elif f.get("pending_accept"):
@@ -8190,6 +8826,7 @@ class ChatPanel(Gtk.Box):
             else:
                 self.info.set_text("online" if self.chat.person_online(pid) else "offline")
         else:
+            self.call_btn.set_visible(False)
             members = g.get("members", {})
             online = len(self.chat.online_members(self.gid))
             owner = members.get(g.get("owner"), {}).get("name", "?")
@@ -8510,7 +9147,11 @@ class ChatPanel(Gtk.Box):
             nm = Gtk.Label(xalign=0)
             nm.set_markup(f"<small><b>{esc(m.get('name', '?'))}</b></small>")
             bubble.add(nm)
-        if m["kind"] == "text":
+        if m.get("once"):
+            bubble.add(self._once_widget(m, mine))
+        elif m.get("voice") and m.get("file"):
+            bubble.add(self._voice_widget(m))
+        elif m["kind"] == "text":
             bubble.add(self._text_widget(m.get("text", "")))
         elif m["kind"] == "sticker":
             ctx.remove_class("chat-mine")
@@ -8536,6 +9177,169 @@ class ChatPanel(Gtk.Box):
             outer.set_margin_end(40)
         row.add(outer)
         return row
+
+    # ---------- voice messages
+    def _voice_widget(self, m):
+        box = Gtk.Box(spacing=8)
+        local = self.chat.local_file(self.gid, m["file"]["id"])
+        secs = int(round(m.get("voice") or 0))
+        dur = Gtk.Label(label=f"🎤 {secs // 60}:{secs % 60:02d}")
+        if local:
+            b = Gtk.ToggleButton(label="■" if m["id"] in self.players else "▶")
+            b.set_tooltip_text("Play")
+            b.connect("toggled", lambda btn: self.play_voice(m["id"], local, btn))
+            box.add(b)
+        elif m["file"]["id"] in self.chat.downloading:
+            box.add(Gtk.Label(label="Downloading…"))
+        else:
+            d = Gtk.Button(label="Download")
+            d.connect("clicked", lambda *_: self.chat.download(self.gid, m))
+            box.add(d)
+        box.add(dur)
+        return box
+
+    def play_voice(self, mid, path, btn, once=None):
+        for k, pl in list(self.players.items()):
+            pl.stop()
+            self.players.pop(k, None)
+        if not btn.get_active():
+            btn.set_label("▶")
+            return
+
+        def done():
+            self.players.pop(mid, None)
+            if btn.get_active():
+                btn.set_active(False)
+            btn.set_label("▶")
+        btn.set_label("■")
+        self.players[mid] = WavPlayer(path, on_done=done)
+
+    def start_recording(self):
+        ok, why = audio_supported()
+        if not ok:
+            self.win.error(why)
+            return
+        try:
+            self.recorder = Recorder()
+        except OSError as ex:
+            self.win.error(f"The microphone couldn't start: {ex}")
+            return
+        self.composer.hide()
+        self.rec_bar.set_no_show_all(False)
+        self.rec_bar.show_all()
+        GLib.timeout_add(200, self._tick_recording)
+
+    def _tick_recording(self):
+        r = self.recorder
+        if not r:
+            return False
+        s = int(r.seconds())
+        once = " · one-time" if self.once_btn.get_active() else ""
+        self.rec_label.set_markup(f"<span foreground='#e01b24'>●</span> Recording {s // 60}:{s % 60:02d}{once}"
+                                  + ("  <small>(5-minute limit reached)</small>" if not r.running else ""))
+        return True
+
+    def stop_recording(self, send):
+        r, self.recorder = self.recorder, None
+        self.rec_bar.hide()
+        self.composer.show()
+        if not r:
+            return
+        pcm = r.stop()
+        secs = len(pcm) / (AUDIO_RATE * 2)
+        if not send or secs < 0.5 or not self.gid:
+            return
+        folder = CHAT_DIR / "voice"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / time.strftime("Voice message %Y-%m-%d %H.%M.%S.wav")
+        write_wav(path, pcm)
+        self.chat.send_files(self.gid, [str(path)], voice=secs, once=self.once_btn.get_active())
+        self.once_btn.set_active(False)
+
+    # ---------- one-time messages
+    @staticmethod
+    def _once_kind(m):
+        if m.get("voice"):
+            return "voice message"
+        if m.get("file"):
+            return "photo" if ext_of(m["file"]["name"]) in IMAGE_EXTS else "file"
+        return "message"
+
+    def _once_widget(self, m, mine):
+        kind = self._once_kind(m)
+        if mine:
+            g = self.chat.groups.get(self.gid) or {}
+            others = [d for d in g.get("members", {}) if d != self.chat.me]
+            n = len(m.get("opened_by", []))
+            status = ("Opened" if n else "Not opened yet") if g.get("kind") == "direct" or len(others) <= 1 else \
+                f"Opened by {n} of {len(others)}"
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f"👁 One-time {kind}\n<small>{status}</small>")
+            return lbl
+        if m.get("opened"):
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f"<i>👁 One-time {kind} · opened</i>")
+            lbl.set_opacity(0.75)
+            return lbl
+        if m.get("file") and not self.chat.local_file(self.gid, m["file"]["id"]):
+            if m["file"]["id"] not in self.chat.downloading:
+                self.chat.download(self.gid, m)
+            return Gtk.Label(label=f"👁 One-time {kind} · downloading…")
+        b = Gtk.Button(label=f"👁 View once · {kind}")
+        b.set_tooltip_text("You can view it once: after closing, it's deleted from this computer")
+        b.connect("clicked", lambda *_: self.view_once(m))
+        return b
+
+    def view_once(self, m):
+        gid, kind = self.gid, self._once_kind(m)
+        d = Gtk.Dialog(title=f"One-time {kind} from {m.get('name', '?')}", transient_for=self.get_toplevel(),
+                       modal=True)
+        d.add_button("Close (delete)", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        player = None
+        path = self.chat.local_file(gid, m["file"]["id"]) if m.get("file") else None
+        temp = None
+        if m["kind"] == "text":
+            t = Gtk.Label(label=m.get("text", ""), wrap=True, max_width_chars=60, xalign=0)
+            t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            box.add(t)
+        elif m.get("voice") and path:
+            box.add(Gtk.Label(label="🎤 Playing the voice message…"))
+            player = WavPlayer(path)
+        elif path and kind == "photo":
+            try:
+                box.add(Gtk.Image.new_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 720, 520, True)))
+            except GLib.Error:
+                box.add(Gtk.Label(label="This photo couldn't be shown."))
+        elif path:
+            temp = Path(tempfile.mkdtemp(prefix="arckad-once-")) / m["file"]["name"]
+            shutil.copy2(path, temp)
+            open_default(str(temp))
+            box.add(Gtk.Label(label=f"“{m['file']['name']}” is open in its app.\nClose this window when you're done: "
+                                    "the file is then deleted.", justify=Gtk.Justification.CENTER))
+        note = Gtk.Label()
+        note.set_markup("<small>👁 Viewed once: closing deletes it from this computer.</small>")
+        note.get_style_context().add_class("dim-label")
+        box.add(note)
+        d.show_all()
+        d.run()
+        d.destroy()
+        if player:
+            player.stop()
+        if temp:
+            GLib.timeout_add_seconds(20, lambda: shutil.rmtree(temp.parent, ignore_errors=True) and False)
+        self.chat.consume_once(gid, m["id"])
+
+    # ---------- calls
+    def start_call(self):
+        g = self.chat.groups.get(self.gid) or {}
+        if g.get("kind") != "direct":
+            return
+        err = self.chat.start_call(g["peer"])
+        if err:
+            self.win.error(err)
 
     def _fill_emoji_tab(self, sc, pop):
         """Build a picker tab the first time it's opened (keeps opening the picker quick)."""
@@ -8649,7 +9453,8 @@ class ChatPanel(Gtk.Box):
         text = self.entry.get_text().strip()
         if text and self.gid:
             self.entry.set_text("")
-            self.chat.send_text(self.gid, text)
+            self.chat.send_text(self.gid, text, once=self.once_btn.get_active())
+            self.once_btn.set_active(False)
             self.chat.start()
 
     def insert_emoji(self, e, pop):
@@ -8675,7 +9480,8 @@ class ChatPanel(Gtk.Box):
             return
         folders = [p for p in paths if os.path.isdir(p)]
         files = [p for p in paths if os.path.isfile(p)]
-        n = self.chat.send_files(self.gid, files)
+        n = self.chat.send_files(self.gid, files, once=self.once_btn.get_active())
+        self.once_btn.set_active(False)
         if folders:
             self.win.info("Folders can't be attached. Tip: right-click the folder → Compress, then attach the ZIP.")
         return n
@@ -9110,6 +9916,70 @@ class ChatPanel(Gtk.Box):
         dlg.get_content_area().add(lb)
         dlg.connect("response", lambda d, r: d.destroy())
         dlg.show_all()
+
+
+class CallWindow(Gtk.Window):
+    """The small window during a call: who, how long, Mute, Hang up."""
+
+    def __init__(self, win):
+        super().__init__(title="Arckad-D call")
+        self.win, self.chat = win, win.chat
+        self.set_transient_for(win)
+        self.set_keep_above(True)
+        self.set_resizable(False)
+        self.set_default_size(300, -1)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, border_width=20)
+        c = self.chat.call
+        f = self.chat.contacts["friends"].get(c["peer"], {}) if c else {}
+        name = f.get("name", "Friend")
+        box.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, self.chat.avatar_file(c["peer"]) if c else None, 96)))
+        nl = Gtk.Label()
+        nl.set_markup(f"<big><b>{esc(name)}</b></big>")
+        box.add(nl)
+        self.status = Gtk.Label()
+        box.add(self.status)
+        self.level = Gtk.LevelBar(min_value=0, max_value=1)
+        box.add(self.level)
+        row = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER)
+        self.mute = Gtk.ToggleButton(label="🎙 Mute")
+        self.mute.connect("toggled", self.on_mute)
+        hang = Gtk.Button(label="Hang up")
+        hang.get_style_context().add_class("destructive-action")
+        hang.connect("clicked", lambda *_: self.chat.hang_up())
+        row.add(self.mute)
+        row.add(hang)
+        box.add(row)
+        tip = Gtk.Label()
+        tip.set_markup("<small>Tip: use a headset to avoid echo.</small>")
+        tip.get_style_context().add_class("dim-label")
+        box.add(tip)
+        self.add(box)
+        self.connect("delete-event", lambda *_: (self.chat.hang_up(), False)[1])
+        GLib.timeout_add(250, self.tick)
+        self.tick()
+
+    def on_mute(self, b):
+        c = self.chat.call
+        if c and c.get("stream"):
+            c["stream"].muted = b.get_active()
+        b.set_label("🎙 Unmute" if b.get_active() else "🎙 Mute")
+
+    def tick(self):
+        c = self.chat.call
+        if not c:
+            return False
+        state = c.get("state")
+        if state == "calling":
+            self.status.set_text("Calling…")
+        elif state in ("ringing", "connecting"):
+            self.status.set_text("Connecting…")
+        elif state == "active":
+            s = int(time.time() - c["started"])
+            self.status.set_markup(f"<span foreground='#2ec27e'>●</span> {s // 60}:{s % 60:02d}")
+            st = c.get("stream")
+            if st:
+                self.level.set_value(max(st.rx_level, st.tx_level if not st.muted else 0))
+        return True
 
 
 class ChatWindow(Gtk.Window):
@@ -11257,6 +12127,73 @@ class MainWindow(Gtk.ApplicationWindow):
     def _chat_lock_tick(self):
         self.chat.check_auto_lock()
         return True
+
+    # ---------- calls
+    def on_call_changed(self, message=None):
+        c = self.chat.call
+        cw = getattr(self, "call_window", None)
+        if c and c.get("state") in ("calling", "connecting", "active") and cw is None:
+            self.call_window = CallWindow(self)
+            self.call_window.show_all()
+        elif not c and cw is not None:
+            cw.destroy()
+            self.call_window = None
+        for p in self.chat_panels():
+            p.update_info()
+        if message:
+            self.flash_all(message)
+        return False
+
+    def ask_call(self, ev):
+        name = "A friend" if self.chat.is_locked() else ev["name"]
+        d = Gtk.Window(title="Incoming call")
+        d.set_transient_for(self)
+        d.set_keep_above(True)
+        d.set_resizable(False)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, border_width=20)
+        box.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, None if self.chat.is_locked()
+                                                        else self.chat.avatar_file(ev["peer"]), 96)))
+        l = Gtk.Label()
+        l.set_markup(f"<big><b>📞 {esc(name)}</b></big>\nis calling you")
+        l.set_justify(Gtk.Justification.CENTER)
+        box.add(l)
+        row = Gtk.Box(spacing=12, halign=Gtk.Align.CENTER)
+        dec = Gtk.Button(label="Decline")
+        dec.get_style_context().add_class("destructive-action")
+        acc = Gtk.Button(label="Accept")
+        acc.get_style_context().add_class("suggested-action")
+        row.add(dec)
+        row.add(acc)
+        box.add(row)
+        d.add(box)
+
+        def answer(yes):
+            self.chat.answer(ev, yes)
+            d.destroy()
+        acc.connect("clicked", lambda *_: answer(True))
+        dec.connect("clicked", lambda *_: answer(False))
+        d.connect("delete-event", lambda *_: (answer(False), True)[1])
+
+        def ring():
+            if ev["event"].is_set():
+                if d.get_visible():
+                    d.destroy()
+                return False
+            if self.cfg.get("chat_sound", True):
+                play_sound("ring")
+            return True
+        ring()
+        GLib.timeout_add(2200, ring)
+        d.show_all()
+        d.present()
+        self.show_toast(f"📞 {name} is calling", "Accept or decline in the call window", avatar_pixbuf(name, None, 40),
+                        lambda: d.present(), seconds=30)
+        try:
+            n = Gio.Notification.new(f"📞 {name} is calling")
+            self.get_application().send_notification("call", n)
+        except Exception:
+            pass
+        return False
 
     def on_people_changed(self):
         for p in self.chat_panels():
