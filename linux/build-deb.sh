@@ -15,7 +15,16 @@ src = open("arckad-d.py", encoding="utf-8").read()
 svg = re.search(r'LOGO_SVG = """(.*?)"""', src, re.S).group(1)
 open(sys.argv[1] + "/usr/share/icons/hicolor/scalable/apps/arckad-d.svg", "w").write(svg)
 EOF
-if command -v rsvg-convert >/dev/null; then
+if [ -f branding/logo.png ]; then
+  # your own logo (branding/logo.png): the app shows it, and the menu icons are made from it
+  python3 branding/make-icons.py
+  install -m 644 branding/logo.png "$PKG/opt/arckad-d/logo.png"
+  rm -f "$PKG/usr/share/icons/hicolor/scalable/apps/arckad-d.svg"
+  for s in 16 24 32 48 64 128 256 512; do
+    mkdir -p "$PKG/usr/share/icons/hicolor/${s}x${s}/apps"
+    install -m 644 "branding/linux/$s.png" "$PKG/usr/share/icons/hicolor/${s}x${s}/apps/arckad-d.png"
+  done
+elif command -v rsvg-convert >/dev/null; then
   for s in 16 24 32 48 64 128 256 512; do
     mkdir -p "$PKG/usr/share/icons/hicolor/${s}x${s}/apps"
     rsvg-convert -w $s -h $s "$PKG/usr/share/icons/hicolor/scalable/apps/arckad-d.svg" \

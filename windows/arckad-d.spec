@@ -44,7 +44,9 @@ a = Analysis(
     [os.path.join(root, "arckad-d.py")],
     pathex=[root],
     binaries=[(p, ".") for p in gtk_dlls],
-    datas=[(os.path.join(here, "arckad-d.png"), "."),
+    datas=([(os.path.join(here, "..", "branding", "logo.png"), ".")]
+           if os.path.exists(os.path.join(here, "..", "branding", "logo.png")) else []) + [
+           (os.path.join(here, "arckad-d.png"), "."),
            (os.path.join(here, "arckad-d.ico"), "."),
            (os.path.join(root, "emoji"), "emoji")],
     hiddenimports=["gi.repository.Gtk", "gi.repository.Gdk", "gi.repository.GdkPixbuf",
