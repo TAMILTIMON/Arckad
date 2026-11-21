@@ -127,6 +127,10 @@ final class ChatHub implements ChatEngine.Ui {
         String body = m.optJSONObject("file") != null ? (m.optDouble("voice", 0) > 0 ? "🎤 Voice message" : "📎 " + m.optJSONObject("file").optString("name"))
                 : "sticker".equals(m.optString("kind")) ? "🏷 Sticker" : m.optString("text");
         if (m.optBoolean("once")) body = "👁 One-time message";
+        if (engine.isLocked()) {
+            title = "🔒 New message";
+            body = "Unlock the chat to read it";
+        }
         notify(gid.hashCode(), title, body, gid, null);
     }
 

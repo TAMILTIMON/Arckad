@@ -337,7 +337,7 @@ final class ChatEngine {
 
     boolean active() {
         for (JSONObject g : groups.values()) if (!g.optBoolean("removed")) return true;
-        return joinActive() || (profile.optBoolean("setup") && profile.optBoolean("visible"))
+        return joinActive() || profile.optBoolean("setup")
                 || contacts.optJSONObject("outgoing").length() > 0 || contacts.optJSONObject("friends").length() > 0
                 || fcodeActive();
     }
@@ -1329,6 +1329,244 @@ final class ChatEngine {
         }
     }
 
+    // ================================================================= profile code (same format as the desktop)
+    private static final String B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    String profileCode() {
+        if (!running) start();
+        List<String> ips = Net.lanAddresses();
+        String ip = null;
+        for (String x : ips) if (!x.startsWith("127.") && x.chars().filter(ch -> ch == '.').count() == 3) {
+            ip = x;
+            break;
+        }
+        if (ip == null || port == 0) return null;
+        int portIx = port >= TCP_PORTS[0] && port <= TCP_PORTS[2] ? port - TCP_PORTS[0] : 3;
+        byte[] raw = new byte[8];
+        String[] parts = ip.split("\\.");
+        for (int i = 0; i < 4; i++) raw[i] = (byte) Integer.parseInt(parts[i]);
+        raw[4] = (byte) portIx;
+        System.arraycopy(sha256(utf8(me)), 0, raw, 5, 3);
+        BigInteger n = new BigInteger(1, raw);
+        StringBuilder s = new StringBuilder();
+        for (int i = 12; i >= 0; i--) s.append(B32.charAt(n.shiftRight(5 * i).intValue() & 31));
+        return "AR-" + s.substring(0, 4) + "-" + s.substring(4, 8) + "-" + s.substring(8);
+    }
+
+    /** {ip, port or null, id hash hex} or null. */
+    static String[] decodeProfileCode(String code) {
+        String up = code.toUpperCase(java.util.Locale.ROOT).replace('O', '0').replace('I', '1').replace('L', '1');
+        StringBuilder s = new StringBuilder();
+        for (char c : up.toCharArray()) if (Character.isLetterOrDigit(c)) s.append(c);
+        String t = s.toString();
+        if (t.startsWith("AR")) t = t.substring(2);
+        if (t.length() != 13) return null;
+        BigInteger n = BigInteger.ZERO;
+        for (char c : t.toCharArray()) {
+            int v = B32.indexOf(c);
+            if (v < 0) return null;
+            n = n.shiftLeft(5).add(BigInteger.valueOf(v));
+        }
+        if (n.bitLength() > 64) return null;
+        byte[] raw = fixed(n, 8);
+        if ((raw[4] & 0xff) > 3) return null;
+        String ip = (raw[0] & 0xff) + "." + (raw[1] & 0xff) + "." + (raw[2] & 0xff) + "." + (raw[3] & 0xff);
+        String port = (raw[4] & 0xff) < 3 ? String.valueOf(TCP_PORTS[raw[4] & 0xff]) : null;
+        return new String[]{ip, port, hex(java.util.Arrays.copyOfRange(raw, 5, 8))};
+    }
+
+    /** Background thread: a friend request to the owner of a profile code. Returns null when sent, or why not. */
+    String addByProfileCode(String code) {
+        String[] d = decodeProfileCode(code);
+        if (d == null) return "That isn't a valid profile code (it looks like AR-XXXX-XXXX-XXXXX).";
+        start();
+        JSONObject info = null;
+        String usedPort = null;
+        for (String p : d[1] != null ? new String[]{d[1]} : new String[]{"47831", "47832", "47833"}) {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL("http://" + d[0] + ":" + p + "/f/hello").openConnection();
+                c.setConnectTimeout(5000);
+                c.setReadTimeout(5000);
+                try (InputStream in = c.getInputStream()) {
+                    info = new JSONObject(new String(readStream(in, 100_000), StandardCharsets.UTF_8));
+                }
+                usedPort = p;
+                break;
+            } catch (Exception ignored) {
+            }
+        }
+        if (info == null || info.optString("id").isEmpty())
+            return "Nobody answered at that code's address (" + d[0] + "). Their computer may be off, Arckad-D closed, "
+                    + "a firewall in the way, or their address changed: ask for their current profile code.";
+        String pid = cut(info.optString("id"), 40);
+        if (!hex(sha256(utf8(pid))).substring(0, 6).equals(d[2])) return "A different person uses that address now: ask for their current code.";
+        if (pid.equals(me)) return "That's your own profile code.";
+        if (friends().has(pid)) return "You're already friends with " + info.optString("name", "them") + ".";
+        people.put(pid, new Obj().putOpt("name", cut(info.optString("name", "?"), 40)).putOpt("ip", d[0])
+                .putOpt("port", Integer.parseInt(usedPort)).putOpt("ph", cut(info.optString("ph"), 16))
+                .putOpt("os", cut(info.optString("os"), 10)).putOpt("seen", now()).putOpt("hidden", true));
+        String err = sendRequest(pid);
+        return err;
+    }
+
+    // ================================================================= group owners add friends into a group
+    int addFriendsToGroup(String gid, List<String> pids) {
+        JSONObject g = groups.get(gid);
+        if (g == null || !isOwner(gid)) return 0;
+        List<String> names = new ArrayList<>();
+        for (String pid : pids) {
+            JSONObject f = friends().optJSONObject(pid);
+            if (f == null || g.optJSONObject("members").has(pid)) continue;
+            Obj.put(g.optJSONObject("members"), pid, new Obj().putOpt("name", f.optString("name")).putOpt("os", f.optString("os"))
+                    .putOpt("role", "member").putOpt("joined", now()).putOpt("pub", f.optString("sigpub")));
+            if (g.optJSONObject("pair_keys") == null) put(g, "pair_keys", new JSONObject());
+            Obj.put(g.optJSONObject("pair_keys"), pid, hex(random(32)));
+            if (g.optJSONObject("pending_adds") == null) put(g, "pending_adds", new JSONObject());
+            Obj.put(g.optJSONObject("pending_adds"), pid, true);
+            names.add(f.optString("name"));
+        }
+        if (names.isEmpty()) return 0;
+        put(g, "version", g.optInt("version", 1) + 1);
+        save();
+        tagStamp = "";
+        StringBuilder who = new StringBuilder();
+        for (String n : names) who.append(who.length() > 0 ? ", " : "").append(n);
+        system(gid, myName() + " added " + who, true);
+        pushMeta(gid);
+        bg(() -> deliverGroupAdds(null));
+        return names.size();
+    }
+
+    void deliverGroupAdds(String only) {
+        for (Map.Entry<String, JSONObject> e : new ArrayList<>(groups.entrySet())) {
+            JSONObject g = e.getValue(), pending = g.optJSONObject("pending_adds");
+            if (pending == null) continue;
+            for (Iterator<String> it = new ArrayList<>(toList(pending.keys())).iterator(); it.hasNext(); ) {
+                String pid = it.next();
+                if (only != null && !only.equals(pid)) continue;
+                String dgid = directGid(pid);
+                JSONObject dg = groups.get(dgid);
+                if (dg == null || dg.optBoolean("removed")) continue;
+                try {
+                    request(dgid, pid, "POST", "/c/groupadd", new Obj().putOpt("meta", metaForMembers(g))
+                            .putOpt("pair_key", g.optJSONObject("pair_keys").optString(pid)), null, 8000);
+                    pending.remove(pid);
+                    save();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private static List<String> toList(Iterator<String> it) {
+        List<String> l = new ArrayList<>();
+        while (it.hasNext()) l.add(it.next());
+        return l;
+    }
+
+    private JSONObject addedToGroup(String did, JSONObject req) throws Exception {
+        JSONObject meta = req.optJSONObject("meta");
+        String gid = meta == null ? "" : cut(meta.optString("id"), 40);
+        if (gid.isEmpty() || !did.equals(meta.optString("owner")) || meta.optJSONObject("members") == null
+                || !meta.optJSONObject("members").has(me)) return err("bad invitation");
+        JSONObject existing = groups.get(gid);
+        if (existing != null && !existing.optBoolean("removed")) {
+            applyMeta(gid, meta);
+            return new Obj().putOpt("ok", true);
+        }
+        synchronized (lock) {
+            JSONObject g = new JSONObject(meta.toString());
+            put(g, "owner_key", cut(req.optString("pair_key"), 64));
+            put(g, "files", new JSONObject());
+            groups.put(gid, g);
+            msgs.putIfAbsent(gid, Collections.synchronizedList(new ArrayList<>()));
+            ids.putIfAbsent(gid, Collections.synchronizedSet(new HashSet<>()));
+            save();
+        }
+        tagStamp = "";
+        JSONObject om = meta.optJSONObject("members").optJSONObject(did);
+        String owner = om == null ? "A friend" : om.optString("name", "A friend");
+        system(gid, owner + " added you to “" + meta.optString("name") + "”", false);
+        ui.event("👥 " + owner + " added you to “" + meta.optString("name") + "”");
+        bg(() -> syncWith(gid, did));
+        ui.changed(gid);
+        return new Obj().putOpt("ok", true);
+    }
+
+    // ================================================================= chat lock (4-digit PIN on this phone)
+    private volatile boolean locked = true;
+    private int pinFails;
+    private long pinWaitUntil;
+
+    boolean hasPin() {
+        return contacts.optJSONObject("pin_phone") != null;
+    }
+
+    boolean isLocked() {
+        return hasPin() && locked;
+    }
+
+    private static String pinHash(String pin, byte[] salt) {
+        try {
+            javax.crypto.SecretKeyFactory f = javax.crypto.SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1");
+            return hex(f.generateSecret(new javax.crypto.spec.PBEKeySpec(pin.toCharArray(), salt, 20000, 256)).getEncoded());
+        } catch (Exception e) {
+            return hex(sha256(salt, utf8(pin)));
+        }
+    }
+
+    void setPin(String pin) {
+        byte[] salt = random(16);
+        put(contacts, "pin_phone", new Obj().putOpt("salt", hex(salt)).putOpt("hash", pinHash(pin, salt)));
+        saveContacts();
+        locked = false;
+    }
+
+    void removePin() {
+        contacts.remove("pin_phone");
+        saveContacts();
+        locked = false;
+        ui.changed(null);
+    }
+
+    void lockNow() {
+        if (hasPin()) {
+            locked = true;
+            ui.changed(null);
+        }
+    }
+
+    /** null when unlocked, else why not. */
+    String unlock(String pin) {
+        if (System.currentTimeMillis() < pinWaitUntil)
+            return "Too many wrong PINs. Try again in " + ((pinWaitUntil - System.currentTimeMillis()) / 1000 + 1) + " s.";
+        JSONObject p = contacts.optJSONObject("pin_phone");
+        if (p != null && same(pinHash(pin, unhex(p.optString("salt"))), p.optString("hash"))) {
+            locked = false;
+            pinFails = 0;
+            ui.changed(null);
+            return null;
+        }
+        pinFails++;
+        if (pinFails >= 3) {
+            pinWaitUntil = System.currentTimeMillis() + Math.min(30_000L << (pinFails - 3), 15 * 60_000L);
+            return "Wrong PIN. Wait " + ((pinWaitUntil - System.currentTimeMillis()) / 1000) + " s.";
+        }
+        return "Wrong PIN.";
+    }
+
+    void resetLockAndHistory() {
+        synchronized (lock) {
+            for (String gid : new ArrayList<>(msgs.keySet())) {
+                msgs.put(gid, Collections.synchronizedList(new ArrayList<>()));
+                ids.put(gid, Collections.synchronizedSet(new HashSet<>()));
+                new File(dir, gid + ".jsonl").delete();
+            }
+            unread.clear();
+        }
+        removePin();
+    }
+
     // ================================================================= receipts (✓✓ delivered, blue ✓✓ read)
     private final Map<String, Map<String, Set<String>[]>> receiptsOut = new ConcurrentHashMap<>();
     volatile boolean sendReadReceipts = true;
@@ -1678,6 +1916,7 @@ final class ChatEngine {
     }
 
     private void cameOnline(String did) {
+        deliverGroupAdds(did);
         for (Map.Entry<String, JSONObject> e : new ArrayList<>(groups.entrySet())) {
             JSONObject g = e.getValue();
             if (g.optBoolean("removed") || g.optJSONObject("members") == null || !g.optJSONObject("members").has(did)) continue;
@@ -1798,6 +2037,11 @@ final class ChatEngine {
     // ================================================================= the server side
     void handle(Net.Request r) throws Exception {
         String path = r.path;
+        if (r.method.equals("GET") && path.equals("/f/hello")) {      // for profile codes: who is at this address?
+            r.json(200, new Obj().putOpt("ok", true).putOpt("id", me).putOpt("name", myName()).putOpt("os", osName)
+                    .putOpt("ph", photoHash()).putOpt("ver", version));
+            return;
+        }
         if (r.method.equals("GET")) {
             if (path.equals("/f/photo")) {
                 byte[] d = photoBytes();
@@ -1925,6 +2169,8 @@ final class ChatEngine {
         } else if (path.equals("/c/call")) {
             res = err("Calls on this phone arrive in the next Arckad-D update.");
             code = 403;
+        } else if (path.equals("/c/groupadd") && !pair && "direct".equals(g.optString("kind")) && did.equals(g.optString("peer"))) {
+            res = addedToGroup(did, req);
         } else if (path.equals("/c/ping") && !pair) {
             res = new Obj().putOpt("ok", true).putOpt("ver", version).putOpt("os", osName).putOpt("calls", false);
         } else if (path.equals("/c/receipt") && !pair) {

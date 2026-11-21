@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.21.0"
+APP_VERSION = "3.22.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5153,7 +5153,7 @@ def make_pair_handler(pr):
         def do_GET(self):
             try:
                 path = self.path.split("?")[0]
-                if (path.startswith("/c/file/") or path == "/f/photo") and getattr(pr.win, "chat", None):
+                if (path.startswith("/c/file/") or path in ("/f/photo", "/f/hello")) and getattr(pr.win, "chat", None):
                     return pr.win.chat.handle_get(self, path)
                 self._plain(404, {"ok": False})
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -6058,7 +6058,7 @@ class Chat:
 
     def active(self):
         return (any(not g.get("removed") for g in self.groups.values()) or self.join_active()
-                or (self.profile.get("setup") and self.profile.get("visible")) or bool(self.contacts["outgoing"])
+                or bool(self.profile.get("setup")) or bool(self.contacts["outgoing"])
                 or bool(self.contacts["friends"]) or self.fcode_active())
 
     def is_online(self, did):
@@ -6430,6 +6430,8 @@ class Chat:
                                             pair_key=bytes.fromhex(g["owner_key"]), timeout=8))
 
     def _came_online(self, did):
+        if any(did in (g.get("pending_adds") or {}) for g in self.groups.values()):
+            self.deliver_group_adds(only=did)
         for gid, g in list(self.groups.items()):
             if g.get("removed") or did not in g.get("members", {}):
                 continue
@@ -7427,6 +7429,176 @@ class Chat:
         self.ui("on_chat_lock_changed")
         self.ui("on_chat_changed", None)
 
+    # ---------- profile code: one code anyone can use to send you a friend request, from any network
+    _B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"        # Crockford base32 (no I, L, O, U)
+
+    def profile_code(self):
+        if self.profile.get("setup") and not self.pr.running:
+            try:
+                self.pr.ensure_running()              # the code needs the service, even for invisible profiles
+            except OSError:
+                return None
+        ips = [ip for ip in lan_addresses() if not ip.startswith("127.") and ip.count(".") == 3]
+        if not ips or not self.pr.port:
+            return None
+        port_ix = self.pr.port - PAIR_TCP_PORTS[0] if self.pr.port in PAIR_TCP_PORTS[:-1] else 3
+        raw = bytes(int(x) for x in ips[0].split(".")) + bytes([port_ix]) + hashlib.sha256(self.me.encode()).digest()[:3]
+        n = int.from_bytes(raw, "big")
+        s = "".join(self._B32[(n >> (5 * i)) & 31] for i in range(12, -1, -1))
+        return f"AR-{s[:4]}-{s[4:8]}-{s[8:]}"
+
+    @classmethod
+    def decode_profile_code(cls, code):
+        """(ip, port, id hash) or None."""
+        s = "".join(c for c in code.upper().replace("O", "0").replace("I", "1").replace("L", "1") if c.isalnum())
+        if s.startswith("AR"):
+            s = s[2:]
+        if len(s) != 13 or any(c not in cls._B32 for c in s):
+            return None
+        n = 0
+        for c in s:
+            n = n * 32 + cls._B32.index(c)
+        raw = n.to_bytes(9, "big")[1:] if n.bit_length() <= 64 else None
+        if raw is None:
+            return None
+        ip = ".".join(str(b) for b in raw[:4])
+        if raw[4] > 3:
+            return None
+        port = PAIR_TCP_PORTS[raw[4]] if raw[4] < 3 else None
+        return ip, port, raw[5:]
+
+    def add_by_profile_code(self, code):
+        """Background thread: send a friend request to whoever owns this profile code. Returns (ok, message)."""
+        import http.client
+        d = self.decode_profile_code(code)
+        if not d:
+            return False, "That isn't a valid profile code (it looks like AR-XXXX-XXXX-XXXXX)."
+        ip, port, idh = d
+        self.start()
+        ports = [port] if port else list(PAIR_TCP_PORTS[:-1])
+        info = None
+        for p in ports:
+            try:
+                c = http.client.HTTPConnection(ip, p, timeout=5)
+                c.request("GET", "/f/hello")
+                r = c.getresponse()
+                info = json.loads(r.read() or b"{}")
+                c.close()
+                port = p
+                break
+            except (OSError, ValueError):
+                continue
+        if not info or not info.get("id"):
+            return False, (f"Nobody answered at that code's address ({ip}). Their computer may be off, Arckad-D may "
+                           "be closed, a firewall may block it, or their address changed: ask them for their current "
+                           "profile code.")
+        pid = str(info["id"])[:40]
+        if hashlib.sha256(pid.encode()).digest()[:3] != idh:
+            return False, "A different person uses that address now (their address changed): ask for their current code."
+        if pid == self.me:
+            return False, "That's your own profile code."
+        if pid in self.contacts["friends"]:
+            return False, f"You're already friends with {info.get('name', 'them')}."
+        self.people[pid] = {"name": str(info.get("name", "?"))[:40], "ip": ip, "port": port,
+                            "ph": str(info.get("ph", ""))[:16], "os": str(info.get("os", ""))[:10],
+                            "seen": time.time(), "hidden": True, "ver": str(info.get("ver", ""))[:12]}
+        ok, msg = self.send_request(pid)
+        return ok, (f"Friend request sent to {info.get('name')}. You'll be friends when they accept." if ok else msg)
+
+    # ---------- group owners add friends straight into a group (no join code)
+    def add_friends_to_group(self, gid, pids):
+        g = self.groups.get(gid)
+        if not g or not self.is_owner(gid):
+            return 0
+        added = []
+        for pid in pids:
+            f = self.contacts["friends"].get(pid)
+            if not f or pid in g["members"]:
+                continue
+            g["members"][pid] = {"name": f["name"], "os": f.get("os", ""), "role": "member", "joined": time.time(),
+                                 "pub": f.get("sigpub")}
+            g.setdefault("pair_keys", {})[pid] = secrets.token_bytes(32).hex()
+            g.setdefault("pending_adds", {})[pid] = True
+            added.append(f["name"])
+        if not added:
+            return 0
+        g["version"] = g.get("version", 1) + 1
+        self.save()
+        self._tag_cache = (None, {})
+        self._system(gid, f"{self.my_name()} added {', '.join(added)}")
+        self.push_meta(gid)
+        threading.Thread(target=self.deliver_group_adds, daemon=True).start()
+        return len(added)
+
+    def deliver_group_adds(self, only=None):
+        """Tell added friends (now, or when they're next online) over the friendship's own key."""
+        for gid, g in list(self.groups.items()):
+            for pid in list((g.get("pending_adds") or {})):
+                if only and pid != only:
+                    continue
+                if pid not in g.get("members", {}):
+                    g["pending_adds"].pop(pid, None)
+                    continue
+                dgid = self._direct_gid(pid)
+                if dgid not in self.groups or self.groups[dgid].get("removed"):
+                    continue
+                payload = {"meta": self._meta_for_members(g), "pair_key": g["pair_keys"][pid]}
+                if self._try(lambda: self._request(dgid, pid, "POST", "/c/groupadd", payload, timeout=8)) is not None:
+                    g["pending_adds"].pop(pid, None)
+                    self.save()
+
+    def _added_to_group(self, did, req):
+        meta = req.get("meta") or {}
+        gid = str(meta.get("id", ""))[:40]
+        if not gid or meta.get("owner") != did or self.me not in (meta.get("members") or {}):
+            return {"ok": False, "reason": "bad invitation"}
+        if gid in self.groups and not self.groups[gid].get("removed"):
+            self._apply_meta(gid, meta)
+            return {"ok": True}
+        with self.lock:
+            self.groups[gid] = dict(meta, owner_key=str(req.get("pair_key", ""))[:64], files={})
+            self.msgs.setdefault(gid, [])
+            self.ids.setdefault(gid, set())
+            self.save()
+        self._tag_cache = (None, {})
+        owner = (meta.get("members") or {}).get(did, {}).get("name", "A friend")
+        self._system(gid, f"{owner} added you to “{meta.get('name', 'a group')}”", share=False)
+        self.ui("on_pair_event", f"👥 {owner} added you to “{meta.get('name', 'a group')}”")
+        threading.Thread(target=self.sync_with, args=(gid, did), daemon=True).start()
+        self.ui("on_chat_changed", gid)
+        return {"ok": True}
+
+    # ---------- profile export / import (.arckadprofile): everything, to move to a new computer
+    def export_profile(self, dest, password, with_files=True):
+        res = self.export_backup(dest, password, with_files, profile=True)
+        return res
+
+    # ---------- automatic backups
+    def auto_backup_due(self):
+        cfg = self.win.cfg.get("auto_backup") or {}
+        if not cfg.get("on") or not cfg.get("password"):
+            return False
+        every = 86400 if cfg.get("every", "day") == "day" else 7 * 86400
+        return time.time() - float(cfg.get("last", 0)) > every
+
+    def run_auto_backup(self):
+        """Background thread. Writes Arckad-D backup <date>.arckadprofile and keeps the newest few."""
+        cfg = self.win.cfg.get("auto_backup") or {}
+        folder = Path(cfg.get("folder") or (Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+                                                   or str(HOME)) / "Arckad-D Backups"))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            dest = folder / time.strftime("Arckad-D backup %Y-%m-%d %H.%M.%S.arckadprofile")
+            self.export_backup(str(dest), cfg["password"], bool(cfg.get("files")), profile=True)
+            cfg["last"], cfg["last_ok"], cfg["last_error"] = time.time(), str(dest), ""
+            old = sorted(folder.glob("Arckad-D backup *.arckadprofile"))
+            for f in old[:-max(1, int(cfg.get("keep", 7)))]:
+                f.unlink(missing_ok=True)
+        except Exception as ex:
+            cfg["last"], cfg["last_error"] = time.time(), str(ex)
+        self.win.cfg["auto_backup"] = cfg
+        write_json(CONFIG_FILE, self.win.cfg)
+
     def check_connection(self, pid):
         """Background thread: a plain-language report on why a friend may show offline or calls fail.
         Returns (report text, can_reconnect)."""
@@ -7567,8 +7739,8 @@ class Chat:
         return {"ok": False, "reason": "unknown"}
 
     # ---------- backup: one password-protected .arckadchat file
-    def export_backup(self, dest, password, with_files=True):
-        """Returns (number of groups, messages, files) written."""
+    def export_backup(self, dest, password, with_files=True, profile=False):
+        """Returns (number of groups, messages, files) written. profile=True: the full .arckadprofile."""
         salt = secrets.token_bytes(16)
         kdf = "scrypt" if hasattr(hashlib, "scrypt") else "pbkdf2"
         key = _backup_key(password, salt, kdf)
@@ -7577,6 +7749,8 @@ class Chat:
                     "device_name": self.my_name(), "identity": self.identity(),
                     "groups": json.loads(json.dumps(self.groups)), "msgs": json.loads(json.dumps(self.msgs)),
                     "contacts": json.loads(json.dumps(self.contacts)),
+                    "settings": {k: self.win.cfg.get(k) for k in ("chat_sound", "read_receipts", "wallpaper",
+                                                                   "chat_wallpapers", "device_name") if k in self.win.cfg},
                     "photo": base64.b64encode(self.photo_bytes()).decode()}
         files = []
         if with_files:
@@ -7586,8 +7760,11 @@ class Chat:
                         files.append((gid, fid, path))
         tmp = Path(str(dest) + ".part")
         with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
-            z.writestr("README.txt", "Arckad-D chat backup (encrypted).\nRestore it in Arckad-D: Chat → ⋯ → Restore chats "
-                                     "from backup, and type its password.\n")
+            z.comment = b"ARCKAD-D PROFILE 1" if profile else b"ARCKAD-D CHATS 1"
+            z.writestr("README.txt", ("Arckad-D profile (encrypted): identity, friends, groups and chats.\nImport it in "
+                                      "Arckad-D on the new computer: Chat → ⋯ → Import profile.\n") if profile else
+                       "Arckad-D chat backup (encrypted).\nRestore it in Arckad-D: Chat → ⋯ → Restore chats "
+                       "from backup, and type its password.\n")
             z.writestr("kdf", f"{kdf}:{salt.hex()}")
             z.writestr("chat.enc", seal(key, json.dumps(data, ensure_ascii=False).encode("utf-8")))
             for gid, fid, path in files:
@@ -7627,6 +7804,8 @@ class Chat:
         """Merge a backup into this device. take_identity: continue as the device that made the backup
         (so you stay a member of its groups). Returns (groups added, messages added, files restored)."""
         if take_identity:
+            for k, v in (data.get("settings") or {}).items():
+                self.win.cfg[k] = v
             for k in ("friends", "outgoing"):
                 self.contacts[k].update((data.get("contacts") or {}).get(k, {}))
             if (data.get("contacts") or {}).get("profile"):
@@ -7862,6 +8041,8 @@ class Chat:
             if did not in g["members"]:
                 return reply({"id": gid, "removed": True})
             return reply(self._meta_for_members(g))
+        if path == "/c/groupadd" and not pair and g.get("kind") == "direct" and did == g.get("peer"):
+            return reply(self._added_to_group(did, req))
         if path == "/c/ping" and not pair:
             return reply({"ok": True, "ver": APP_VERSION, "os": OS_NAME, "calls": audio_supported()[0]})
         if path == "/c/receipt" and not pair:
@@ -7903,6 +8084,9 @@ class Chat:
         return reply({"ok": False, "reason": "unknown request"}, 404)
 
     def handle_get(self, h, path):
+        if path == "/f/hello":                       # for profile codes: who is at this address?
+            return h._plain(200, {"ok": True, "id": self.me, "name": self.my_name(), "os": OS_NAME,
+                                  "ph": self.photo_hash(), "ver": APP_VERSION})
         if path == "/f/photo":
             data = self.photo_bytes()
             if not data:
@@ -8579,6 +8763,100 @@ def avatar_pixbuf(name, photo, size, group=False):
     return pb
 
 
+# ---------- chat wallpapers: colours, gentle patterns, or your own picture
+WALLPAPERS = [  # id, label, base colour, pattern
+    ("none", "None", None, None), ("sky", "Sky", "#dbeafe", "dots"), ("mint", "Mint", "#d1fae5", "waves"),
+    ("sand", "Sand", "#fef3c7", "diagonal"), ("rose", "Rose", "#fce7f3", "dots"), ("slate", "Slate", "#cbd5e1", "grid"),
+    ("night", "Night", "#1e293b", "dots"), ("forest", "Forest", "#14532d", "waves"),
+]
+_PATTERNS = {
+    "dots": '<circle cx="10" cy="10" r="2.2" fill="{ink}"/><circle cx="30" cy="30" r="2.2" fill="{ink}"/>',
+    "waves": '<path d="M0 20 Q10 12 20 20 T40 20" fill="none" stroke="{ink}" stroke-width="1.6"/>',
+    "diagonal": '<path d="M0 40 L40 0 M-10 10 L10 -10 M30 50 L50 30" stroke="{ink}" stroke-width="1.4"/>',
+    "grid": '<path d="M0 0 H40 M0 0 V40" stroke="{ink}" stroke-width="1"/>',
+}
+
+
+def wallpaper_file(wid):
+    """The image for a built-in wallpaper (made once), a user picture path, or None."""
+    if not wid or wid == "none":
+        return None
+    if wid.startswith("file:"):
+        p = wid[5:]
+        return p if os.path.isfile(p) else None
+    for i, _l, colour, pat in WALLPAPERS:
+        if i == wid:
+            path = CACHE_DIR / f"wallpaper-{wid}.png"
+            if not path.exists():
+                dark = colour in ("#1e293b", "#14532d")
+                ink = "rgba(255,255,255,0.10)" if dark else "rgba(0,0,0,0.07)"
+                svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"><rect width="40" height="40" '
+                       f'fill="{colour}"/>{_PATTERNS[pat].format(ink=ink)}</svg>')
+                loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+                loader.write(svg.encode())
+                loader.close()
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                loader.get_pixbuf().savev(str(path), "png", [], [])
+            return str(path)
+    return None
+
+
+class CropDialog(Gtk.Dialog):
+    """Square crop for profile photos: zoom, move, rotate, with a live round preview."""
+
+    def __init__(self, parent, path):
+        super().__init__(title="Crop your photo", transient_for=parent, modal=True)
+        self.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Use this photo", Gtk.ResponseType.OK)
+        self.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        src = GdkPixbuf.Pixbuf.new_from_file(path)
+        self.src = src.apply_embedded_orientation() or src           # photos from phones carry a rotation
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        self.preview = Gtk.Image(halign=Gtk.Align.CENTER)
+        box.add(self.preview)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        self.zoom = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1.0, 4.0, 0.05)
+        self.zoom.set_value(1.0)
+        self.hpos = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.01)
+        self.vpos = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.01)
+        self.hpos.set_value(0.5)
+        self.vpos.set_value(0.5)
+        for i, (label, sc) in enumerate((("Zoom", self.zoom), ("Left ↔ right", self.hpos), ("Up ↕ down", self.vpos))):
+            sc.set_draw_value(False)
+            sc.set_hexpand(True)
+            sc.connect("value-changed", lambda *_: self.update())
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, i, 1, 1)
+            grid.attach(sc, 1, i, 1, 1)
+        box.add(grid)
+        rot = Gtk.Button(label="↻ Rotate")
+        rot.connect("clicked", lambda *_: self.rotate())
+        box.add(rot)
+        self.set_default_size(380, -1)
+        self.update()
+        self.show_all()
+
+    def rotate(self):
+        self.src = self.src.rotate_simple(GdkPixbuf.PixbufRotation.CLOCKWISE)
+        self.update()
+
+    def cropped(self, size=512):
+        w, h = self.src.get_width(), self.src.get_height()
+        side = max(8, int(min(w, h) / self.zoom.get_value()))
+        x = int((w - side) * self.hpos.get_value())
+        y = int((h - side) * self.vpos.get_value())
+        return self.src.new_subpixbuf(x, y, side, side).scale_simple(size, size, GdkPixbuf.InterpType.HYPER)
+
+    def update(self):
+        self.preview.set_from_pixbuf(_round(self.cropped(220), 220))
+
+    def save(self):
+        path = CACHE_DIR / "profile-crop.jpg"
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        self.cropped().savev(str(path), "jpeg", ["quality"], ["92"])
+        return str(path)
+
+
 class ProfileDialog(Gtk.Dialog):
     """Your chat profile: name, photo, and whether people on the network can find you."""
 
@@ -8611,6 +8889,17 @@ class ProfileDialog(Gtk.Dialog):
         vl.set_markup("<b>Let people on my network find me</b>\n<small>Your name and photo appear in other people's "
                       "<b>People</b> list so they can send you a friend request. Turn off to be invisible "
                       "(your friends still find you).</small>")
+        code = chat.profile_code()
+        if code:
+            cr = Gtk.Box(spacing=8)
+            cl = Gtk.Label(xalign=0, selectable=True, hexpand=True)
+            cl.set_markup(f"Your profile code: <b><tt>{code}</tt></b>\n<small>Share it so anyone (also on another "
+                          "network or VLAN) can send you a friend request.</small>")
+            cb = Gtk.Button(label="Copy")
+            cb.connect("clicked", lambda *_: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(code, -1))
+            cr.pack_start(cl, True, True, 0)
+            cr.add(cb)
+            box.add(cr)
         self.visible = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.visible.set_active(chat.profile.get("visible", True))
         vr.pack_start(vl, True, True, 0)
@@ -8638,8 +8927,18 @@ class ProfileDialog(Gtk.Dialog):
             flt.add_pattern(f"*.{e.upper()}")
         dlg.add_filter(flt)
         if dlg.run() == Gtk.ResponseType.ACCEPT:
-            self.new_photo, self.remove_photo = dlg.get_filename(), False
-            self.update_pic()
+            try:
+                crop = CropDialog(self, dlg.get_filename())
+                if crop.run() == Gtk.ResponseType.OK:
+                    self.new_photo, self.remove_photo = crop.save(), False
+                    self.update_pic()
+                crop.destroy()
+            except GLib.Error as ex:
+                err = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.ERROR,
+                                        buttons=Gtk.ButtonsType.CLOSE, text="That photo couldn't be opened")
+                err.format_secondary_text(ex.message)
+                err.run()
+                err.destroy()
         dlg.destroy()
 
     def drop_photo(self):
@@ -8792,6 +9091,11 @@ class ChatPanel(Gtk.Box):
         title = Gtk.Label(xalign=0, hexpand=True)
         title.set_markup("<b>Chats</b>")
         top.pack_start(title, True, True, 0)
+        self.lock_btn = Gtk.Button()
+        self.lock_btn.add(Gtk.Image.new_from_icon_name("system-lock-screen-symbolic", Gtk.IconSize.BUTTON))
+        self.lock_btn.set_tooltip_text("Lock the chat with your PIN (or set one up)")
+        self.lock_btn.connect("clicked", lambda *_: self.lock_now())
+        top.add(self.lock_btn)
         self.people_btn = Gtk.Button()
         pbx = Gtk.Box(spacing=3)
         pbx.add(Gtk.Image.new_from_icon_name("system-users-symbolic", Gtk.IconSize.BUTTON))
@@ -8813,8 +9117,11 @@ class ChatPanel(Gtk.Box):
         pb.set_tooltip_text("Add friends, new group, join a group")
         top.add(pb)
         lmenu = Gtk.Menu()
-        for label, cb in (("Profile…", self.edit_profile), ("Back up chats…", self.backup),
-                          ("Restore chats from a backup…", self.restore)):
+        for label, cb in (("Profile…", self.edit_profile), ("Chat wallpaper…", lambda: self.choose_wallpaper(None)),
+                          ("Back up chats…", self.backup), ("Restore chats from a backup…", self.restore),
+                          ("Automatic backups…", self.auto_backup_settings),
+                          ("Export my profile (move to a new computer)…", self.export_profile),
+                          ("Import a profile…", self.import_profile)):
             it = Gtk.MenuItem(label=label)
             it.connect("activate", lambda _i, cb=cb: cb())
             lmenu.append(it)
@@ -8908,6 +9215,11 @@ class ChatPanel(Gtk.Box):
         tb.add(self.conv_title)
         tb.add(self.info)
         head.pack_start(tb, True, True, 0)
+        lock2 = Gtk.Button()
+        lock2.add(Gtk.Image.new_from_icon_name("system-lock-screen-symbolic", Gtk.IconSize.BUTTON))
+        lock2.set_tooltip_text("Lock the chat")
+        lock2.connect("clicked", lambda *_: self.lock_now())
+        head.add(lock2)
         self.find_btn = Gtk.ToggleButton()
         self.find_btn.add(Gtk.Image.new_from_icon_name("edit-find-symbolic", Gtk.IconSize.BUTTON))
         self.find_btn.set_tooltip_text("Search messages, filter by type and date")
@@ -9116,6 +9428,7 @@ class ChatPanel(Gtk.Box):
         if not (self.chat.join_active() and self.chat.join["gid"] == gid):
             self.code_box.hide()                      # another group's join code doesn't belong here
         self.pages.set_visible_child_name("conv")
+        self.apply_wallpaper()
         self.show_messages()
         self.update_info()
         self.chat.mark_read(gid)
@@ -9326,7 +9639,27 @@ class ChatPanel(Gtk.Box):
                 row.add(b)
             self.people_box.add(row)
 
-        section("Add a friend with a code (any network, other VLANs too)")
+        section("Your profile code (share it: anyone can send you a friend request, from any network)")
+        code = ch.profile_code()
+        pc = Gtk.Box(spacing=6)
+        pl = Gtk.Label(xalign=0, selectable=True, hexpand=True)
+        pl.set_markup(f"<span size='large' weight='bold' font_family='monospace'>{code or 'starting…'}</span>")
+        pc.pack_start(pl, True, True, 0)
+        cp = Gtk.Button(label="Copy")
+        cp.connect("clicked", lambda *_: code and (Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(code, -1),
+                                                    self.win.flash_all("Profile code copied")))
+        pc.add(cp)
+        self.people_box.add(pc)
+        ar = Gtk.Box(spacing=6)
+        pe = Gtk.Entry(placeholder_text="Add with a profile code: AR-XXXX-XXXX-XXXXX", hexpand=True)
+        pb2 = Gtk.Button(label="Send friend request")
+        pb2.get_style_context().add_class("suggested-action")
+        pb2.connect("clicked", lambda *_: pe.get_text().strip() and self.add_by_profile_code(pe.get_text()))
+        pe.connect("activate", lambda *_: pe.get_text().strip() and self.add_by_profile_code(pe.get_text()))
+        ar.pack_start(pe, True, True, 0)
+        ar.add(pb2)
+        self.people_box.add(ar)
+        section("Add a friend with a one-time code")
         fc = Gtk.Box(spacing=6)
         b1 = Gtk.Button(label="Show my friend code")
         b1.connect("clicked", lambda *_: self.show_friend_code())
@@ -9531,6 +9864,290 @@ class ChatPanel(Gtk.Box):
     def _pin_ok(self, pin):
         p = self.chat.contacts.get("pin") or {}
         return bool(p) and hmacmod.compare_digest(_backup_key(pin, bytes.fromhex(p["salt"])).hex(), p["hash"])
+
+    # ---------- lock
+    def lock_now(self):
+        if self.chat.has_pin():
+            self.chat.lock_chat()
+        else:
+            self.pin_settings()
+
+    # ---------- profile code
+    def add_by_profile_code(self, code):
+        self.win.flash_all("Looking up the profile code…")
+
+        def work():
+            ok, msg = self.chat.add_by_profile_code(code)
+            GLib.idle_add(lambda: (self.win.info(("✓ " if ok else "✗ ") + msg), self.refresh_people()) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- wallpaper
+    def apply_wallpaper(self):
+        g = self.chat.groups.get(self.gid) or {}
+        wid = (self.win.cfg.get("chat_wallpapers") or {}).get(self.gid) or self.win.cfg.get("wallpaper") or "none"
+        path = wallpaper_file(wid)
+        if not hasattr(self, "_wall_css"):
+            self._wall_css = Gtk.CssProvider()
+            self.scroll.get_style_context().add_provider(self._wall_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.list.get_style_context().add_provider(self._wall_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if path:
+            url = Gio.File.new_for_path(path).get_uri()
+            tiled = not wid.startswith("file:")
+            css = (f"scrolledwindow {{ background-image: url('{url}'); "
+                   + ("background-repeat: repeat; background-size: 40px 40px; }" if tiled else
+                      "background-size: cover; background-position: center; }")
+                   + " list, list row { background-color: transparent; background-image: none; }")
+        else:
+            css = ""
+        self._wall_css.load_from_data(css.encode())
+        _ = g
+
+    def choose_wallpaper(self, gid):
+        d = Gtk.Dialog(title="Wallpaper for this chat" if gid else "Chat wallpaper (all chats)",
+                       transient_for=self.get_toplevel(), modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        flow = Gtk.FlowBox(max_children_per_line=4, selection_mode=Gtk.SelectionMode.NONE, margin=12,
+                           column_spacing=8, row_spacing=8)
+
+        def set_wall(wid):
+            if gid:
+                self.win.cfg.setdefault("chat_wallpapers", {})[gid] = wid
+            else:
+                self.win.cfg["wallpaper"] = wid
+            write_json(CONFIG_FILE, self.win.cfg)
+            for p in self.win.chat_panels():
+                p.apply_wallpaper()
+        for wid, label, colour, _pat in WALLPAPERS:
+            b = Gtk.Button()
+            bx = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            f = wallpaper_file(wid)
+            if f:
+                pb = GdkPixbuf.Pixbuf.new_from_file(f)
+                tile = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 80, 56)
+                for x in range(0, 80, 40):
+                    for y in range(0, 56, 40):
+                        pb.copy_area(0, 0, min(40, 80 - x), min(40, 56 - y), tile, x, y)
+                bx.add(Gtk.Image.new_from_pixbuf(tile))
+            else:
+                bx.add(Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.DIALOG))
+            bx.add(Gtk.Label(label=label))
+            b.add(bx)
+            b.connect("clicked", lambda _b, w=wid: set_wall(w))
+            flow.add(b)
+        pic = Gtk.Button(label="📷 Your own picture…")
+
+        def choose_pic(*_):
+            fc = Gtk.FileChooserNative(title="Choose a wallpaper picture", transient_for=d, action=Gtk.FileChooserAction.OPEN)
+            flt = Gtk.FileFilter()
+            flt.set_name("Pictures")
+            for e in ("jpg", "jpeg", "png", "webp", "bmp"):
+                flt.add_pattern(f"*.{e}")
+                flt.add_pattern(f"*.{e.upper()}")
+            fc.add_filter(flt)
+            if fc.run() == Gtk.ResponseType.ACCEPT:
+                src = fc.get_filename()
+                folder = CHAT_DIR / "wallpapers"
+                folder.mkdir(parents=True, exist_ok=True)
+                dest = unique_target(folder / os.path.basename(src))
+                shutil.copy2(src, dest)
+                set_wall("file:" + str(dest))
+            fc.destroy()
+        pic.connect("clicked", choose_pic)
+        box = d.get_content_area()
+        box.add(flow)
+        box.add(pic)
+        if gid:
+            same = Gtk.Button(label="Use the general wallpaper")
+            same.connect("clicked", lambda *_: set_wall(""))
+            box.add(same)
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    # ---------- profile export / import and automatic backups
+    def _ask_password(self, title, intro, confirm=True):
+        d = Gtk.Dialog(title=title, transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "OK", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        lb = Gtk.Label(xalign=0, wrap=True, max_width_chars=50)
+        lb.set_markup(intro)
+        box.add(lb)
+        p1 = Gtk.Entry(visibility=False, placeholder_text="Password (at least 8 characters)", activates_default=True)
+        p2 = Gtk.Entry(visibility=False, placeholder_text="Type it again", activates_default=True)
+        box.add(p1)
+        if confirm:
+            box.add(p2)
+        err = Gtk.Label(xalign=0)
+        box.add(err)
+        d.set_default_response(Gtk.ResponseType.OK)
+        d.show_all()
+        while True:
+            if d.run() != Gtk.ResponseType.OK:
+                d.destroy()
+                return None
+            if confirm and len(p1.get_text()) < 8:
+                err.set_markup("<span foreground='#e01b24'>Use at least 8 characters.</span>")
+            elif confirm and p1.get_text() != p2.get_text():
+                err.set_markup("<span foreground='#e01b24'>The two passwords are different.</span>")
+            else:
+                pw = p1.get_text()
+                d.destroy()
+                return pw
+
+    def export_profile(self):
+        pw = self._ask_password("Export your profile", "Saves <b>everything</b> (your identity, profile, friends, groups "
+                                "and chats) in one <b>.arckadprofile</b> file, encrypted with a password. Import it on "
+                                "the new computer to carry on as you. Keep the file and password safe.")
+        if not pw:
+            return
+        fc = Gtk.FileChooserNative(title="Save your profile", transient_for=self.get_toplevel(),
+                                   action=Gtk.FileChooserAction.SAVE)
+        fc.set_do_overwrite_confirmation(True)
+        fc.set_current_name(f"{self.chat.my_name()} {time.strftime('%Y-%m-%d')}.arckadprofile")
+        fc.set_current_folder(str(downloads_dir()))
+        if fc.run() != Gtk.ResponseType.ACCEPT:
+            fc.destroy()
+            return
+        dest = fc.get_filename()
+        fc.destroy()
+        if not dest.endswith(".arckadprofile"):
+            dest += ".arckadprofile"
+        self.win.flash_all("Exporting your profile…")
+
+        def work():
+            try:
+                res = self.chat.export_profile(dest, pw, True)
+                GLib.idle_add(lambda: self.win.info(
+                    f"Profile exported ✓\n\n{dest}\n\n{res[0]} chats · {res[1]} messages · {res[2]} attachments · "
+                    f"{human_size(os.path.getsize(dest))}\n\nOn the new computer: Chat → ⋯ → Import a profile. "
+                    "Then stop using Arckad-D chat on this computer.") and False)
+            except (OSError, ValueError) as ex:
+                GLib.idle_add(lambda m=str(ex): self.win.error(f"The profile couldn't be exported: {m}") and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def import_profile(self):
+        fc = Gtk.FileChooserNative(title="Import a profile", transient_for=self.get_toplevel(),
+                                   action=Gtk.FileChooserAction.OPEN)
+        flt = Gtk.FileFilter()
+        flt.set_name("Arckad-D profiles and backups")
+        flt.add_pattern("*.arckadprofile")
+        flt.add_pattern("*.arckadchat")
+        fc.add_filter(flt)
+        if fc.run() != Gtk.ResponseType.ACCEPT:
+            fc.destroy()
+            return
+        path = fc.get_filename()
+        fc.destroy()
+        pw = self._ask_password("Import a profile", "Type the password the profile was exported with.", confirm=False)
+        if not pw:
+            return
+
+        def work():
+            try:
+                data, key = Chat.read_backup(path, pw)
+            except ValueError as ex:
+                GLib.idle_add(lambda m=str(ex): self.win.error(m) and False)
+                return
+            GLib.idle_add(ask, data, key)
+
+        def ask(data, key):
+            same = data["device_id"] == self.chat.me
+            if not same and not self.win.confirm(
+                    f"Continue as “{data.get('device_name', 'that profile')}” on this computer?\n\nYou keep all its "
+                    "friends, groups and chats, and they see this computer as you. Stop using Arckad-D chat on the old "
+                    "computer (or import there a fresh profile), so the two don't get in each other's way."):
+                return False
+            threading.Thread(target=lambda: GLib.idle_add(
+                lambda res=self.chat.restore_backup(path, data, key, not same): (self.refresh(), self.win.info(
+                    f"Profile imported ✓\n\n{res[0]} chats · {res[1]} messages · {res[2]} attachments"
+                    + ("\n\nRestart Arckad-D to finish." if not same else ""))) and False), daemon=True).start()
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    def auto_backup_settings(self):
+        cfg = dict(self.win.cfg.get("auto_backup") or {})
+        d = Gtk.Dialog(title="Automatic backups", transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        on = Gtk.CheckButton(label="Back up my chats automatically")
+        on.set_active(bool(cfg.get("on")))
+        box.add(on)
+        row = Gtk.Box(spacing=8)
+        row.add(Gtk.Label(label="Every"))
+        every = Gtk.ComboBoxText()
+        every.append("day", "day")
+        every.append("week", "week")
+        every.set_active_id(cfg.get("every", "day"))
+        row.add(every)
+        row.add(Gtk.Label(label="· keep the newest"))
+        keep = Gtk.SpinButton.new_with_range(1, 60, 1)
+        keep.set_value(int(cfg.get("keep", 7)))
+        row.add(keep)
+        box.add(row)
+        files = Gtk.CheckButton(label="Include attachments (photos and files; bigger backups)")
+        files.set_active(bool(cfg.get("files")))
+        box.add(files)
+        folder = Gtk.FileChooserButton(title="Backup folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        default = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS) or str(HOME)) / "Arckad-D Backups"
+        default.mkdir(parents=True, exist_ok=True)
+        folder.set_filename(cfg.get("folder") or str(default))
+        fr = Gtk.Box(spacing=8)
+        fr.add(Gtk.Label(label="Save in"))
+        fr.pack_start(folder, True, True, 0)
+        box.add(fr)
+        pw = Gtk.Entry(visibility=False, placeholder_text="Backup password (at least 8 characters)")
+        pw.set_text(cfg.get("password", ""))
+        box.add(pw)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=52)
+        last = cfg.get("last_ok")
+        note.set_markup("<small>Backups are complete <b>.arckadprofile</b> files encrypted with this password; restore "
+                        "one with ⋯ → Import a profile. The password is kept in your settings (readable only by your "
+                        "account) so backups can run on their own.</small>" +
+                        (f"\n<small>Last backup: {esc(last)}</small>" if last else "") +
+                        (f"\n<small><span foreground='#e01b24'>Last attempt failed: {esc(cfg['last_error'])}</span></small>"
+                         if cfg.get("last_error") else ""))
+        box.add(note)
+        now = Gtk.Button(label="Back up now")
+        box.add(now)
+        d.show_all()
+
+        def collect():
+            return {"on": on.get_active(), "every": every.get_active_id(), "keep": int(keep.get_value()),
+                    "files": files.get_active(), "folder": folder.get_filename() or str(default),
+                    "password": pw.get_text(), "last": cfg.get("last", 0), "last_ok": cfg.get("last_ok", ""),
+                    "last_error": cfg.get("last_error", "")}
+
+        def run_now(*_):
+            if len(pw.get_text()) < 8:
+                note.set_markup("<span foreground='#e01b24'>Set a password of at least 8 characters first.</span>")
+                return
+            self.win.cfg["auto_backup"] = collect()
+            now.set_sensitive(False)
+            now.set_label("Backing up…")
+
+            def work():
+                self.chat.run_auto_backup()
+                c2 = self.win.cfg.get("auto_backup") or {}
+                GLib.idle_add(lambda: (now.set_label("Back up now"), now.set_sensitive(True), note.set_markup(
+                    f"<small>{'✓ Saved: ' + esc(c2.get('last_ok', '')) if not c2.get('last_error') else '✗ ' + esc(c2['last_error'])}</small>"))
+                    and False)
+            threading.Thread(target=work, daemon=True).start()
+        now.connect("clicked", run_now)
+        while True:
+            r = d.run()
+            if r != Gtk.ResponseType.OK:
+                break
+            if on.get_active() and len(pw.get_text()) < 8:
+                note.set_markup("<span foreground='#e01b24'>Automatic backups need a password of at least 8 characters.</span>")
+                continue
+            self.win.cfg["auto_backup"] = collect()
+            write_json(CONFIG_FILE, self.win.cfg)
+            break
+        d.destroy()
 
     def add_friend(self, pid):
         def work():
@@ -10539,7 +11156,8 @@ class ChatPanel(Gtk.Box):
             self.more_menu.show_all()
             return
         owner = self.chat.is_owner(self.gid)
-        for label, cb in (("Search and filter…", lambda: self.find_btn.set_active(True)),
+        for label, cb in (("Wallpaper for this chat…", lambda: self.choose_wallpaper(self.gid)),
+                          ("Search and filter…", lambda: self.find_btn.set_active(True)),
                           ("Select messages…", lambda: self.set_select(True)),
                           ("Clear chat…", lambda: self.win.confirm("Delete all messages here from this computer?")
                            and self.chat.clear_chat(self.gid))):
@@ -10681,6 +11299,28 @@ class ChatPanel(Gtk.Box):
             you = " (you)" if did == self.chat.me else ""
             lbl.set_markup(f"<b>{esc(m['name'])}</b>{you}\n<small>{role} · {esc(m.get('os', ''))}</small>")
             row.pack_start(lbl, True, True, 0)
+            if did != self.chat.me and did not in self.chat.contacts["friends"]:
+                rel = self.chat.relation(did)
+                fb = Gtk.Button(label={"outgoing": "Request sent", "incoming": "Accept"}.get(rel, "Add friend"))
+                fb.set_sensitive(rel != "outgoing")
+                fb.set_tooltip_text("Send a friend request (works across networks: the group knows their address)")
+
+                def befriend(b, d=did, n=m["name"], pub=m.get("pub")):
+                    if self.chat.relation(d) == "incoming":
+                        self.chat.accept_request(d)
+                        b.set_label("Friends ✓")
+                        return
+                    if d not in self.chat.people:
+                        o = self.chat.online.get(d) or {}
+                        self.chat.people[d] = {"name": n, "ip": o.get("ip"), "port": o.get("port"), "ph": "",
+                                               "os": "", "seen": o.get("seen", 0), "hidden": True}
+                    b.set_sensitive(False)
+                    b.set_label("Sending…")
+                    threading.Thread(target=lambda: GLib.idle_add(
+                        lambda r=self.chat.send_request(d): b.set_label("Request sent" if r[0] else "Not reachable")
+                        or False), daemon=True).start()
+                fb.connect("clicked", befriend)
+                row.add(fb)
             if owner and did != self.chat.me:
                 rm = Gtk.Button(label="Remove")
                 rm.connect("clicked", lambda _b, d=did, n=m["name"]: (
@@ -10689,8 +11329,44 @@ class ChatPanel(Gtk.Box):
                 row.add(rm)
             lb.add(row)
         dlg.get_content_area().add(lb)
+        if owner and not g.get("removed"):
+            addf = Gtk.Button(label="＋ Add from my friends…", margin=10)
+            addf.get_style_context().add_class("suggested-action")
+            addf.connect("clicked", lambda *_: (dlg.destroy(), self.add_friends_dialog()))
+            dlg.get_content_area().add(addf)
         dlg.connect("response", lambda d, r: d.destroy())
         dlg.show_all()
+
+    def add_friends_dialog(self):
+        g = self.chat.groups.get(self.gid)
+        friends = [(pid, f) for pid, f in self.chat.contacts["friends"].items() if pid not in g.get("members", {})]
+        if not friends:
+            self.win.info("All your friends are already in this group (or you have no friends yet: add some in 👥 People).")
+            return
+        d = Gtk.Dialog(title=f"Add friends to {g['name']}", transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=12)
+        checks = []
+        for pid, f in sorted(friends, key=lambda kv: kv[1]["name"].lower()):
+            row = Gtk.Box(spacing=8)
+            cb = Gtk.CheckButton()
+            row.add(cb)
+            row.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(f["name"], self.chat.avatar_file(pid), 32)))
+            row.add(Gtk.Label(label=f["name"], xalign=0))
+            box.add(row)
+            checks.append((pid, cb))
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=44)
+        note.set_markup("<small>They're added straight away (friends trust each other); anyone can leave a group. "
+                        "Friends who are offline get added when they're next online.</small>")
+        box.add(note)
+        d.get_content_area().add(box)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK:
+            n = self.chat.add_friends_to_group(self.gid, [pid for pid, cb in checks if cb.get_active()])
+            if n:
+                self.win.flash_all(f"Added {n} friend{'s' if n != 1 else ''} to “{g['name']}”")
+        d.destroy()
 
 
 class CallWindow(Gtk.Window):
@@ -11049,6 +11725,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.chat_windows = []
         self.setup_tray()
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
+        GLib.timeout_add_seconds(90, self._auto_backup_tick)
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -13142,6 +13819,22 @@ class MainWindow(Gtk.ApplicationWindow):
             p.refresh()
         self.update_chat_button()
         return False
+
+    def _auto_backup_tick(self):
+        if self.chat.auto_backup_due() and not getattr(self, "_backing_up", False):
+            self._backing_up = True
+
+            def work():
+                try:
+                    self.chat.run_auto_backup()
+                finally:
+                    self._backing_up = False
+            threading.Thread(target=work, daemon=True).start()
+        if not getattr(self, "_backup_timer_long", False):
+            self._backup_timer_long = True
+            GLib.timeout_add_seconds(1800, self._auto_backup_tick)       # then check every half hour
+            return False
+        return True
 
     def _chat_lock_tick(self):
         self.chat.check_auto_lock()

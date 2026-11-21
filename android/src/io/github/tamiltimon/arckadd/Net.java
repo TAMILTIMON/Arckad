@@ -195,22 +195,27 @@ final class Net {
 
     // ================================================================= addresses
     static List<String> lanAddresses() {
-        List<String> wifi = new ArrayList<>(), other = new ArrayList<>();
+        // any real address counts (office networks use all kinds of ranges, e.g. 128.128.x.x); Wi-Fi first,
+        // mobile data last, self-assigned 169.254.x.x never
+        List<String> wifi = new ArrayList<>(), other = new ArrayList<>(), cell = new ArrayList<>();
         try {
             for (Enumeration<NetworkInterface> e = NetworkInterface.getNetworkInterfaces(); e.hasMoreElements(); ) {
                 NetworkInterface ni = e.nextElement();
                 if (!ni.isUp() || ni.isLoopback()) continue;
+                String name = ni.getName();
                 for (Enumeration<InetAddress> a = ni.getInetAddresses(); a.hasMoreElements(); ) {
                     InetAddress ad = a.nextElement();
-                    if (!(ad instanceof Inet4Address)) continue;
+                    if (!(ad instanceof Inet4Address) || ad.isLinkLocalAddress() || ad.isLoopbackAddress()) continue;
                     String ip = ad.getHostAddress();
-                    if (ni.getName().startsWith("wlan") || ni.getName().startsWith("ap") || ni.getName().startsWith("swlan")) wifi.add(ip);
-                    else if (ad.isSiteLocalAddress()) other.add(ip);
+                    if (name.startsWith("wlan") || name.startsWith("ap") || name.startsWith("swlan") || name.startsWith("wifi")) wifi.add(ip);
+                    else if (name.startsWith("rmnet") || name.startsWith("ccmni") || name.startsWith("pdp") || name.startsWith("v4-rmnet")) cell.add(ip);
+                    else other.add(ip);
                 }
             }
         } catch (Exception ignored) {
         }
         wifi.addAll(other);
+        wifi.addAll(cell);
         if (wifi.isEmpty()) wifi.add("127.0.0.1");
         return wifi;
     }

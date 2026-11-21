@@ -52,7 +52,8 @@ import java.util.Locale;
 /** The Chat tab: chats (friends and groups), a conversation, People, your profile. The same chats as the
  *  desktop app: phones and computers talk to each other. */
 final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
-    static final int REQ_ATTACH = 7101, REQ_PHOTO = 7102;
+    static final int REQ_ATTACH = 7101, REQ_PHOTO = 7102, REQ_WALL = 7104;
+    private String wallFor;                         // which chat a wallpaper picture is for (null = all chats)
     static final String[] STICKERS = {"approved", "done", "thanks", "great", "onit", "urgent", "question", "meeting",
             "lunch", "coffee", "welcome", "birthday", "noted", "later", "yes", "no"};
     private static final int[] AV_COLOURS = {0xff1c71d8, 0xff26a269, 0xffc64600, 0xff9141ac, 0xff0e8a84, 0xffa51d2d,
@@ -141,6 +142,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             t.addView(n);
             t.addView(Ui.text(a, subtitle(gid), 12, Ui.DIM, false));
             bar.addView(t, MainActivity.grow());
+            bar.addView(Ui.icon(a, "🔒", "Lock chat", v -> lockNow()));
             bar.addView(Ui.icon(a, "⋮", "More", v -> convMenu()));
         } else if ("people".equals(page)) {
             bar.addView(Ui.icon(a, "←", "Back", v -> show("list", null)));
@@ -153,6 +155,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             bar.addView(me, new LinearLayout.LayoutParams(Ui.dp(a, 42), Ui.dp(a, 34)));
             bar.addView(a.title("Chats"), MainActivity.grow());
             int req = e.incoming().length();
+            bar.addView(Ui.icon(a, "🔒", "Lock chat (or set a PIN)", v -> lockNow()));
             bar.addView(Ui.icon(a, req > 0 ? "👥" + req : "👥", "People", v -> showPeople()));
             bar.addView(Ui.icon(a, "＋", "New", v -> plusMenu()));
             bar.addView(Ui.icon(a, "⋮", "More", v -> listMenu()));
@@ -162,6 +165,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     // ================================================================= pages
     private void render() {
         root.removeAllViews();
+        if (e.isLocked()) {
+            renderLocked();
+            return;
+        }
         if ("conv".equals(page) && gid != null && e.groups.containsKey(gid)) renderConv();
         else if ("people".equals(page)) renderPeople();
         else {
@@ -301,7 +308,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         msgBox.setOrientation(LinearLayout.VERTICAL);
         msgBox.setPadding(Ui.dp(a, 8), Ui.dp(a, 6), Ui.dp(a, 8), Ui.dp(a, 6));
         msgScroll.addView(msgBox);
-        col.addView(msgScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+        FrameLayout wall = new FrameLayout(a);
+        applyWallpaper(wall);
+        wall.addView(msgScroll);
+        col.addView(wall, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         String lastDay = "";
         List<JSONObject> list = new ArrayList<>(e.msgs.getOrDefault(gid, new ArrayList<>()));
         e.markRead(gid);
@@ -644,19 +654,227 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 e.sendFiles(target, files);
             });
         } else if (req == REQ_PHOTO && !uris.isEmpty()) {
-            try (InputStream in = a.getContentResolver().openInputStream(uris.get(0))) {
-                Bitmap src = BitmapFactory.decodeStream(in);
-                int side = Math.min(src.getWidth(), src.getHeight());
-                Bitmap sq = Bitmap.createBitmap(src, (src.getWidth() - side) / 2, (src.getHeight() - side) / 2, side, side);
-                Bitmap small = Bitmap.createScaledBitmap(sq, 256, 256, true);
-                ByteArrayOutputStream out = new ByteArrayOutputStream();
-                small.compress(Bitmap.CompressFormat.JPEG, 88, out);
-                pendingPhoto = out.toByteArray();
-                if (afterPhoto != null) afterPhoto.run();
-            } catch (Exception ex) {
+            Bitmap src = loadUpright(uris.get(0), 1600);
+            if (src == null) {
                 Ui.toast(a, "That photo couldn't be used");
+                return;
             }
+            CropView cv = new CropView(a, src);
+            LinearLayout box = new LinearLayout(a);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.addView(cv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(a, 340)));
+            box.addView(Ui.text(a, "Drag to move · pinch to zoom", 13, Ui.DIM, false));
+            Ui.dialog(a).setTitle("Crop your photo").setView(box)
+                    .setNeutralButton("↻ Rotate", null)
+                    .setPositiveButton("Use this photo", (d, w) -> {
+                        ByteArrayOutputStream out = new ByteArrayOutputStream();
+                        cv.result(512).compress(Bitmap.CompressFormat.JPEG, 90, out);
+                        pendingPhoto = out.toByteArray();
+                        if (afterPhoto != null) afterPhoto.run();
+                    }).setNegativeButton("Cancel", null).show()
+                    .getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> cv.rotate());
+        } else if (req == REQ_WALL && !uris.isEmpty()) {
+            File folder = new File(new File(a.getFilesDir(), "chat"), "wallpapers");
+            folder.mkdirs();
+            File f = new File(folder, "wall-" + System.currentTimeMillis() + ".jpg");
+            Bitmap b = loadUpright(uris.get(0), 1600);
+            if (b == null) return;
+            try (FileOutputStream out = new FileOutputStream(f)) {
+                b.compress(Bitmap.CompressFormat.JPEG, 88, out);
+            } catch (Exception ignored) {
+                return;
+            }
+            setWallpaper(wallFor, "file:" + f.getPath());
         }
+    }
+
+    /** A picture the right way up: phones save photos sideways plus a note to rotate them (EXIF). */
+    private Bitmap loadUpright(Uri u, int maxPx) {
+        try {
+            BitmapFactory.Options o = new BitmapFactory.Options();
+            o.inJustDecodeBounds = true;
+            try (InputStream in = a.getContentResolver().openInputStream(u)) {
+                BitmapFactory.decodeStream(in, null, o);
+            }
+            int s = 1;
+            while (o.outWidth / (s * 2) >= maxPx || o.outHeight / (s * 2) >= maxPx) s *= 2;
+            BitmapFactory.Options o2 = new BitmapFactory.Options();
+            o2.inSampleSize = s;
+            Bitmap b;
+            try (InputStream in = a.getContentResolver().openInputStream(u)) {
+                b = BitmapFactory.decodeStream(in, null, o2);
+            }
+            if (b == null) return null;
+            int deg = 0;
+            try (InputStream in = a.getContentResolver().openInputStream(u)) {
+                android.media.ExifInterface ex = new android.media.ExifInterface(in);
+                int or = ex.getAttributeInt(android.media.ExifInterface.TAG_ORIENTATION, android.media.ExifInterface.ORIENTATION_NORMAL);
+                deg = or == android.media.ExifInterface.ORIENTATION_ROTATE_90 ? 90 : or == android.media.ExifInterface.ORIENTATION_ROTATE_180 ? 180
+                        : or == android.media.ExifInterface.ORIENTATION_ROTATE_270 ? 270 : 0;
+            } catch (Exception ignored) {
+            }
+            if (deg != 0) {
+                android.graphics.Matrix m = new android.graphics.Matrix();
+                m.postRotate(deg);
+                b = Bitmap.createBitmap(b, 0, 0, b.getWidth(), b.getHeight(), m, true);
+            }
+            return b;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // ---------- wallpaper
+    private static final Object[][] WALLS = {{"none", "None", 0, ""}, {"sky", "Sky", 0xffdbeafe, "dots"},
+            {"mint", "Mint", 0xffd1fae5, "waves"}, {"sand", "Sand", 0xfffef3c7, "diagonal"}, {"rose", "Rose", 0xfffce7f3, "dots"},
+            {"slate", "Slate", 0xffcbd5e1, "grid"}, {"night", "Night", 0xff1e293b, "dots"}, {"forest", "Forest", 0xff14532d, "waves"}};
+
+    private String wallpaperId(String g) {
+        String per = g == null ? "" : Ui.prefs(a).getString("chat_wall_" + g, "");
+        return per.isEmpty() ? Ui.prefs(a).getString("chat_wall", "none") : per;
+    }
+
+    private void setWallpaper(String g, String id) {
+        Ui.prefs(a).edit().putString(g == null ? "chat_wall" : "chat_wall_" + g, id).apply();
+        render();
+    }
+
+    private android.graphics.drawable.Drawable tile(Object[] w) {
+        int px = Ui.dp(a, 40), colour = (Integer) w[2];
+        Bitmap b = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(b);
+        c.drawColor(colour);
+        boolean dark = colour == 0xff1e293b || colour == 0xff14532d;
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        p.setColor(dark ? 0x1affffff : 0x12000000);
+        p.setStrokeWidth(Ui.dp(a, 1.5f));
+        p.setStyle(Paint.Style.STROKE);
+        float u = px / 40f;
+        switch ((String) w[3]) {
+            case "dots":
+                p.setStyle(Paint.Style.FILL);
+                c.drawCircle(10 * u, 10 * u, 2.2f * u, p);
+                c.drawCircle(30 * u, 30 * u, 2.2f * u, p);
+                break;
+            case "waves":
+                android.graphics.Path path = new android.graphics.Path();
+                path.moveTo(0, 20 * u);
+                path.quadTo(10 * u, 12 * u, 20 * u, 20 * u);
+                path.quadTo(30 * u, 28 * u, 40 * u, 20 * u);
+                c.drawPath(path, p);
+                break;
+            case "diagonal":
+                c.drawLine(0, 40 * u, 40 * u, 0, p);
+                break;
+            default:
+                c.drawLine(0, 0, 40 * u, 0, p);
+                c.drawLine(0, 0, 0, 40 * u, p);
+        }
+        android.graphics.drawable.BitmapDrawable d = new android.graphics.drawable.BitmapDrawable(a.getResources(), b);
+        d.setTileModeXY(android.graphics.Shader.TileMode.REPEAT, android.graphics.Shader.TileMode.REPEAT);
+        return d;
+    }
+
+    private void applyWallpaper(FrameLayout wall) {
+        String id = wallpaperId(gid);
+        if (id.startsWith("file:")) {
+            Bitmap b = decode(new File(id.substring(5)), Ui.dp(a, 900));
+            if (b != null) {
+                ImageView iv = new ImageView(a);
+                iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                iv.setImageBitmap(b);
+                wall.addView(iv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            }
+            return;
+        }
+        for (Object[] w : WALLS) if (w[0].equals(id) && !"none".equals(id)) wall.setBackground(tile(w));
+    }
+
+    private void chooseWallpaper(String g) {
+        String[] names = new String[WALLS.length + 1 + (g != null ? 1 : 0)];
+        for (int i = 0; i < WALLS.length; i++) names[i] = (String) WALLS[i][1];
+        names[WALLS.length] = "📷 Your own picture…";
+        if (g != null) names[WALLS.length + 1] = "Use the general wallpaper";
+        Ui.dialog(a).setTitle(g == null ? "Chat wallpaper (all chats)" : "Wallpaper for this chat").setItems(names, (d, w) -> {
+            if (w < WALLS.length) setWallpaper(g, (String) WALLS[w][0]);
+            else if (w == WALLS.length) {
+                wallFor = g;
+                a.startActivityForResult(Intent.createChooser(new Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), "Choose a picture"), REQ_WALL);
+            } else setWallpaper(g, "");
+        }).show();
+    }
+
+    // ---------- lock
+    private void lockNow() {
+        if (e.hasPin()) e.lockNow();
+        else pinSettings();
+    }
+
+    private void renderLocked() {
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER);
+        TextView t = Ui.text(a, "🔒\nChat is locked", 22, Ui.TEXT, true);
+        t.setGravity(Gravity.CENTER);
+        box.addView(t);
+        EditText pin = new EditText(a);
+        pin.setHint("PIN");
+        pin.setGravity(Gravity.CENTER);
+        pin.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        pin.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(4)});
+        TextView msg = Ui.text(a, "Type your 4-digit PIN", 14, Ui.DIM, false);
+        msg.setGravity(Gravity.CENTER);
+        pin.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int st, int c, int af) {
+            }
+
+            public void onTextChanged(CharSequence s, int st, int b, int c) {
+            }
+
+            public void afterTextChanged(android.text.Editable s) {
+                if (s.length() == 4) {
+                    String err = e.unlock(s.toString());
+                    if (err != null) {
+                        msg.setText(err);
+                        s.clear();
+                    }
+                }
+            }
+        });
+        box.addView(pin, new LinearLayout.LayoutParams(Ui.dp(a, 160), ViewGroup.LayoutParams.WRAP_CONTENT));
+        box.addView(msg);
+        box.addView(Ui.button(a, "Forgot PIN?", false, v -> Ui.confirm(a, "Reset the chat lock?",
+                "The PIN is removed and the chat history on this phone is deleted, so nobody can use “forgot PIN” to read "
+                        + "your messages. Friends and groups stay.", "Reset", e::resetLockAndHistory)));
+        root.addView(box, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        pin.requestFocus();
+    }
+
+    private void pinSettings() {
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
+        box.addView(Ui.text(a, "Protect your chats on this phone with a 4-digit PIN. While locked, notifications don't "
+                + "show names or messages.", 13, Ui.DIM, false));
+        EditText p1 = new EditText(a), p2 = new EditText(a);
+        for (EditText p : new EditText[]{p1, p2}) {
+            p.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+            p.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(4)});
+            box.addView(p);
+        }
+        p1.setHint("New 4-digit PIN");
+        p2.setHint("Type it again");
+        android.app.AlertDialog.Builder b = Ui.dialog(a).setTitle("Chat lock").setView(box).setPositiveButton("Save", (d, w) -> {
+            String x = p1.getText().toString();
+            if (x.length() != 4 || !x.equals(p2.getText().toString())) {
+                Ui.toast(a, "The two PINs must match and have 4 digits");
+                return;
+            }
+            e.setPin(x);
+            Ui.toast(a, "🔒 Chat lock is on");
+        }).setNegativeButton("Cancel", null);
+        if (e.hasPin()) b.setNeutralButton("Remove PIN", (d, w) -> e.removePin());
+        b.show();
     }
 
     private String displayName(Uri u) {
@@ -684,8 +902,17 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     }
 
     private void listMenu() {
-        String[] items = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings"};
+        String[] items = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
+                "Chat wallpaper", "Chat lock (PIN)"};
         Ui.dialog(a).setItems(items, (d, w) -> {
+            if (w == 3) {
+                chooseWallpaper(null);
+                return;
+            }
+            if (w == 4) {
+                pinSettings();
+                return;
+            }
             if (w == 0) editProfile(null);
             else if (w == 1) {
                 Ui.info(a, "Keep chat connected", "Some phones stop apps in the background to save battery. In the list "
@@ -747,6 +974,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                         ChatEngine.bg(() -> e.leaveGroup(target));
                     }));
         }
+        labels.add("Wallpaper for this chat");
+        acts.add(() -> chooseWallpaper(gid));
         labels.add("Open received files");
         acts.add(() -> a.openFolder(e.filesDir(gid)));
         Ui.dialog(a).setItems(labels.toArray(new String[0]), (d, w) -> acts.get(w).run()).show();
@@ -768,6 +997,25 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             LinearLayout row = new LinearLayout(a);
             row.setGravity(Gravity.CENTER_VERTICAL);
             row.addView(t, MainActivity.grow());
+            if (!did.equals(e.me) && !e.friends().has(did)) {
+                String rel = e.relation(did);
+                row.addView(Ui.button(a, "outgoing".equals(rel) ? "Sent" : "incoming".equals(rel) ? "Accept" : "Add friend", false, v -> {
+                    if ("incoming".equals(e.relation(did))) {
+                        e.acceptRequest(did);
+                        return;
+                    }
+                    if (!e.people.containsKey(did)) {
+                        JSONObject o = e.online.get(did);
+                        e.people.put(did, new Obj().putOpt("name", m.optString("name")).putOpt("ip", o == null ? "" : o.optString("ip"))
+                                .putOpt("port", o == null ? 0 : o.optInt("port")).putOpt("ph", "").putOpt("os", "").putOpt("seen", 0).putOpt("hidden", true));
+                    }
+                    Ui.toast(a, "Sending…");
+                    ChatEngine.bg(() -> {
+                        String err = e.sendRequest(did);
+                        a.runOnUiThread(() -> Ui.toast(a, err == null ? "Friend request sent ✓" : err));
+                    });
+                }));
+            }
             if (e.isOwner(gid) && !did.equals(e.me)) row.addView(Ui.button(a, "Remove", false, v -> Ui.confirm(a,
                     "Remove " + m.optString("name") + "?", "They can't read anything new in this group.", "Remove", () -> {
                         d[0].dismiss();
@@ -775,7 +1023,35 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                     })));
             box.addView(row, Ui.matchWrap(a, 6));
         }
-        d[0] = Ui.dialog(a).setTitle("Members of " + g.optString("name")).setView(box).setPositiveButton("Close", null).show();
+        android.app.AlertDialog.Builder db = Ui.dialog(a).setTitle("Members of " + g.optString("name")).setView(box).setPositiveButton("Close", null);
+        if (e.isOwner(gid) && !g.optBoolean("removed")) db.setNeutralButton("Add friends", (x, w) -> addFriendsToGroup());
+        d[0] = db.show();
+    }
+
+    private void addFriendsToGroup() {
+        JSONObject g = e.groups.get(gid);
+        List<String> ids = new ArrayList<>();
+        for (Iterator<String> it = e.friends().keys(); it.hasNext(); ) {
+            String pid = it.next();
+            if (!g.optJSONObject("members").has(pid)) ids.add(pid);
+        }
+        if (ids.isEmpty()) {
+            Ui.info(a, "Add friends", "All your friends are already in this group (or you have no friends yet).");
+            return;
+        }
+        String[] names = new String[ids.size()];
+        boolean[] pick = new boolean[ids.size()];
+        for (int i = 0; i < ids.size(); i++) names[i] = e.friends().optJSONObject(ids.get(i)).optString("name");
+        Ui.dialog(a).setTitle("Add friends to " + g.optString("name")).setMultiChoiceItems(names, pick, (d, w, on) -> pick[w] = on)
+                .setPositiveButton("Add", (d, w) -> {
+                    List<String> chosen = new ArrayList<>();
+                    for (int i = 0; i < pick.length; i++) if (pick[i]) chosen.add(ids.get(i));
+                    String target = gid;
+                    ChatEngine.bg(() -> {
+                        int n = e.addFriendsToGroup(target, chosen);
+                        a.runOnUiThread(() -> Ui.toast(a, "Added " + n + (n == 1 ? " friend" : " friends")));
+                    });
+                }).setNegativeButton("Cancel", null).show();
     }
 
     private void newGroup() {
@@ -886,6 +1162,24 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         });
     }
 
+    private void addWithProfileCode() {
+        EditText in = new EditText(a);
+        in.setHint("AR-XXXX-XXXX-XXXXX");
+        in.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS);
+        Ui.dialog(a).setTitle("Add with a profile code").setView(in).setPositiveButton("Send friend request", (d, w) -> {
+            String code = in.getText().toString();
+            Ui.toast(a, "Looking up the code…");
+            ChatEngine.bg(() -> {
+                String err = e.addByProfileCode(code);
+                a.runOnUiThread(() -> {
+                    if (err == null) Ui.info(a, "Friend request sent ✓", "You'll be friends when they accept.");
+                    else Ui.info(a, "Couldn't send the request", err);
+                    render();
+                });
+            });
+        }).setNegativeButton("Cancel", null).show();
+    }
+
     // ---------- people
     private void showPeople() {
         if (!e.profile.optBoolean("setup")) {
@@ -902,7 +1196,20 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(Ui.dp(a, 12), 0, Ui.dp(a, 12), Ui.dp(a, 12));
         sc.addView(box);
-        section(box, "Add a friend with a code (any network, other VLANs too)");
+        section(box, "Your profile code (anyone can send you a friend request with it, from any network)");
+        String pcode = e.profileCode();
+        TextView pc = Ui.text(a, pcode == null ? "Connect to Wi-Fi to get your code" : pcode, 20, Ui.TEXT, true);
+        pc.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        pc.setTextIsSelectable(true);
+        box.addView(pc);
+        if (pcode != null) box.addView(Ui.row(a, Ui.button(a, "Copy", false, v -> {
+            android.content.ClipboardManager cm = (android.content.ClipboardManager) a.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("profile code", pcode));
+            Ui.toast(a, "Profile code copied");
+        }), Ui.button(a, "Share", false, v -> a.startActivity(Intent.createChooser(new Intent(Intent.ACTION_SEND).setType("text/plain")
+                .putExtra(Intent.EXTRA_TEXT, "Add me on Arckad-D: " + pcode), "Share your profile code"))),
+                Ui.button(a, "Add with a code", true, v -> addWithProfileCode())));
+        section(box, "Add a friend with a one-time code");
         box.addView(Ui.row(a, Ui.button(a, "Show my friend code", false, v -> showFriendCode()),
                 Ui.button(a, "Enter a friend code", false, v -> enterFriendCode())));
         JSONObject inc = e.incoming();
