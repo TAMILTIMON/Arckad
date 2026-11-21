@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.25.0"
+APP_VERSION = "3.26.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -9363,6 +9363,201 @@ class LinkedDevices:
         return reply({"ok": False, "reason": "unknown"})
 
 
+# ---------------------------------------------------------------- Ubuntu Search Guard (keeps Tracker in check)
+# Tracker (GNOME's file indexer, "localsearch" in newer GNOME) sometimes grows its database without limit or
+# crashes in a loop leaving big crash dumps, until the disk is full. Arckad-D doesn't use Tracker; this guard
+# watches it and keeps it small: clean-ups, a gentle "limited" mode, or switching it off.
+TRACKER_UNITS = ["tracker-miner-fs-3.service", "tracker-extract-3.service", "tracker-miner-fs-control-3.service",
+                 "tracker-miner-rss-3.service", "localsearch-3.service", "localsearch-control-3.service"]
+TRACKER_SCHEMA = "org.freedesktop.Tracker3.Miner.Files"
+TRACKER_LIMIT_IGNORE = ["*.iso", "*.img", "*.vmdk", "*.vdi", "*.qcow2", "*.vhd", "*.vhdx", "*.arckadprofile",
+                        "*.arckadchat", "*.part", "*.crdownload", "*.tmp"]
+TRACKER_GUARD_DB_LIMIT = 2 * 1024 ** 3          # 2 GB: far more than a healthy Tracker database needs
+
+
+def _tree_size(p):
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(p):
+            for f in files:
+                try:
+                    total += os.lstat(os.path.join(root, f)).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def tracker_db_dirs():
+    return [Path(GLib.get_user_cache_dir()) / "tracker3", Path(GLib.get_user_data_dir()) / "tracker3",
+            Path(GLib.get_user_cache_dir()) / "localsearch"]
+
+
+def tracker_dumps():
+    """Tracker crash files: (path, size, mine). /var/lib/systemd/coredump needs the password to delete."""
+    out = []
+    for folder in ("/var/crash", "/var/lib/systemd/coredump"):
+        try:
+            for name in os.listdir(folder):
+                low = name.lower()
+                if "tracker" in low or "localsearch" in low:
+                    p = os.path.join(folder, name)
+                    try:
+                        st = os.stat(p)
+                        out.append((p, st.st_size, st.st_uid == os.getuid()))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return out
+
+
+def _systemctl(*args):
+    try:
+        r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=20)
+        return r.returncode, r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+
+
+def _gsettings(*args):
+    try:
+        r = subprocess.run(["gsettings", *args], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0, r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+
+
+def tracker_present():
+    if IS_WIN:
+        return False
+    return bool(shutil.which("tracker3") or shutil.which("localsearch")
+                or any(Path(d, "systemd/user", u).exists() for d in ("/usr/lib", "/lib") for u in TRACKER_UNITS))
+
+
+def tracker_mode():
+    """'off', 'limited' or 'normal'."""
+    code, out = _systemctl("is-enabled", TRACKER_UNITS[0])
+    if out.strip() == "masked":
+        return "off"
+    ok, thr = _gsettings("get", TRACKER_SCHEMA, "throttle")
+    if ok and thr.strip().split()[-1:] == ["20"]:
+        return "limited"
+    return "normal"
+
+
+def tracker_status():
+    db = sum(_tree_size(d) for d in tracker_db_dirs())
+    dumps = tracker_dumps()
+    try:
+        st = os.statvfs(str(HOME))
+        free, total = st.f_bavail * st.f_frsize, st.f_blocks * st.f_frsize
+    except OSError:
+        free, total = 0, 1
+    return {"present": tracker_present(), "db": db, "dumps": sum(s for _p, s, _m in dumps), "dump_files": dumps,
+            "free": free, "total": total, "mode": tracker_mode() if tracker_present() else "absent"}
+
+
+def tracker_problem(st=None):
+    """A short reason when Tracker needs attention, else None."""
+    st = st or tracker_status()
+    if not st["present"]:
+        return None
+    big = st["db"] + st["dumps"]
+    if st["db"] > TRACKER_GUARD_DB_LIMIT:
+        return f"Ubuntu's search indexer (Tracker) has grown to {human_size(st['db'])}."
+    if st["dumps"] > 500 * 1024 ** 2:
+        return f"Ubuntu's search indexer (Tracker) keeps crashing: its crash files use {human_size(st['dumps'])}."
+    if st["free"] < 0.08 * st["total"] and big > 1024 ** 3:
+        return f"The disk is nearly full and Tracker uses {human_size(big)} of it."
+    return None
+
+
+def tracker_clean(remove_system_dumps=False):
+    """Stop Tracker, delete its (oversized) database and crash files; it rebuilds a small one. Returns freed bytes."""
+    before = tracker_status()
+    _systemctl("stop", *TRACKER_UNITS)
+    for tool in ("tracker3", "localsearch"):
+        if shutil.which(tool):
+            try:
+                subprocess.run([tool, "daemon", "-t"], capture_output=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    for d in tracker_db_dirs():
+        shutil.rmtree(d, ignore_errors=True)
+    root_owned = []
+    for p, _s, mine in tracker_dumps():
+        if mine:
+            try:
+                os.remove(p)
+            except OSError:
+                root_owned.append(p)
+        else:
+            root_owned.append(p)
+    if remove_system_dumps and root_owned and shutil.which("pkexec"):
+        try:
+            subprocess.run(["pkexec", "sh", "-c",
+                            "rm -f /var/crash/*tracker* /var/crash/*localsearch* "
+                            "/var/lib/systemd/coredump/*tracker* /var/lib/systemd/coredump/*localsearch*; "
+                            "journalctl --vacuum-size=300M >/dev/null 2>&1 || true"],
+                           capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if tracker_mode() != "off":
+        _systemctl("start", "tracker-miner-fs-3.service")
+    after = tracker_status()
+    return max(0, (before["db"] + before["dumps"]) - (after["db"] + after["dumps"]))
+
+
+def tracker_set_mode(mode, cfg):
+    """normal | limited | off. The previous indexing settings are remembered so "normal" puts them back."""
+    if mode == "off":
+        _systemctl("stop", *TRACKER_UNITS)
+        _systemctl("mask", *TRACKER_UNITS)
+        for d in tracker_db_dirs():
+            shutil.rmtree(d, ignore_errors=True)
+        return
+    _systemctl("unmask", *TRACKER_UNITS)
+    saved = cfg.setdefault("tracker_saved", {})
+    if mode == "limited":
+        for key in ("throttle", "index-on-battery", "index-single-directories", "ignored-files"):
+            if key not in saved:
+                ok, val = _gsettings("get", TRACKER_SCHEMA, key)
+                if ok:
+                    saved[key] = val
+        _gsettings("set", TRACKER_SCHEMA, "throttle", "20")                  # slowest, gentlest
+        _gsettings("set", TRACKER_SCHEMA, "index-on-battery", "false")
+        ok, single = _gsettings("get", TRACKER_SCHEMA, "index-single-directories")
+        if ok and "&DOWNLOAD" in single:                                     # Downloads: big, short-lived files
+            items = [x.strip().strip("'\"") for x in single.strip("@as []").split(",") if x.strip()]
+            items = [x for x in items if x and x != "&DOWNLOAD"]
+            _gsettings("set", TRACKER_SCHEMA, "index-single-directories", "[" + ", ".join(f"'{x}'" for x in items) + "]")
+        ok, ign = _gsettings("get", TRACKER_SCHEMA, "ignored-files")
+        if ok:
+            have = [x.strip().strip("'\"") for x in ign.strip("@as []").split(",") if x.strip()]
+            pats = have + [p for p in TRACKER_LIMIT_IGNORE if p not in have]
+            _gsettings("set", TRACKER_SCHEMA, "ignored-files", "[" + ", ".join(f"'{x}'" for x in pats) + "]")
+    else:
+        for key, val in saved.items():
+            _gsettings("set", TRACKER_SCHEMA, key, val)
+        cfg["tracker_saved"] = {}
+    _systemctl("start", "tracker-miner-fs-3.service")
+
+
+def tracker_ignore_folder(path, on=True):
+    """A .trackerignore file makes Tracker skip a folder (Arckad-D's backups, optionally received chat files)."""
+    marker = Path(path) / ".trackerignore"
+    try:
+        if on:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            marker.touch(exist_ok=True)
+        else:
+            marker.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- Chat panel (right pane and its own window)
 CHAT_CSS = b"""
 .chat-bubble { border-radius: 14px; padding: 6px 11px; }
@@ -12812,6 +13007,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.setup_tray()
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
+        if not IS_WIN:
+            GLib.timeout_add_seconds(120, self._tracker_guard_tick)
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -12955,7 +13152,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Receive files…", lambda: self.open_share(None, "receive")),
             None,
             ("Update search index now", INDEX.rebuild),
-        ]))
+        ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else [])))
         pair = Gtk.Box()
         pair.get_style_context().add_class("linked")
         self.share_btn = Gtk.Button()
@@ -14921,6 +15118,162 @@ class MainWindow(Gtk.ApplicationWindow):
             p.refresh()
         self.update_chat_button()
         return False
+
+    # ---------- Ubuntu Search Guard
+    def _tracker_guard_tick(self):
+        guard = self.cfg.get("tracker_guard", "ask")
+        if guard != "off" and not getattr(self, "_tracker_busy", False):
+            def work():
+                st = tracker_status()
+                problem = tracker_problem(st)
+                for folder in self._arckad_folders_to_hide():
+                    tracker_ignore_folder(folder)
+                if problem:
+                    GLib.idle_add(self._tracker_alert, problem, guard)
+            threading.Thread(target=work, daemon=True).start()
+        if not getattr(self, "_tracker_timer_long", False):
+            self._tracker_timer_long = True
+            GLib.timeout_add_seconds(1800, self._tracker_guard_tick)       # then every 30 minutes
+            return False
+        return True
+
+    def _arckad_folders_to_hide(self):
+        """Arckad-D's own folders that Tracker gains nothing from indexing."""
+        folders = []
+        ab = (self.cfg.get("auto_backup") or {}).get("folder")
+        if ab:
+            folders.append(ab)
+        docs = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+        if docs and os.path.isdir(os.path.join(docs, "Arckad-D Backups")):
+            folders.append(os.path.join(docs, "Arckad-D Backups"))
+        if self.cfg.get("tracker_hide_chat") and os.path.isdir(downloads_dir() / "Arckad-D Chat"):
+            folders.append(str(downloads_dir() / "Arckad-D Chat"))
+        return folders
+
+    def _tracker_alert(self, problem, guard):
+        if guard == "auto":
+            self._tracker_busy = True
+
+            def work():
+                freed = tracker_clean()
+                self._tracker_busy = False
+                GLib.idle_add(lambda: self.notify_desktop("Ubuntu Search Guard",
+                                                          f"{problem} Cleaned up: {human_size(freed)} freed.", None, None)
+                              or False)
+            threading.Thread(target=work, daemon=True).start()
+            return False
+        if getattr(self, "_tracker_alerted", 0) > time.time() - 6 * 3600:      # at most every 6 hours
+            return False
+        self._tracker_alerted = time.time()
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.NONE, text="Your disk is being filled by Ubuntu's search indexer")
+        d.format_secondary_text(problem + "\n\nThis is Ubuntu's Tracker, not Arckad-D. Arckad-D can clean it up now "
+                                "and keep it small from now on.")
+        d.add_buttons("Not now", Gtk.ResponseType.CANCEL, "Open the guard…", Gtk.ResponseType.APPLY,
+                      "Clean up now", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+
+        def respond(dlg, r):
+            dlg.destroy()
+            if r == Gtk.ResponseType.OK:
+                self._tracker_clean_async(False)
+            elif r == Gtk.ResponseType.APPLY:
+                self.tracker_dialog()
+        d.connect("response", respond)
+        d.show_all()
+        return False
+
+    def _tracker_clean_async(self, with_password, done=None):
+        self._tracker_busy = True
+        self.flash_all("Cleaning up Ubuntu's search indexer…")
+
+        def work():
+            freed = tracker_clean(with_password)
+            self._tracker_busy = False
+            GLib.idle_add(lambda: (self.info(f"Cleaned up ✓\n\n{human_size(freed)} freed. Tracker rebuilds a small, "
+                                             "clean index in the background."), done and done()) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def tracker_dialog(self):
+        st = tracker_status()
+        d = Gtk.Dialog(title="Ubuntu search (Tracker) — keep the disk safe", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(560, -1)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
+        intro.set_markup("<b>Tracker</b> is Ubuntu's file indexer (it powers search in Files and Activities). It "
+                         "sometimes grows without limit or crashes in a loop until the disk is full. <b>Arckad-D doesn't "
+                         "use it</b> (it has its own small index) but can keep it in check for you.")
+        box.add(intro)
+        if not st["present"]:
+            box.add(Gtk.Label(label="✓ Tracker isn't installed on this computer: nothing to do.", xalign=0))
+            d.show_all()
+            d.run()
+            d.destroy()
+            return
+        problem = tracker_problem(st)
+        status = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
+        status.set_markup(
+            f"Tracker database: <b>{human_size(st['db'])}</b>   ·   crash files: <b>{human_size(st['dumps'])}</b>\n"
+            f"Free disk space: <b>{human_size(st['free'])}</b> of {human_size(st['total'])}\n"
+            + (f"<span foreground='#e01b24'><b>⚠ {esc(problem)}</b></span>" if problem else
+               "<span foreground='#2ec27e'><b>✓ Healthy</b></span>"))
+        box.add(status)
+        clean = Gtk.Button(label="🧹 Clean up now")
+        clean.get_style_context().add_class("suggested-action" if problem else "")
+        dumps_root = any(not mine for _p, _s, mine in st["dump_files"])
+        sysd = Gtk.CheckButton(label="Also remove system crash files and trim system logs (asks for your password)")
+        sysd.set_active(dumps_root)
+        sysd.set_sensitive(bool(shutil.which("pkexec")))
+        clean.connect("clicked", lambda *_: (d.response(Gtk.ResponseType.CLOSE),
+                                             self._tracker_clean_async(sysd.get_active())))
+        box.add(clean)
+        box.add(sysd)
+        box.add(Gtk.Separator())
+        box.add(Gtk.Label(label="How should Tracker run?", xalign=0))
+        modes = [("limited", "Limited (recommended): gentlest speed, skips Downloads and huge files (ISO, disk images, "
+                             "backups). Search in Files still works for your documents."),
+                 ("normal", "Normal: Ubuntu's default."),
+                 ("off", "Off: Tracker fully stopped. Files still searches by name (slower); Arckad-D search unaffected.")]
+        group = None
+        radios = {}
+        for key, label in modes:
+            rb = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            rb.get_child().set_line_wrap(True)
+            rb.get_child().set_max_width_chars(60)
+            group = group or rb
+            rb.set_active(st["mode"] == key)
+            radios[key] = rb
+            box.add(rb)
+        hide = Gtk.CheckButton(label="Hide files received in chat (Downloads/Arckad-D Chat) from Ubuntu search")
+        hide.set_active(bool(self.cfg.get("tracker_hide_chat")))
+        box.add(hide)
+        box.add(Gtk.Separator())
+        grow = Gtk.Box(spacing=8)
+        grow.add(Gtk.Label(label="If Tracker grows too big again:"))
+        guard = Gtk.ComboBoxText()
+        for k, label in (("ask", "Ask me"), ("auto", "Clean up automatically"), ("off", "Do nothing")):
+            guard.append(k, label)
+        guard.set_active_id(self.cfg.get("tracker_guard", "ask"))
+        grow.add(guard)
+        box.add(grow)
+        d.show_all()
+        d.run()
+        new_mode = next(k for k, rb in radios.items() if rb.get_active())
+        self.cfg["tracker_guard"] = guard.get_active_id()
+        self.cfg["tracker_hide_chat"] = hide.get_active()
+        chat_dir = downloads_dir() / "Arckad-D Chat"
+        if chat_dir.is_dir():
+            tracker_ignore_folder(chat_dir, hide.get_active())
+        d.destroy()
+        if new_mode != st["mode"]:
+            threading.Thread(target=lambda: (tracker_set_mode(new_mode, self.cfg), write_json(CONFIG_FILE, self.cfg)),
+                             daemon=True).start()
+            self.flash_all({"limited": "Tracker: limited mode on", "normal": "Tracker: back to normal",
+                            "off": "Tracker switched off"}[new_mode])
+        write_json(CONFIG_FILE, self.cfg)
 
     def _auto_backup_tick(self):
         if self.chat.auto_backup_due() and not getattr(self, "_backing_up", False):
