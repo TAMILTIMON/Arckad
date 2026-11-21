@@ -33,11 +33,15 @@ final class ChatHub implements ChatEngine.Ui {
         void askJoin(ChatEngine.Ask ev);
 
         void chatEvent(String text);
+
+        void askLink(ChatEngine.Ask ev);
+
+        void relinked();
     }
 
     static final String CH_MSG = "chat-messages", CH_SERVICE = "chat-connection";
     private static ChatHub hub;
-    final ChatEngine engine;
+    volatile ChatEngine engine;
     final Context app;
     final CopyOnWriteArrayList<Listener> listeners = new CopyOnWriteArrayList<>();
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -62,10 +66,44 @@ final class ChatHub implements ChatEngine.Ui {
             }
             if (name == null || name.isEmpty()) name = Build.MODEL;
         }
-        File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
         ChatEngine.version = BuildInfo.VERSION;
-        engine = new ChatEngine(new File(c.getFilesDir(), "chat"), dl, p.getString("device_id", "phone"), name, Net.OS, this);
+        if (!p.contains("chat_inst")) p.edit().putString("chat_inst", ChatCrypto.token(6)).apply();
+        engine = build(p.getString("device_id", "phone"), name);
         channels();
+    }
+
+    private ChatEngine build(String deviceId, String name) {
+        File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        ChatEngine e = new ChatEngine(new File(app.getFilesDir(), "chat"), dl, deviceId, name, Net.OS, this);
+        e.inst = Ui.prefs(app).getString("chat_inst", "phone");
+        return e;
+    }
+
+    @Override
+    public void askLink(ChatEngine.Ask ev) {
+        main.post(() -> {
+            if (listeners.isEmpty()) {
+                notify(7002, ev.name + " wants to link to your account", "Open Arckad-D to approve it.", null, "chat");
+                return;
+            }
+            for (Listener l : listeners) {
+                l.askLink(ev);
+                break;
+            }
+        });
+    }
+
+    /** This phone became a linked account (or was unlinked): restart chat with the new identity. */
+    @Override
+    public void relinked(String deviceId) {
+        main.post(() -> {
+            ChatEngine old = engine;
+            old.stop();
+            Ui.prefs(app).edit().putString("device_id", deviceId).apply();
+            engine = build(deviceId, old.deviceName);
+            start();
+            for (Listener l : listeners) l.relinked();
+        });
     }
 
     /** Start chat networking (and keep it running in the background) if chat is in use. */

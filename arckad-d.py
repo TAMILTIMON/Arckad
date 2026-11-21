@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.22.0"
+APP_VERSION = "3.23.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5161,6 +5161,8 @@ def make_pair_handler(pr):
 
         def _post(self):
             path = self.path.split("?")[0]
+            if path.startswith("/t/") and getattr(pr.win, "chat", None):
+                return pr.win.chat.linked.handle_post(self, path)
             if path.startswith(("/c/", "/cj/", "/f/")) and getattr(pr.win, "chat", None):
                 return pr.win.chat.handle_post(self, path)
             if path == "/pair/start":                     # step 1: exchange keys (needs the code to be shown)
@@ -5945,6 +5947,7 @@ class Chat:
         self.fcode_seen = {}
         self.lock_state = {"locked": bool(self.contacts.get("pin")), "fails": 0, "wait_until": 0,
                            "last_use": time.time()}
+        self.linked = LinkedDevices(self)
         self.load()
         threading.Thread(target=self.identity, daemon=True).start()     # make the signing key in the background
 
@@ -6059,7 +6062,8 @@ class Chat:
     def active(self):
         return (any(not g.get("removed") for g in self.groups.values()) or self.join_active()
                 or bool(self.profile.get("setup")) or bool(self.contacts["outgoing"])
-                or bool(self.contacts["friends"]) or self.fcode_active())
+                or bool(self.contacts["friends"]) or self.fcode_active() or bool(self.contacts.get("link"))
+                or getattr(getattr(self, "linked", None), "code_active", lambda: False)())
 
     def is_online(self, did):
         o = self.online.get(did)
@@ -6161,6 +6165,7 @@ class Chat:
             threading.Thread(target=lambda: self._try(lambda: self._request(gid, owner, "POST", "/c/leave", {},
                                                                                  timeout=6)), daemon=True).start()
         time.sleep(0.3)
+        self.linked.tomb("group", gid)
         with self.lock:
             self.groups.pop(gid, None)
             self.msgs.pop(gid, None)
@@ -6358,6 +6363,7 @@ class Chat:
             out["ctags"] = tags
         if self.join_active():
             out["chatjoin"] = hashlib.sha256(f"arckad-chat-code|{self.join['code']}".encode()).hexdigest()[:20]
+        out.update(self.linked.beacon_fields())
         if self.fcode_active():
             out["fcode"] = hashlib.sha256(f"arckad-friend-code|{self.fcode['code']}".encode()).hexdigest()[:20]
         if self.profile.get("setup") and self.profile.get("visible"):
@@ -6389,6 +6395,7 @@ class Chat:
             self.code_seen[str(msg["chatjoin"])] = (ip, int(msg["port"]), time.time())
         if msg.get("fcode") and msg.get("port"):
             self.fcode_seen[str(msg["fcode"])] = (ip, int(msg["port"]), time.time())
+        self.linked.on_udp(msg, ip)
         who = msg.get("who")
         if isinstance(who, dict) and isinstance(who.get("id"), str) and who["id"] != self.me and msg.get("port"):
             self._saw_person(who, ip, int(msg["port"]))
@@ -6410,6 +6417,7 @@ class Chat:
         friend's last known address, so friends on other networks reconnect after restarts."""
         ips = {o["ip"] for o in self.online.values() if o.get("ip")}
         ips |= {f["ip"] for f in self.contacts["friends"].values() if f.get("ip")}
+        ips |= {t["ip"] for t in (self.contacts.get("link") or {}).get("twins", {}).values() if t.get("ip")}
         return ips
 
     def ensure_my_pub(self, gid):
@@ -6442,6 +6450,7 @@ class Chat:
 
     def tick(self):
         """Called every few seconds: keep histories in step with someone online."""
+        self.linked.tick()
         now = time.time()
         if now - self.last_sync < 45:
             return
@@ -6456,6 +6465,8 @@ class Chat:
         import http.client
         o = self.online.get(did) or {}
         ip, port = o.get("ip"), o.get("port")
+        if did == self.me and self.linked.twin_addresses():
+            ip, port = self.linked.twin_addresses()[0]
         if (not ip or not port) and did in self.contacts["friends"]:
             f = self.contacts["friends"][did]
             ip, port = f.get("ip"), f.get("port")
@@ -6630,6 +6641,7 @@ class Chat:
         return str(target)
 
     def _deliver(self, gid, msg):
+        self.linked.push(gid, msg)                    # my other devices get it at once
         g = self.groups.get(gid) or {}
         targets = set(self.online_members(gid))
         if g.get("kind") == "direct" and not g.get("removed"):
@@ -6682,7 +6694,7 @@ class Chat:
             CHAT_DIR.mkdir(parents=True, exist_ok=True)
             sq.scale_simple(256, 256, GdkPixbuf.InterpType.HYPER).savev(str(self.photo_path()), "jpeg",
                                                                         ["quality"], ["88"])
-        self.profile.update({"name": name.strip()[:40], "visible": bool(visible), "setup": True})
+        self.profile.update({"name": name.strip()[:40], "visible": bool(visible), "setup": True, "updated": time.time()})
         self.save_contacts()
         self.pr.last_beacon = 0
         self.start()
@@ -6854,6 +6866,7 @@ class Chat:
             self.ui("on_people_changed")
 
     def decline_request(self, pid):
+        self.linked.tomb("req", pid)
         if self.contacts["incoming"].pop(pid, None) is not None:
             self.save_contacts()
             threading.Thread(target=lambda: self._try(lambda: self._call(pid, "/f/decline", {"id": self.me})),
@@ -6861,6 +6874,7 @@ class Chat:
         self.ui("on_people_changed")
 
     def cancel_request(self, pid):
+        self.linked.tomb("req", pid)
         self.contacts["outgoing"].pop(pid, None)
         self.save_contacts()
         threading.Thread(target=lambda: self._try(lambda: self._call(pid, "/f/cancel", {"id": self.me})),
@@ -7072,6 +7086,8 @@ class Chat:
 
     def mark_read(self, gid):
         """The chat is on screen: everything in it is read (and senders get blue ticks)."""
+        if self.unread.get(gid):
+            self.linked.push_read(gid)
         self.unread[gid] = 0
         changed = False
         for m in self.msgs.get(gid, []):
@@ -7667,6 +7683,7 @@ class Chat:
 
     def _forget_friend(self, pid):
         self.contacts["friends"].pop(pid, None)
+        self.linked.tomb("friend", pid)
         gid = self._direct_gid(pid)
         g = self.groups.get(gid)
         if g:
@@ -8020,6 +8037,7 @@ class Chat:
                 if m["kind"] not in ("system", "delete"):
                     self.unread[gid] = self.unread.get(gid, 0) + 1
                     self.queue_receipt(gid, m["from"], m["id"], "d")
+                self.linked.push(gid, m)
                 self.ui("on_chat_message", gid, m)
                 if m.get("file"):
                     self._maybe_download(gid, m)
@@ -8604,6 +8622,532 @@ class CallStream:
             self.on_end(error)
 
 
+# ---------------------------------------------------------------- Linked devices (one account on PC and phone)
+# Linked devices share one chat identity: to friends and groups they are simply "you". A private twin
+# channel (its own key from the link code) keeps them in step: new messages are pushed at once, history and
+# state (friends, requests, groups, profile, read status) are merged regularly; deletions travel as tombstones.
+def _link_tag(key, bucket):
+    return _hm(key, "twin", bucket).hex()[:24]
+
+
+class LinkedDevices:
+    def __init__(self, chat):
+        self.chat = chat
+        self.code = None                       # {"code", "until", "tries", "pending"} while showing a link code
+        self.seen_codes = {}
+        self.last_sync = 0
+        cfg = chat.win.cfg
+        if not cfg.get("chat_inst"):
+            cfg["chat_inst"] = secrets.token_hex(6)
+            write_json(CONFIG_FILE, cfg)
+
+    # ---------- state
+    @property
+    def inst(self):
+        return self.chat.win.cfg["chat_inst"]
+
+    @property
+    def link(self):
+        return self.chat.contacts.get("link") or {}
+
+    def key(self):
+        k = self.link.get("key")
+        return bytes.fromhex(k) if k else None
+
+    def twins(self):
+        return self.link.get("twins", {})
+
+    def twin_online(self, inst):
+        t = self.twins().get(inst) or {}
+        return time.time() - t.get("seen", 0) < 15
+
+    def twin_addresses(self):
+        return [(t["ip"], t["port"]) for i, t in self.twins().items() if t.get("ip") and t.get("port") and self.twin_online(i)]
+
+    def tomb(self, kind, key):
+        """Remember a deletion so the other device doesn't bring it back."""
+        self.chat.contacts.setdefault("tombs", {}).setdefault(kind, {})[key] = time.time()
+        self.chat.save_contacts()
+
+    # ---------- presence: a tag only my linked devices recognise
+    def beacon_fields(self):
+        out = {}
+        k = self.key()
+        if k:
+            out["twin"] = _link_tag(k, int(time.time() // 30))
+            out["inst"] = self.inst
+        if self.code_active():
+            out["linkcode"] = hashlib.sha256(f"arckad-link-code|{self.code['code']}".encode()).hexdigest()[:20]
+        return out
+
+    def on_udp(self, msg, ip):
+        if msg.get("linkcode") and msg.get("port"):
+            self.seen_codes[str(msg["linkcode"])] = (ip, int(msg["port"]), time.time())
+        k = self.key()
+        inst = str(msg.get("inst", ""))[:20]
+        if not k or not msg.get("twin") or inst == self.inst:
+            return
+        b = int(time.time() // 30)
+        if msg["twin"] not in (_link_tag(k, b), _link_tag(k, b - 1)):
+            return
+        t = self.twins().setdefault(inst, {"name": "linked device", "os": ""})
+        was = self.twin_online(inst)
+        t.update(ip=ip, port=int(msg.get("port") or 0), seen=time.time())
+        if not was:
+            self.chat.save_contacts()
+            self.chat.ui("on_chat_changed", None)
+            threading.Thread(target=self.sync, args=(inst,), daemon=True).start()
+
+    # ---------- linking: the device with the account shows a code, the new device types it
+    def new_code(self):
+        self.chat.start()
+        self.chat.pr.ensure_running()
+        self.code = {"code": f"{secrets.randbelow(1_000_000):06d}", "until": time.time() + 600, "tries": 0, "pending": {}}
+        self.chat.pr.last_beacon = 0
+        return self.code["code"]
+
+    def code_active(self):
+        return bool(self.code) and time.time() < self.code["until"]
+
+    def bundle(self):
+        """Everything the new device needs to become this account."""
+        c = self.chat
+        contacts = {k: v for k, v in c.contacts.items() if k not in ("link", "pin")}
+        groups = {}
+        for gid, g in c.groups.items():
+            groups[gid] = {k: v for k, v in g.items() if k not in ("files", "hidden")}
+        return {"device_id": c.me, "identity": c.identity(), "contacts": json.loads(json.dumps(contacts)),
+                "groups": json.loads(json.dumps(groups)), "photo": base64.b64encode(c.photo_bytes()).decode(),
+                "settings": {k: c.win.cfg.get(k) for k in ("read_receipts", "chat_sound", "wallpaper") if k in c.win.cfg}}
+
+    def _start(self, req, ip):
+        if not self.code_active():
+            return {"ok": False, "reason": "no link code is shown on that device right now"}
+        try:
+            theirs = int(req["pub"], 16)
+        except (KeyError, ValueError, TypeError):
+            return {"ok": False, "reason": "bad request"}
+        if not 1 < theirs < DH_P - 1:
+            return {"ok": False, "reason": "bad key"}
+        x = secrets.randbits(320)
+        pub = pow(2, x, DH_P)
+        shared = pow(theirs, x, DH_P).to_bytes(256, "big")
+        key = hashlib.sha256(b"arckad-link-key|" + shared + theirs.to_bytes(256, "big") + pub.to_bytes(256, "big")).digest()
+        self.code["pending"][str(req.get("inst", ""))[:20]] = {"key": key, "name": str(req.get("name", "device"))[:40],
+                                                               "os": str(req.get("os", ""))[:10], "ip": ip,
+                                                               "port": req.get("port")}
+        return {"ok": True, "pub": format(pub, "x"), "inst": self.inst, "name": self.chat.win.nearby.name(),
+                "os": OS_NAME, "port": self.chat.pr.port}
+
+    def _confirm(self, req, ip):
+        inst = str(req.get("inst", ""))[:20]
+        st = self.code["pending"].get(inst) if self.code_active() else None
+        if not st:
+            return {"ok": False, "reason": "the link code has expired; show a new one"}
+        code = self.code["code"]
+        if not hmacmod.compare_digest(_hm(st["key"], "link-guest", code).hex(), str(req.get("proof", ""))):
+            self.code["tries"] += 1
+            if self.code["tries"] >= 5:
+                self.code = None
+            return {"ok": False, "reason": "wrong code"}
+        ev = {"event": threading.Event(), "accepted": False, "name": st["name"], "os": st["os"]}
+        self.chat.ui("ask_link", ev)
+        ev["event"].wait(120)
+        if not ev["accepted"]:
+            return {"ok": False, "reason": "not approved on the other device"}
+        link = self.chat.contacts.setdefault("link", {})
+        if not link.get("key"):
+            link["key"] = secrets.token_bytes(32).hex()
+        link.setdefault("twins", {})[inst] = {"name": st["name"], "os": st["os"], "ip": ip, "port": st.get("port"),
+                                              "seen": time.time(), "linked": time.time()}
+        self.chat.save_contacts()
+        self.code = None
+        payload = {"proof": _hm(st["key"], "link-host", code).hex(), "link_key": link["key"], "bundle": self.bundle(),
+                   "twin": {"inst": self.inst, "name": self.chat.win.nearby.name(), "os": OS_NAME}}
+        self.chat.ui("on_pair_event", f"🔗 {st['name']} is now linked to your account")
+        threading.Thread(target=lambda: (time.sleep(3), self.sync(inst)), daemon=True).start()
+        return {"ok": True, "sealed": base64.b64encode(seal(st["key"], json.dumps(payload).encode())).decode()}
+
+    def link_with_code(self, code, host=None):
+        """Background thread on the NEW device: become the account shown on the other device. Returns (ok, msg)."""
+        import http.client
+        c = self.chat
+        c.pr.ensure_running()
+        where = None
+        if host:
+            for p in PAIR_TCP_PORTS[:-1]:
+                if Paired._reachable(host, p):
+                    where = (socket.gethostbyname(host), p)
+                    break
+        else:
+            want = hashlib.sha256(f"arckad-link-code|{code}".encode()).hexdigest()[:20]
+            end = time.time() + 8
+            while time.time() < end and not where:
+                hit = self.seen_codes.get(want)
+                if hit and time.time() - hit[2] < 10:
+                    where = (hit[0], hit[1])
+                time.sleep(0.2)
+        if not where:
+            return False, ("No device showing that link code was found. On another network, also type its IP address.")
+        ip, port = where
+        x = secrets.randbits(320)
+        pub = pow(2, x, DH_P)
+
+        def call(path, obj):
+            cn = http.client.HTTPConnection(ip, port, timeout=150)
+            cn.request("POST", path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
+            r = cn.getresponse()
+            data = json.loads(r.read() or b"{}")
+            cn.close()
+            return data
+        try:
+            r1 = call("/t/start", {"inst": self.inst, "name": c.win.nearby.name(), "os": OS_NAME, "pub": format(pub, "x"),
+                                   "port": c.pr.port})
+            if not r1.get("ok"):
+                return False, r1.get("reason", "refused")
+            theirs = int(r1["pub"], 16)
+            shared = pow(theirs, x, DH_P).to_bytes(256, "big")
+            key = hashlib.sha256(b"arckad-link-key|" + shared + pub.to_bytes(256, "big") + theirs.to_bytes(256, "big")).digest()
+            r2 = call("/t/confirm", {"inst": self.inst, "proof": _hm(key, "link-guest", code).hex()})
+            if not r2.get("ok"):
+                return False, r2.get("reason", "not approved")
+            data = json.loads(unseal(key, base64.b64decode(r2["sealed"])))
+            if not hmacmod.compare_digest(_hm(key, "link-host", code).hex(), str(data.get("proof", ""))):
+                return False, "the other device couldn't prove it knows the code"
+        except (OSError, ValueError, KeyError) as ex:
+            return False, f"connection problem ({ex})"
+        self.adopt(data["bundle"], data["link_key"], data["twin"], ip, r1.get("port") or port)
+        return True, data["twin"].get("name", "your device")
+
+    def adopt(self, b, link_key, twin, ip, port):
+        """This device becomes the linked account (its own previous chat profile is replaced)."""
+        c = self.chat
+        with c.lock:
+            for gid in list(c.groups):
+                try:
+                    (CHAT_DIR / f"{gid}.jsonl").unlink()
+                except OSError:
+                    pass
+            c.groups, c.msgs, c.ids, c.unread = {}, {}, {}, {}
+            c.win.cfg["device_id"] = b["device_id"]
+            for k, v in (b.get("settings") or {}).items():
+                c.win.cfg[k] = v
+            write_json(CONFIG_FILE, c.win.cfg)
+            c.ident = b["identity"]
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+            write_json(CHAT_DIR / "identity.json", c.ident)
+            contacts = b["contacts"]
+            contacts["link"] = {"key": link_key, "twins": {twin["inst"]: {"name": twin.get("name", "device"),
+                                                                          "os": twin.get("os", ""), "ip": ip,
+                                                                          "port": port, "seen": time.time(),
+                                                                          "linked": time.time()}}}
+            c.contacts = contacts
+            for k in ("friends", "incoming", "outgoing"):
+                c.contacts.setdefault(k, {})
+            c.profile = c.contacts.setdefault("profile", {"name": "", "visible": True, "setup": True})
+            c.save_contacts()
+            if b.get("photo"):
+                c.photo_path().write_bytes(base64.b64decode(b["photo"]))
+            for gid, g in b["groups"].items():
+                c.groups[gid] = dict(g, files={})
+                c.msgs[gid], c.ids[gid] = [], set()
+            c.save()
+        c._tag_cache = (None, {})
+        c.ui("on_chat_changed", None)
+        threading.Thread(target=lambda: (time.sleep(2), self.sync(twin["inst"])), daemon=True).start()
+
+    # ---------- talking to a linked device
+    def _call(self, inst, path, obj, timeout=30):
+        import http.client
+        t = self.twins().get(inst) or {}
+        k = self.key()
+        if not t.get("ip") or not t.get("port") or not k:
+            raise OSError("linked device not reachable")
+        body = seal(k, json.dumps(obj).encode())
+        ts = int(time.time())
+        hdr = {"X-Link-From": self.inst, "X-Link-Time": str(ts), "X-Link-Sig": _hm(k, "POST", path, ts, self.inst).hex(),
+               "Content-Length": str(len(body))}
+        cn = http.client.HTTPConnection(t["ip"], t["port"], timeout=timeout)
+        cn.request("POST", path, body, hdr)
+        r = cn.getresponse()
+        data = r.read()
+        cn.close()
+        if r.status != 200:
+            raise PermissionError(f"refused ({r.status})")
+        return json.loads(unseal(k, data)) if data else {}
+
+    def push(self, gid, msg):
+        """A new message (sent or received here) goes to my other devices at once."""
+        if not self.key() or msg.get("local"):
+            return
+        m = {k: v for k, v in msg.items() if k not in ("r_sent",)}
+
+        def work():
+            for inst in list(self.twins()):
+                if self.twin_online(inst):
+                    self.chat._try(lambda: self._call(inst, "/t/push", {"gid": gid, "msg": m}, timeout=8))
+        threading.Thread(target=work, daemon=True).start()
+
+    def push_read(self, gid):
+        if not self.key():
+            return
+        for inst in list(self.twins()):
+            if self.twin_online(inst):
+                threading.Thread(target=lambda i=inst: self.chat._try(
+                    lambda: self._call(i, "/t/read", {"gid": gid}, timeout=6)), daemon=True).start()
+
+    def state(self):
+        c = self.chat
+        contacts = {k: v for k, v in c.contacts.items() if k not in ("link", "pin", "pin_phone")}
+        groups = {gid: {k: v for k, v in g.items() if k not in ("files", "hidden")} for gid, g in c.groups.items()}
+        return {"contacts": contacts, "groups": groups, "photo_hash": c.photo_hash()}
+
+    def merge(self, st, twin):
+        """Fold the other device's state into mine: newer wins, deletions (tombstones) win over older entries."""
+        c = self.chat
+        changed = False
+        theirs = st.get("contacts") or {}
+        tombs = c.contacts.setdefault("tombs", {})
+        for kind, entries in (theirs.get("tombs") or {}).items():
+            for k, ts in entries.items():
+                if ts > tombs.setdefault(kind, {}).get(k, 0):
+                    tombs[kind][k] = ts
+                    changed = True
+        # profile
+        tp, mp = theirs.get("profile") or {}, c.profile
+        if tp.get("updated", 0) > mp.get("updated", 0):
+            mp.update(tp)
+            changed = True
+            if st.get("photo_hash") != c.photo_hash():
+                threading.Thread(target=self._fetch_photo, args=(twin, st.get("photo_hash")), daemon=True).start()
+        # friends and requests
+        for kind in ("friends", "incoming", "outgoing"):
+            mine = c.contacts.setdefault(kind, {})
+            for pid, e in (theirs.get(kind) or {}).items():
+                if pid not in mine:
+                    mine[pid] = e
+                    changed = True
+                elif kind == "friends" and e.get("since", 0) > mine[pid].get("since", 0):
+                    mine[pid] = e
+                    changed = True
+        ft, rt = tombs.get("friend", {}), tombs.get("req", {})
+        for pid in list(c.contacts["friends"]):
+            if ft.get(pid, 0) > c.contacts["friends"][pid].get("since", 0):
+                c.contacts["friends"].pop(pid)
+                changed = True
+        for kind in ("incoming", "outgoing"):
+            for pid in list(c.contacts[kind]):
+                if pid in c.contacts["friends"] or rt.get(pid, 0) > c.contacts[kind][pid].get("ts", 0):
+                    c.contacts[kind].pop(pid)
+                    changed = True
+        # groups (including friend chats)
+        gt = tombs.get("group", {})
+        for gid, g in (st.get("groups") or {}).items():
+            if gt.get(gid, 0) > g.get("created", 0) and not g.get("kind") == "direct":
+                continue
+            mine = c.groups.get(gid)
+            if mine is None:
+                c.groups[gid] = dict(g, files={})
+                c.msgs.setdefault(gid, [])
+                c.ids.setdefault(gid, set())
+                changed = True
+            else:
+                if int(g.get("version", 0)) > int(mine.get("version", 0)) or (g.get("key") != mine.get("key") and
+                                                                              g.get("kind") == "direct" and not g.get("removed")):
+                    for k in ("name", "owner_only", "members", "key", "version", "past", "removed", "owner"):
+                        if k in g:
+                            mine[k] = g[k]
+                    changed = True
+                for k in ("pair_keys", "pending_adds"):
+                    if g.get(k):
+                        before = len(mine.get(k) or {})
+                        mine.setdefault(k, {}).update(g[k])
+                        changed |= len(mine[k]) != before
+                if g.get("owner_key") and not mine.get("owner_key"):
+                    mine["owner_key"] = g["owner_key"]
+                    changed = True
+        for gid in list(c.groups):
+            if gt.get(gid, 0) > c.groups[gid].get("created", 0) and c.groups[gid].get("kind") != "direct":
+                c.groups.pop(gid)
+                changed = True
+        if changed:
+            c.save()
+            c.save_contacts()
+            c._tag_cache = (None, {})
+            c.ui("on_chat_changed", None)
+            c.ui("on_people_changed")
+
+    def _fetch_photo(self, inst, ph):
+        import http.client
+        t = self.twins().get(inst) or {}
+        try:
+            cn = http.client.HTTPConnection(t["ip"], t["port"], timeout=8)
+            cn.request("GET", "/f/photo")
+            r = cn.getresponse()
+            data = r.read(2_000_000)
+            cn.close()
+            if r.status == 200 and data[:2] == b"\xff\xd8":
+                self.chat.photo_path().write_bytes(data)
+            elif r.status == 404:
+                self.chat.photo_path().unlink(missing_ok=True)
+            _avatar_cache.clear()
+            self.chat.ui("on_chat_changed", None)
+        except (OSError, KeyError):
+            pass
+
+    def sync(self, inst):
+        """Exchange state, then fetch the messages I'm missing (in batches)."""
+        c = self.chat
+        if not self.key() or inst not in self.twins():
+            return
+        try:
+            r = self._call(inst, "/t/state", {"state": self.state()})
+            self.merge(r.get("state") or {}, inst)
+            for _round in range(20):
+                have = {gid: [m["id"] for m in c.msgs.get(gid, [])] for gid in c.groups}
+                r = self._call(inst, "/t/msgs", {"have": have}, timeout=60)
+                got = 0
+                for gid, lst in (r.get("msgs") or {}).items():
+                    for m in lst:
+                        if gid in c.groups and c._append(gid, m):
+                            got += 1
+                            if m.get("file"):
+                                c._maybe_download(gid, m)
+                if got:
+                    c.ui("on_chat_changed", None)
+                if not r.get("more"):
+                    break
+            t = self.twins().get(inst)
+            if t:
+                t["synced"] = time.time()
+                c.save_contacts()
+        except PermissionError:
+            c.ui("on_pair_event", "A linked device refused to sync (it may have been unlinked).")
+        except Exception:
+            pass
+
+    def tick(self):
+        if time.time() - self.last_sync < 30 or not self.key():
+            return
+        self.last_sync = time.time()
+        for inst in list(self.twins()):
+            if self.twin_online(inst):
+                threading.Thread(target=self.sync, args=(inst,), daemon=True).start()
+
+    def unlink(self, inst):
+        """Remove a linked device: it's told to drop the account (if reachable) and stops being trusted here."""
+        told = self.chat._try(lambda: self._call(inst, "/t/unlink", {}, timeout=6)) is not None
+        self.twins().pop(inst, None)
+        if not self.twins():
+            self.chat.contacts.pop("link", None)        # last one gone: a new link gets a new key
+        self.chat.save_contacts()
+        self.chat.ui("on_chat_changed", None)
+        return told
+
+    def wipe_here(self):
+        """This device was unlinked: remove the shared account from it (it starts fresh)."""
+        c = self.chat
+        with c.lock:
+            for gid in list(c.groups):
+                try:
+                    (CHAT_DIR / f"{gid}.jsonl").unlink()
+                except OSError:
+                    pass
+            c.groups, c.msgs, c.ids, c.unread = {}, {}, {}, {}
+            c.save()
+            c.contacts = {"friends": {}, "incoming": {}, "outgoing": {},
+                          "profile": {"name": "", "visible": True, "setup": False}}
+            c.profile = c.contacts["profile"]
+            c.save_contacts()
+            for f in ("identity.json", "profile.jpg"):
+                try:
+                    (CHAT_DIR / f).unlink()
+                except OSError:
+                    pass
+            c.ident = None
+            c.win.cfg["device_id"] = secrets.token_hex(8)
+            write_json(CONFIG_FILE, c.win.cfg)
+        c.ui("on_chat_changed", None)
+        c.ui("on_pair_event", "This device was unlinked: the shared chat account was removed from it.")
+
+    # ---------- server side
+    def _auth(self, h):
+        k = self.key()
+        inst = h.headers.get("X-Link-From", "")
+        if not k or inst not in self.twins():
+            return None
+        try:
+            ts = int(h.headers.get("X-Link-Time", "0"))
+        except ValueError:
+            return None
+        if abs(time.time() - ts) > 600:
+            return None
+        if not hmacmod.compare_digest(_hm(k, "POST", h.path, ts, inst).hex(), h.headers.get("X-Link-Sig", "")):
+            return None
+        t = self.twins()[inst]
+        t.update(ip=h.client_address[0], seen=time.time())
+        return inst
+
+    def handle_post(self, h, path):
+        if path == "/t/start":
+            return h._plain(200, self._start(json.loads(h._body(100_000) or b"{}"), h.client_address[0]))
+        if path == "/t/confirm":
+            r = self._confirm(json.loads(h._body(100_000) or b"{}"), h.client_address[0])
+            return h._plain(200 if r.get("ok") else 403, r)
+        inst = self._auth(h)
+        if not inst:
+            return h._plain(401, {"ok": False, "reason": "not linked"})
+        k = self.key()
+        body = h._body(50_000_000)
+        req = json.loads(unseal(k, body)) if body else {}
+        c = self.chat
+
+        def reply(obj):
+            h._raw(200, seal(k, json.dumps(obj).encode()))
+        if path == "/t/state":
+            self.merge(req.get("state") or {}, inst)
+            return reply({"ok": True, "state": self.state()})
+        if path == "/t/msgs":
+            have = {gid: set(ids) for gid, ids in (req.get("have") or {}).items()}
+            out, n, more = {}, 0, False
+            for gid, lst in c.msgs.items():
+                for m in lst:
+                    if m.get("local") or m["id"] in have.get(gid, ()):
+                        continue
+                    if n >= 3000:
+                        more = True
+                        break
+                    out.setdefault(gid, []).append({k2: v for k2, v in m.items() if k2 != "r_sent"})
+                    n += 1
+            return reply({"ok": True, "msgs": out, "more": more})
+        if path == "/t/push":
+            gid, m = req.get("gid"), req.get("msg") or {}
+            if gid in c.groups and isinstance(m, dict) and m.get("id") and c._append(gid, m):
+                if m.get("from") != c.me and m.get("kind") not in ("system", "delete"):
+                    c.unread[gid] = c.unread.get(gid, 0) + 1
+                    c.ui("on_chat_message", gid, m)
+                else:
+                    c.ui("on_chat_changed", gid)
+                if m.get("file"):
+                    c._maybe_download(gid, m)
+            return reply({"ok": True})
+        if path == "/t/read":
+            gid = req.get("gid")
+            if gid in c.groups:
+                c.unread[gid] = 0
+                for m in c.msgs.get(gid, []):
+                    if m.get("from") != c.me:
+                        m["r_sent"] = True
+                c._schedule_rewrite(gid)
+                c.ui("on_chat_changed", None)
+            return reply({"ok": True})
+        if path == "/t/unlink":
+            reply({"ok": True})
+            threading.Thread(target=self.wipe_here, daemon=True).start()
+            return
+        return reply({"ok": False, "reason": "unknown"})
+
+
 # ---------------------------------------------------------------- Chat panel (right pane and its own window)
 CHAT_CSS = b"""
 .chat-bubble { border-radius: 14px; padding: 6px 11px; }
@@ -9120,6 +9664,7 @@ class ChatPanel(Gtk.Box):
         for label, cb in (("Profile…", self.edit_profile), ("Chat wallpaper…", lambda: self.choose_wallpaper(None)),
                           ("Back up chats…", self.backup), ("Restore chats from a backup…", self.restore),
                           ("Automatic backups…", self.auto_backup_settings),
+                          ("Linked devices (phone + PC, one account)…", self.linked_devices),
                           ("Export my profile (move to a new computer)…", self.export_profile),
                           ("Import a profile…", self.import_profile)):
             it = Gtk.MenuItem(label=label)
@@ -9864,6 +10409,117 @@ class ChatPanel(Gtk.Box):
     def _pin_ok(self, pin):
         p = self.chat.contacts.get("pin") or {}
         return bool(p) and hmacmod.compare_digest(_backup_key(pin, bytes.fromhex(p["salt"])).hex(), p["hash"])
+
+    # ---------- linked devices
+    def linked_devices(self):
+        L = self.chat.linked
+        d = Gtk.Dialog(title="Linked devices", transient_for=self.get_toplevel(), modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(470, -1)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+        intro.set_markup("Use <b>one chat account on your phone and PC</b>: the same profile, friends, groups and "
+                         "history. Messages arrive on both, and what you send from one shows on the other. To "
+                         "friends you're simply one person.")
+        box.add(intro)
+        me = Gtk.Label(xalign=0)
+        me.set_markup(f"<b>This device:</b> {esc(self.win.nearby.name())} ({OS_NAME})")
+        box.add(me)
+        twins = L.twins()
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        for inst, t in twins.items():
+            row = Gtk.Box(spacing=8, margin=6)
+            on = L.twin_online(inst)
+            synced = t.get("synced")
+            lab = Gtk.Label(xalign=0, hexpand=True)
+            lab.set_markup(f"<span foreground='{'#2ec27e' if on else '#9a9996'}'>●</span> <b>{esc(t.get('name', 'device'))}</b> "
+                           f"({esc(t.get('os', ''))})\n<small>{'online' if on else 'offline'}"
+                           + (f" · last synced {time.strftime('%d %b %H:%M', time.localtime(synced))}" if synced else "")
+                           + "</small>")
+            row.pack_start(lab, True, True, 0)
+            un = Gtk.Button(label="Unlink")
+            un.connect("clicked", lambda _b, i=inst, n=t.get("name", "device"): self.win.confirm(
+                f"Unlink {n}?\n\nThe shared chat account is removed from it (if it's reachable now) and it stops "
+                "receiving your messages.") and (L.unlink(i), d.response(Gtk.ResponseType.CLOSE)))
+            row.add(un)
+            lb.add(row)
+        if not twins:
+            none = Gtk.Label(label="No linked devices yet.", xalign=0)
+            none.get_style_context().add_class("dim-label")
+            lb.add(none)
+        box.add(lb)
+        b1 = Gtk.Button(label="＋ Link a new device (show a link code)")
+        b1.get_style_context().add_class("suggested-action")
+        box.add(b1)
+        code_lbl = Gtk.Label(selectable=True)
+        hint = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=56)
+        box.add(code_lbl)
+        box.add(hint)
+
+        def show_code(*_):
+            code = L.new_code()
+            ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
+            code_lbl.set_markup(f"<span size='xx-large' weight='bold' letter_spacing='6000'>{code[:3]} {code[3:]}</span>")
+            hint.set_markup(f"<small>On your phone or other computer: Chat → ⋯ → <b>Link this device to my account</b>, "
+                            f"type this code, then confirm here. From another network it also needs this computer's "
+                            f"address: <b>{esc(ips[0] if ips else '?')}</b> · valid 10 minutes</small>")
+        b1.connect("clicked", show_code)
+        b2 = Gtk.Button(label="Link THIS device to my account on another device…")
+        b2.connect("clicked", lambda *_: (d.response(Gtk.ResponseType.CLOSE), self.link_this_device()))
+        box.add(b2)
+        d.show_all()
+        d.run()
+        L.code = None
+        d.destroy()
+
+    def link_this_device(self):
+        d = Gtk.Dialog(title="Link this device to my account", transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Link", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        warn = Gtk.Label(xalign=0, wrap=True, max_width_chars=52)
+        warn.set_markup("On your other device: ⋯ → <b>Linked devices</b> → <b>Link a new device</b>. Type the code it "
+                        "shows. <b>This device's current chat profile is replaced</b> by that account (export it first "
+                        "if you need it).")
+        box.add(warn)
+        code = Gtk.Entry(placeholder_text="6-digit link code", max_length=7)
+        ip = Gtk.Entry(placeholder_text="its IP address (only if on another network)")
+        box.add(code)
+        box.add(ip)
+        status = Gtk.Label(xalign=0, wrap=True)
+        box.add(status)
+        d.show_all()
+        while d.run() == Gtk.ResponseType.OK:
+            c = "".join(ch for ch in code.get_text() if ch.isdigit())
+            if len(c) != 6:
+                status.set_text("The link code has 6 digits.")
+                continue
+            status.set_text("Linking… confirm on the other device.")
+            d.set_sensitive(False)
+            res = {}
+
+            def work():
+                res["r"] = self.chat.linked.link_with_code(c, ip.get_text().strip() or None)
+            t = threading.Thread(target=work, daemon=True)
+            t.start()
+            while t.is_alive():
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+                time.sleep(0.05)
+            d.set_sensitive(True)
+            ok, msg = res["r"]
+            if ok:
+                d.destroy()
+                _avatar_cache.clear()
+                self.refresh()
+                self.win.info(f"Linked with {msg} ✓\n\nYour chats are copying over now. Restart Arckad-D once to "
+                              "finish switching this computer to the account.")
+                return
+            status.set_text("✗ " + msg)
+        d.destroy()
 
     # ---------- lock
     def lock_now(self):
@@ -13908,6 +14564,25 @@ class MainWindow(Gtk.ApplicationWindow):
             self.get_application().send_notification("call", n)
         except Exception:
             pass
+        return False
+
+    def ask_link(self, ev):
+        d = Gtk.MessageDialog(transient_for=self if self.get_visible() else None, modal=False,
+                              message_type=Gtk.MessageType.QUESTION, text=f"Link {ev['name']} to your chat account?")
+        d.format_secondary_text(f"{ev['name']} ({ev['os']}) typed your link code. It will get your profile, friends, "
+                                "groups and chat history, and can send messages as you. Only link your own devices.")
+        d.add_buttons("Cancel", Gtk.ResponseType.REJECT, "Link", Gtk.ResponseType.ACCEPT)
+        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+        d.set_keep_above(True)
+
+        def respond(dlg, resp):
+            if not ev["event"].is_set():
+                ev["accepted"] = resp == Gtk.ResponseType.ACCEPT
+                ev["event"].set()
+            dlg.destroy()
+        d.connect("response", respond)
+        d.show_all()
+        d.present()
         return False
 
     def on_people_changed(self):

@@ -54,6 +54,10 @@ final class ChatEngine {
         void event(String text);
 
         void fileSaved(File f);                   // so the gallery sees received photos
+
+        void askLink(Ask ev);                     // link another device to this account?
+
+        void relinked(String deviceId);           // this device became (or stopped being) a linked account
     }
 
     static final class Ask {
@@ -89,6 +93,8 @@ final class ChatEngine {
     private Map<String, String> tagTable = new HashMap<>();
     private String tagStamp = "";
     int port;
+    String inst = "phone";                        // this install (linked devices tell each other apart by it)
+    final ChatLink link;
 
     ChatEngine(File dir, File downloads, String deviceId, String deviceName, String osName, Ui ui) {
         this.dir = dir;
@@ -99,6 +105,11 @@ final class ChatEngine {
         this.ui = ui;
         dir.mkdirs();
         load();
+        link = new ChatLink(this);
+    }
+
+    void resetTags() {
+        tagStamp = "";
     }
 
     static double now() {
@@ -241,6 +252,7 @@ final class ChatEngine {
         put(profile, "name", n.length() > 40 ? n.substring(0, 40) : n);
         put(profile, "visible", visible);
         put(profile, "setup", true);
+        put(profile, "updated", now());
         saveContacts();
         lastBeacon = 0;
         start();
@@ -337,7 +349,7 @@ final class ChatEngine {
 
     boolean active() {
         for (JSONObject g : groups.values()) if (!g.optBoolean("removed")) return true;
-        return joinActive() || profile.optBoolean("setup")
+        return joinActive() || profile.optBoolean("setup") || contacts.has("link") || (link != null && link.codeActive())
                 || contacts.optJSONObject("outgoing").length() > 0 || contacts.optJSONObject("friends").length() > 0
                 || fcodeActive();
     }
@@ -500,6 +512,7 @@ final class ChatEngine {
             });
         }
         sleep(300);
+        link.tomb("group", gid);
         synchronized (lock) {
             groups.remove(gid);
             msgs.remove(gid);
@@ -905,6 +918,7 @@ final class ChatEngine {
     }
 
     void declineRequest(String pid) {
+        link.tomb("req", pid);
         if (incoming().remove(pid) != null) {
             saveContacts();
             bg(() -> {
@@ -918,6 +932,7 @@ final class ChatEngine {
     }
 
     void cancelRequest(String pid) {
+        link.tomb("req", pid);
         outgoing().remove(pid);
         saveContacts();
         bg(() -> {
@@ -1000,6 +1015,7 @@ final class ChatEngine {
 
     void forgetFriend(String pid) {
         friends().remove(pid);
+        link.tomb("friend", pid);
         JSONObject g = groups.get(directGid(pid));
         if (g != null) {
             put(g, "removed", true);
@@ -1217,6 +1233,7 @@ final class ChatEngine {
     }
 
     private String[] memberAddress(String did) {
+        if (did.equals(me) && link.twinAddress() != null) return link.twinAddress();
         JSONObject o = online.get(did);
         if ((o == null || o.optString("ip").isEmpty() || o.optInt("port") == 0) && friends().has(did)) o = friends().optJSONObject(did);
         if (o == null || o.optString("ip").isEmpty() || o.optInt("port") == 0) return null;
@@ -1601,6 +1618,7 @@ final class ChatEngine {
 
     /** The conversation is on screen: its messages are read. */
     void markRead(String gid) {
+        if (unread.getOrDefault(gid, 0) > 0) link.pushRead(gid);
         unread.put(gid, 0);
         boolean changed = false;
         for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
@@ -1742,6 +1760,7 @@ final class ChatEngine {
     }
 
     void deliver(String gid, JSONObject m) {
+        link.push(gid, m);                        // my other devices get it at once
         JSONObject g = groups.get(gid);
         Set<String> targets = new HashSet<>(onlineMembers(gid));
         if (g != null && "direct".equals(g.optString("kind")) && !g.optBoolean("removed")) targets.add(g.optString("peer"));
@@ -1847,6 +1866,7 @@ final class ChatEngine {
                 tags.put(hex(hm(unhex(g.optString("key")), "member", me, bucket)).substring(0, 24));
         if (tags.length() > 0) put(msg, "ctags", tags);
         if (joinActive()) put(msg, "chatjoin", sha256hex("arckad-chat-code|" + join.optString("code")).substring(0, 20));
+        link.beaconFields(msg);
         if (fcodeActive()) put(msg, "fcode", sha256hex("arckad-friend-code|" + fcode.optString("code")).substring(0, 20));
         boolean anyone = friends().length() > 0 || outgoing().length() > 0;
         if ((profile.optBoolean("setup") && profile.optBoolean("visible")) || anyone) {
@@ -1882,6 +1902,7 @@ final class ChatEngine {
 
     void onUdp(JSONObject msg, String ip) {
         if (!"arckad-pair".equals(msg.optString("app"))) return;
+        link.onUdp(msg, ip);
         int p = msg.optInt("port");
         if (!msg.optString("chatjoin").isEmpty() && p > 0) {
             codeSeen.put(msg.optString("chatjoin"), new double[]{now()});
@@ -1934,6 +1955,11 @@ final class ChatEngine {
         JSONObject f = friends();
         for (Iterator<String> it = f.keys(); it.hasNext(); ) {
             String ip = f.optJSONObject(it.next()).optString("ip");
+            if (!ip.isEmpty()) s.add(ip);
+        }
+        JSONObject tw = link.twins();
+        for (Iterator<String> it = tw.keys(); it.hasNext(); ) {
+            String ip = tw.optJSONObject(it.next()).optString("ip");
             if (!ip.isEmpty()) s.add(ip);
         }
         return s;
@@ -2030,6 +2056,7 @@ final class ChatEngine {
                 lastDirect = t;
                 sendBeacon(directTargets());          // other VLANs: greet friends and members directly
                 tick();
+                link.tick();
             }
         }
     }
@@ -2058,6 +2085,10 @@ final class ChatEngine {
         }
         if (!r.method.equals("POST")) {
             r.json(404, err("unknown"));
+            return;
+        }
+        if (path.startsWith("/t/")) {
+            link.handle(r, path);
             return;
         }
         if (path.equals("/f/codestart") || path.equals("/f/codeconfirm")) {
@@ -2114,6 +2145,7 @@ final class ChatEngine {
                         unread.merge(gid, 1, Integer::sum);
                         queueReceipt(gid, did, m.optString("id"), false);
                     }
+                    link.push(gid, m);
                     ui.message(gid, m);
                     if (m.optJSONObject("file") != null) maybeDownload(gid, m);
                 }

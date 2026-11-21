@@ -62,7 +62,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
 
     private final MainActivity a;
     private final ChatHub hub;
-    private final ChatEngine e;
+    private ChatEngine e;
     private final FrameLayout root;
     private String page = "list", gid;
     private LinearLayout msgBox;
@@ -903,8 +903,12 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
 
     private void listMenu() {
         String[] items = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
-                "Chat wallpaper", "Chat lock (PIN)"};
+                "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)"};
         Ui.dialog(a).setItems(items, (d, w) -> {
+            if (w == 5) {
+                linkedDevices();
+                return;
+            }
             if (w == 3) {
                 chooseWallpaper(null);
                 return;
@@ -1432,6 +1436,99 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     @Override
     public void chatEvent(String text) {
         Ui.toast(a, text);
+    }
+
+    @Override
+    public void askLink(ChatEngine.Ask ev) {
+        Ui.dialog(a).setTitle("Link " + ev.name + " to your account?")
+                .setMessage(ev.name + " (" + ev.os + ") typed your link code. It gets your profile, friends, groups and chat "
+                        + "history, and can send messages as you. Only link your own devices.")
+                .setPositiveButton("Link", (d, w) -> {
+                    ev.accepted = true;
+                    ev.done.countDown();
+                })
+                .setNegativeButton("Cancel", (d, w) -> ev.done.countDown())
+                .setOnCancelListener(d -> ev.done.countDown()).show();
+    }
+
+    @Override
+    public void relinked() {
+        e = hub.engine;
+        avatars.evictAll();
+        show("list", null);
+    }
+
+    private void linkedDevices() {
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
+        box.addView(Ui.text(a, "Use one chat account on your phone and PC: the same profile, friends, groups and history. "
+                + "Messages arrive on both, and what you send from one shows on the other.", 13, Ui.DIM, false));
+        final AlertDialog[] d = new AlertDialog[1];
+        JSONObject tw = e.link.twins();
+        for (Iterator<String> it = tw.keys(); it.hasNext(); ) {
+            String inst = it.next();
+            JSONObject t = tw.optJSONObject(inst);
+            LinearLayout row = new LinearLayout(a);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.addView(Ui.text(a, (e.link.twinOnline(inst) ? "🟢 " : "⚪ ") + t.optString("name") + " (" + t.optString("os") + ")",
+                    15, Ui.TEXT, false), MainActivity.grow());
+            row.addView(Ui.button(a, "Unlink", false, v -> Ui.confirm(a, "Unlink " + t.optString("name") + "?",
+                    "The shared chat account is removed from it and it stops receiving your messages.", "Unlink", () -> {
+                        d[0].dismiss();
+                        ChatEngine.bg(() -> e.link.unlink(inst));
+                    })));
+            box.addView(row, Ui.matchWrap(a, 6));
+        }
+        if (tw.length() == 0) box.addView(Ui.text(a, "No linked devices yet.", 14, Ui.DIM, false));
+        d[0] = Ui.dialog(a).setTitle("Linked devices").setView(box)
+                .setPositiveButton("Link a new device", (x, w) -> showLinkCode())
+                .setNeutralButton("Link THIS phone", (x, w) -> linkThisPhone())
+                .setNegativeButton("Close", null).show();
+    }
+
+    private void showLinkCode() {
+        String code = e.link.newCode();
+        TextView t = Ui.text(a, code.substring(0, 3) + " " + code.substring(3), 34, Ui.TEXT, true);
+        t.setGravity(Gravity.CENTER);
+        List<String> ips = Net.lanAddresses();
+        TextView h = Ui.text(a, "On your PC: Chat → ⋯ → Linked devices → Link THIS device, and type this code. Then "
+                + "confirm here. From another network it also needs this phone's address: " + (ips.isEmpty() ? "?" : ips.get(0))
+                + "\nValid 10 minutes.", 13, Ui.DIM, false);
+        h.setGravity(Gravity.CENTER);
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 16), Ui.dp(a, 12), Ui.dp(a, 16), 0);
+        box.addView(t);
+        box.addView(h);
+        Ui.dialog(a).setTitle("Link code").setView(box).setPositiveButton("Done", null)
+                .setNegativeButton("Stop", (x, w) -> e.link.stopCode()).show();
+    }
+
+    private void linkThisPhone() {
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
+        box.addView(Ui.text(a, "On your PC: Chat → ⋯ → Linked devices → Link a new device. Type the code it shows. "
+                + "This phone's current chat profile is replaced by that account.", 13, Ui.DIM, false));
+        EditText code = new EditText(a);
+        code.setHint("6-digit link code");
+        code.setInputType(InputType.TYPE_CLASS_NUMBER);
+        EditText ip = new EditText(a);
+        ip.setHint("PC's IP (only if on another network)");
+        box.addView(code);
+        box.addView(ip);
+        Ui.dialog(a).setTitle("Link this phone to my account").setView(box).setPositiveButton("Link", (x, w) -> {
+            String c = code.getText().toString().replaceAll("[^0-9]", ""), host = ip.getText().toString().trim();
+            Ui.toast(a, "Linking… confirm on the PC");
+            ChatEngine.bg(() -> {
+                String err = e.link.linkWithCode(c, host.isEmpty() ? null : host);
+                a.runOnUiThread(() -> {
+                    if (err == null) Ui.info(a, "Linked ✓", "This phone now uses your account. Your chats are copying over.");
+                    else Ui.info(a, "Couldn't link", err);
+                });
+            });
+        }).setNegativeButton("Cancel", null).show();
     }
 
     private void askNotifications() {
