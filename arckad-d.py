@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.23.2"
+APP_VERSION = "3.24.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -7621,6 +7621,11 @@ class Chat:
             old = sorted(folder.glob("Arckad-D backup *.arckadprofile"))
             for f in old[:-max(1, int(cfg.get("keep", 7)))]:
                 f.unlink(missing_ok=True)
+            if cfg.get("drive"):                          # a copy in Google Drive too (encrypted)
+                try:
+                    cfg["drive_ok"], cfg["drive_error"] = upload_to_google_drive(dest, int(cfg.get("keep", 7))), ""
+                except Exception as ex:
+                    cfg["drive_error"] = str(ex)
         except Exception as ex:
             cfg["last"], cfg["last_error"] = time.time(), str(ex)
         self.win.cfg["auto_backup"] = cfg
@@ -8685,6 +8690,87 @@ class CallStream:
 # Linked devices share one chat identity: to friends and groups they are simply "you". A private twin
 # channel (its own key from the link code) keeps them in step: new messages are pushed at once, history and
 # state (friends, requests, groups, profile, read status) are merged regularly; deletions travel as tombstones.
+# ---------------------------------------------------------------- Google Drive (through Google's own Drive app)
+DRIVE_FOLDER = "Arckad-D Backups"
+
+
+def find_google_drive():
+    """Google Drive on this computer, or None. Windows: Google Drive for desktop ("My Drive", usually G:).
+    Ubuntu: Settings → Online Accounts → Google (Files), which mounts it in the file manager.
+    Returns (Gio.File of "My Drive", label)."""
+    if IS_WIN:
+        import string
+        for letter in string.ascii_uppercase:
+            p = Path(f"{letter}:\\My Drive")
+            try:
+                if p.is_dir():
+                    return Gio.File.new_for_path(str(p)), f"Google Drive ({letter}:\\My Drive)"
+            except OSError:
+                continue
+        for p in (HOME / "Google Drive" / "My Drive", HOME / "Google Drive", HOME / "My Drive"):
+            if p.is_dir():
+                return Gio.File.new_for_path(str(p)), f"Google Drive ({p})"
+        return None
+    try:
+        for m in Gio.VolumeMonitor.get().get_mounts():
+            root = m.get_root()
+            if root and root.get_uri().startswith("google-drive://"):
+                my = _child_by_name(root, "My Drive") or root
+                return my, f"Google Drive ({m.get_name()})"
+    except Exception:
+        pass
+    for p in (HOME / "GoogleDrive", HOME / "Google Drive", HOME / "gdrive"):     # rclone / Insync folders
+        if p.is_dir():
+            return Gio.File.new_for_path(str(p)), f"Google Drive ({p})"
+    return None
+
+
+def _child_by_name(folder, name):
+    """A child by the name people see (Google Drive in GNOME names files by id internally)."""
+    try:
+        en = folder.enumerate_children("standard::name,standard::display-name", Gio.FileQueryInfoFlags.NONE, None)
+        for info in en:
+            if info.get_display_name() == name:
+                return folder.get_child(info.get_name())
+    except GLib.Error:
+        pass
+    return None
+
+
+def upload_to_google_drive(local_path, keep=7):
+    """Copy a backup into "My Drive/Arckad-D Backups" and keep the newest `keep` there. Returns where."""
+    found = find_google_drive()
+    if not found:
+        raise OSError("Google Drive isn't connected on this computer (see “How to connect Google Drive”).")
+    my, label = found
+    folder = _child_by_name(my, DRIVE_FOLDER)
+    if folder is None:
+        try:
+            folder = my.get_child_for_display_name(DRIVE_FOLDER)
+            folder.make_directory(None)
+        except GLib.Error as ex:
+            if not ex.matches(Gio.io_error_quark(), Gio.IOErrorEnum.EXISTS):
+                raise OSError(f"Couldn't create the folder in Google Drive: {ex.message}")
+            folder = _child_by_name(my, DRIVE_FOLDER) or my.get_child_for_display_name(DRIVE_FOLDER)
+    name = os.path.basename(str(local_path))
+    try:
+        dest = folder.get_child_for_display_name(name)
+        Gio.File.new_for_path(str(local_path)).copy(dest, Gio.FileCopyFlags.OVERWRITE, None, None, None)
+    except GLib.Error as ex:
+        raise OSError(f"Couldn't copy the backup to Google Drive: {ex.message}")
+    try:                                           # keep the newest few in Drive too
+        items = []
+        for info in folder.enumerate_children("standard::name,standard::display-name", Gio.FileQueryInfoFlags.NONE, None):
+            dn = info.get_display_name()
+            if dn.startswith("Arckad-D backup ") and dn.endswith(".arckadprofile"):
+                items.append((dn, info.get_name()))
+        for dn, n in sorted(items)[:-max(1, keep)]:
+            folder.get_child(n).delete(None)
+    except GLib.Error:
+        pass
+    return f"{label} / {DRIVE_FOLDER} / {name}"
+
+
 def _link_tag(key, bucket):
     return _hm(key, "twin", bucket).hex()[:24]
 
@@ -9792,7 +9878,7 @@ class ChatPanel(Gtk.Box):
         lmenu = Gtk.Menu()
         for label, cb in (("Profile…", self.edit_profile), ("Chat wallpaper…", lambda: self.choose_wallpaper(None)),
                           ("Back up chats…", self.backup), ("Restore chats from a backup…", self.restore),
-                          ("Automatic backups…", self.auto_backup_settings),
+                          ("Automatic backups (also to Google Drive)…", self.auto_backup_settings),
                           ("Linked devices (phone + PC, one account)…", self.linked_devices),
                           ("Restore my profile from before a link…", self.restore_before_link),
                           ("Export my profile (move to a new computer)…", self.export_profile),
@@ -10935,7 +11021,10 @@ class ChatPanel(Gtk.Box):
         keep.set_value(int(cfg.get("keep", 7)))
         row.add(keep)
         box.add(row)
-        files = Gtk.CheckButton(label="Include attachments (photos and files; bigger backups)")
+        what = Gtk.Label(xalign=0)
+        what.set_markup("<b>What:</b> your profile and chats (always) — identity, friends, groups and messages.")
+        box.add(what)
+        files = Gtk.CheckButton(label="Also include attachments (photos and files; bigger backups)")
         files.set_active(bool(cfg.get("files")))
         box.add(files)
         folder = Gtk.FileChooserButton(title="Backup folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
@@ -10946,6 +11035,22 @@ class ChatPanel(Gtk.Box):
         fr.add(Gtk.Label(label="Save in"))
         fr.pack_start(folder, True, True, 0)
         box.add(fr)
+        gd = find_google_drive()
+        drive = Gtk.CheckButton(label="☁ Also keep a copy in Google Drive")
+        drive.set_active(bool(cfg.get("drive")))
+        box.add(drive)
+        dlabel = Gtk.Label(xalign=0, wrap=True, max_width_chars=54)
+        if gd:
+            dlabel.set_markup(f"<small>✓ Found: <b>{esc(gd[1])}</b> → folder “{DRIVE_FOLDER}”. Google's Drive app uploads "
+                              "it. The backup is encrypted with your password, so Google can't read it.</small>")
+        else:
+            drive.set_sensitive(False)
+            how = ("install <b>Google Drive for desktop</b> (google.com/drive/download) and sign in; it adds a “My Drive” "
+                   "drive" if IS_WIN else "open <b>Settings → Online Accounts → Google</b>, sign in and switch on "
+                   "<b>Files</b>; Google Drive then appears in the file manager")
+            dlabel.set_markup(f"<small>Google Drive isn't connected on this computer yet. To use it: {how}. Then open this "
+                              "window again.</small>")
+        box.add(dlabel)
         pw = Gtk.Entry(visibility=False, placeholder_text="Backup password (at least 8 characters)")
         pw.set_text(cfg.get("password", ""))
         box.add(pw)
@@ -10964,7 +11069,8 @@ class ChatPanel(Gtk.Box):
 
         def collect():
             return {"on": on.get_active(), "every": every.get_active_id(), "keep": int(keep.get_value()),
-                    "files": files.get_active(), "folder": folder.get_filename() or str(default),
+                    "files": files.get_active(), "drive": drive.get_active() and bool(gd),
+                    "folder": folder.get_filename() or str(default),
                     "password": pw.get_text(), "last": cfg.get("last", 0), "last_ok": cfg.get("last_ok", ""),
                     "last_error": cfg.get("last_error", "")}
 
@@ -10979,9 +11085,13 @@ class ChatPanel(Gtk.Box):
             def work():
                 self.chat.run_auto_backup()
                 c2 = self.win.cfg.get("auto_backup") or {}
+                drive_line = ""
+                if c2.get("drive"):
+                    drive_line = ("\n☁ " + ("Copied to " + esc(c2.get("drive_ok", "")) if not c2.get("drive_error")
+                                             else "Google Drive: " + esc(c2["drive_error"])))
                 GLib.idle_add(lambda: (now.set_label("Back up now"), now.set_sensitive(True), note.set_markup(
-                    f"<small>{'✓ Saved: ' + esc(c2.get('last_ok', '')) if not c2.get('last_error') else '✗ ' + esc(c2['last_error'])}</small>"))
-                    and False)
+                    f"<small>{'✓ Saved: ' + esc(c2.get('last_ok', '')) if not c2.get('last_error') else '✗ ' + esc(c2['last_error'])}"
+                    f"{drive_line}</small>")) and False)
             threading.Thread(target=work, daemon=True).start()
         now.connect("clicked", run_now)
         while True:

@@ -52,7 +52,9 @@ import java.util.Locale;
 /** The Chat tab: chats (friends and groups), a conversation, People, your profile. The same chats as the
  *  desktop app: phones and computers talk to each other. */
 final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
-    static final int REQ_ATTACH = 7101, REQ_PHOTO = 7102, REQ_WALL = 7104;
+    static final int REQ_ATTACH = 7101, REQ_PHOTO = 7102, REQ_WALL = 7104, REQ_BACKUP = 7105, REQ_RESTORE = 7106;
+    private String backupPassword;
+    private boolean backupFiles;
     private String wallFor;                         // which chat a wallpaper picture is for (null = all chats)
     static final String[] STICKERS = {"approved", "done", "thanks", "great", "onit", "urgent", "question", "meeting",
             "lunch", "coffee", "welcome", "birthday", "noted", "later", "yes", "no"};
@@ -673,6 +675,62 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                         if (afterPhoto != null) afterPhoto.run();
                     }).setNegativeButton("Cancel", null).show()
                     .getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> cv.rotate());
+        } else if (req == REQ_BACKUP && !uris.isEmpty() && backupPassword != null) {
+            final String pw = backupPassword;
+            final boolean files = backupFiles;
+            backupPassword = null;
+            Ui.toast(a, "Backing up…");
+            ChatEngine.bg(() -> {
+                String msg;
+                try (java.io.OutputStream out = a.getContentResolver().openOutputStream(uris.get(0))) {
+                    int[] r = ChatBackup.export(e, out, pw, files);
+                    msg = "Backup saved ✓\n\n" + r[0] + " chats · " + r[1] + " messages · " + r[2] + " attachments\n\nIt's "
+                            + "encrypted with your password. Restore it on any phone or PC with “Restore from a backup” "
+                            + "(PC: ⋯ → Import a profile).";
+                } catch (Exception ex) {
+                    msg = "The backup couldn't be saved: " + ex.getMessage();
+                }
+                final String m = msg;
+                a.runOnUiThread(() -> Ui.info(a, "Back up chats", m));
+            });
+        } else if (req == REQ_RESTORE && !uris.isEmpty()) {
+            final File f;
+            try {
+                f = new File(a.getCacheDir(), "restore.arckadprofile");
+                try (InputStream in = a.getContentResolver().openInputStream(uris.get(0)); FileOutputStream out = new FileOutputStream(f)) {
+                    Fs.pipe(in, out);
+                }
+            } catch (Exception ex) {
+                Ui.toast(a, "That file couldn't be opened");
+                return;
+            }
+            EditText pw = new EditText(a);
+            pw.setHint("The backup's password");
+            pw.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+            Ui.dialog(a).setTitle("Restore from a backup").setView(pw).setPositiveButton("Open", (d, w) -> {
+                String p = pw.getText().toString();
+                Ui.toast(a, "Opening the backup…");
+                ChatEngine.bg(() -> {
+                    try {
+                        Object[] r = ChatBackup.read(f, p);
+                        JSONObject backup = (JSONObject) r[0];
+                        a.runOnUiThread(() -> Ui.confirm(a, "Restore “" + backup.optString("device_name", "this backup") + "”?",
+                                "This phone continues as that profile, with its friends, groups and chats. The profile on this "
+                                        + "phone now is kept as a safety copy (⋮ → Restore my profile from before a link).",
+                                "Restore", () -> ChatEngine.bg(() -> {
+                                    try {
+                                        int[] res = ChatBackup.restore(e, f, backup, (byte[]) r[1]);
+                                        a.runOnUiThread(() -> Ui.info(a, "Restored ✓", res[0] + " chats · " + res[1] + " messages · "
+                                                + res[2] + " attachments"));
+                                    } catch (Exception ex) {
+                                        a.runOnUiThread(() -> Ui.info(a, "Couldn't restore", String.valueOf(ex.getMessage())));
+                                    }
+                                })));
+                    } catch (Exception ex) {
+                        a.runOnUiThread(() -> Ui.info(a, "Couldn't open the backup", String.valueOf(ex.getMessage())));
+                    }
+                });
+            }).setNegativeButton("Cancel", null).show();
         } else if (req == REQ_WALL && !uris.isEmpty()) {
             File folder = new File(new File(a.getFilesDir(), "chat"), "wallpapers");
             folder.mkdirs();
@@ -904,8 +962,16 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     private void listMenu() {
         String[] items = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
                 "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)",
-                "Restore my profile from before a link"};
+                "Restore my profile from before a link", "☁ Back up chats (Google Drive or anywhere)", "Restore from a backup"};
         Ui.dialog(a).setItems(items, (d, w) -> {
+            if (w == 7) {
+                backupChats();
+                return;
+            }
+            if (w == 8) {
+                a.startActivityForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), REQ_RESTORE);
+                return;
+            }
             if (w == 5) {
                 linkedDevices();
                 return;
@@ -1504,6 +1570,38 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 .setPositiveButton("💻 Join my PC's account", (x, w) -> linkThisPhone())
                 .setNeutralButton("Add my PC to this phone", (x, w) -> showLinkCode())
                 .setNegativeButton("Close", null).show();
+    }
+
+    private void backupChats() {
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
+        box.addView(Ui.text(a, "Saves your profile and chats (identity, friends, groups, messages) in one file, encrypted with "
+                + "a password. Next, choose where: Google Drive, your phone, a USB drive… Keep the password safe: "
+                + "without it nobody can open the backup, not even you.", 13, Ui.DIM, false));
+        EditText p1 = new EditText(a), p2 = new EditText(a);
+        for (EditText p : new EditText[]{p1, p2}) {
+            p.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+            box.addView(p);
+        }
+        p1.setHint("Password (at least 8 characters)");
+        p2.setHint("Type it again");
+        android.widget.CheckBox files = new android.widget.CheckBox(a);
+        files.setText("Also include attachments (photos and files; bigger)");
+        files.setTextColor(Ui.TEXT);
+        box.addView(files);
+        Ui.dialog(a).setTitle("☁ Back up chats").setView(box).setPositiveButton("Choose where to save", (d, w) -> {
+            String x = p1.getText().toString();
+            if (x.length() < 8 || !x.equals(p2.getText().toString())) {
+                Ui.toast(a, "The passwords must match and have at least 8 characters");
+                return;
+            }
+            backupPassword = x;
+            backupFiles = files.isChecked();
+            String name = e.myName() + " " + new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT).format(new Date()) + ".arckadprofile";
+            a.startActivityForResult(new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, name), REQ_BACKUP);
+        }).setNegativeButton("Cancel", null).show();
     }
 
     private void restoreBeforeLink() {
