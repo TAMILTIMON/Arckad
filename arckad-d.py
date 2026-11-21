@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.19.0"
+APP_VERSION = "3.20.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5933,6 +5933,9 @@ class Chat:
         self._tag_cache = (None, {})
         self.last_sync = 0
         self.ident = None
+        self.progress = {}               # transfer key -> {"dir", "done", "total", "start", "samples", "peer", "cancel"}
+        self.receipts_out = {}           # sender id -> {"gid": {"d": set(ids), "r": set(ids)}}
+        self._dirty, self._dirty_timer = set(), None
         self.people = {}                 # devices seen on the network: id -> {"name", "ip", "port", "ph", "os", "seen"}
         self.contacts = read_json(CHAT_DIR / "contacts.json", {})
         for k in ("friends", "incoming", "outgoing"):
@@ -5977,6 +5980,12 @@ class Chat:
 
     def _append(self, gid, msg):
         """Store a message once. Returns True if it was new."""
+        if msg.get("kind") == "delete":
+            self._apply_delete(gid, msg)
+        g = self.groups.get(gid)
+        if g and g.get("hidden") and msg.get("kind") not in ("delete", "system"):
+            g.pop("hidden", None)                 # a deleted chat comes back with a new message
+            self.save()
         with self.lock:
             if gid not in self.groups or msg.get("id") in self.ids.setdefault(gid, set()):
                 return False
@@ -6500,7 +6509,10 @@ class Chat:
         for m in reply.get("msgs", [])[:2000]:
             m = self._clean(m, gid)
             if m and self._append(gid, m):
-                new += 1
+                if m["kind"] not in ("system", "delete"):
+                    new += 1
+                    if m["from"] != self.me:
+                        self.queue_receipt(gid, m["from"], m["id"], "d")
                 if m.get("file"):
                     self._maybe_download(gid, m)
         if new:
@@ -6512,7 +6524,7 @@ class Chat:
         if not isinstance(m, dict) or not isinstance(m.get("id"), str) or len(m["id"]) > 40:
             return None
         kind = m.get("kind")
-        if kind not in ("text", "file", "system", "sticker"):
+        if kind not in ("text", "file", "system", "sticker", "delete"):
             return None
         out = {"id": m["id"], "from": str(m.get("from", ""))[:40], "name": str(m.get("name", "?"))[:40],
                "ts": float(m.get("ts", 0) or 0), "kind": kind, "text": str(m.get("text", ""))[:8000]}
@@ -7001,6 +7013,163 @@ class Chat:
             self.ui("on_pair_event", f"🤝 You're now friends with {r.get('name', 'someone')}")
             return {"ok": True, "proof": _hm(st["key"], "fcode-host", code).hex()}
         return {"ok": False, "reason": "unknown"}
+
+    # ---------- transfer progress (size, speed, time left)
+    def _progress_start(self, key, direction, total, peer):
+        pg = {"dir": direction, "done": 0, "total": max(1, total), "start": time.time(),
+              "samples": [(time.time(), 0)], "peer": peer, "cancel": False}
+        self.progress[key] = pg
+        return pg
+
+    @staticmethod
+    def _progress_add(pg, n):
+        pg["done"] += n
+        now = time.time()
+        if now - pg["samples"][-1][0] > 0.25:
+            pg["samples"].append((now, pg["done"]))
+            pg["samples"] = pg["samples"][-12:]           # the last ~3 seconds give the current speed
+
+    @staticmethod
+    def progress_stats(pg):
+        """(done, total, bytes per second, seconds left or None)."""
+        s = pg["samples"]
+        t0, d0 = s[0]
+        dt = max(0.001, time.time() - t0)
+        speed = (pg["done"] - d0) / dt if len(s) > 1 else pg["done"] / max(0.001, time.time() - pg["start"])
+        left = (pg["total"] - pg["done"]) / speed if speed > 1 else None
+        return pg["done"], pg["total"], speed, left
+
+    def uploads_for(self, fid):
+        return [pg for k, pg in list(self.progress.items()) if k.startswith(fid + ":")]
+
+    def cancel_download(self, fid):
+        pg = self.progress.get(fid)
+        if pg:
+            pg["cancel"] = True
+
+    # ---------- delivered / read receipts (✓✓ grey / blue)
+    def queue_receipt(self, gid, sender, mid, kind):
+        if not sender or sender == self.me:
+            return
+        if kind == "r" and not self.win.cfg.get("read_receipts", True):
+            return
+        box = self.receipts_out.setdefault(sender, {}).setdefault(gid, {"d": set(), "r": set()})
+        box[kind].add(mid)
+        threading.Timer(0.8, self.flush_receipts, args=(sender,)).start()
+
+    def flush_receipts(self, sender=None):
+        for did in ([sender] if sender else list(self.receipts_out)):
+            for gid, box in list(self.receipts_out.get(did, {}).items()):
+                if not box["d"] and not box["r"]:
+                    continue
+                d, r = sorted(box["d"]), sorted(box["r"])
+                if self._try(lambda: self._request(gid, did, "POST", "/c/receipt", {"d": d, "r": r}, timeout=6)) is not None:
+                    box["d"].difference_update(d)
+                    box["r"].difference_update(r)
+
+    def mark_read(self, gid):
+        """The chat is on screen: everything in it is read (and senders get blue ticks)."""
+        self.unread[gid] = 0
+        changed = False
+        for m in self.msgs.get(gid, []):
+            if m.get("from") != self.me and m.get("kind") not in ("system", "delete") and not m.get("r_sent") \
+                    and not m.get("deleted"):
+                m["r_sent"] = True
+                changed = True
+                self.queue_receipt(gid, m["from"], m["id"], "r")
+        if changed:
+            self._schedule_rewrite(gid)
+
+    def mark_unread(self, gid):
+        self.unread[gid] = max(1, self.unread.get(gid, 0))
+        self.ui("on_chat_changed", None)
+
+    def _got_receipt(self, gid, did, req):
+        want_d, want_r = set(req.get("d") or []), set(req.get("r") or [])
+        changed = False
+        for m in self.msgs.get(gid, []):
+            if m.get("from") != self.me:
+                continue
+            if m["id"] in want_d or m["id"] in want_r:
+                if did not in m.setdefault("delivered", []):
+                    m["delivered"].append(did)
+                    changed = True
+            if m["id"] in want_r and did not in m.setdefault("read", []):
+                m["read"].append(did)
+                changed = True
+        if changed:
+            self._schedule_rewrite(gid)
+            self.ui("on_chat_changed", gid)
+
+    def _schedule_rewrite(self, gid):
+        self._dirty.add(gid)
+        if self._dirty_timer is None:
+            def flush():
+                self._dirty_timer = None
+                for g in list(self._dirty):
+                    self._dirty.discard(g)
+                    if g in self.groups:
+                        self._rewrite(g)
+            self._dirty_timer = threading.Timer(1.0, flush)
+            self._dirty_timer.start()
+
+    # ---------- deleting messages and chats
+    def delete_for_me(self, gid, ids):
+        ids = set(ids)
+        for m in self.msgs.get(gid, []):
+            if m["id"] in ids:
+                for k in ("text", "file", "sticker", "voice", "sig"):
+                    m.pop(k, None)
+                m["deleted"] = "me"
+        self._rewrite(gid)
+        self.ui("on_chat_changed", gid)
+
+    def delete_for_everyone(self, gid, ids):
+        """Your own messages disappear for everyone (a signed request only you can make)."""
+        mine = [m["id"] for m in self.msgs.get(gid, []) if m["id"] in set(ids) and m.get("from") == self.me
+                and m.get("kind") not in ("system", "delete") and m.get("deleted") != "everyone"]
+        if not mine or not self.can_post(gid):
+            return 0
+        msg = self._sign(gid, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+                               "kind": "delete", "text": ",".join(mine)})
+        self._append(gid, msg)
+        self._deliver(gid, msg)
+        self.ui("on_chat_changed", gid)
+        return len(mine)
+
+    def _apply_delete(self, gid, dmsg):
+        targets = set(t for t in (dmsg.get("text") or "").split(",") if t)
+        changed = False
+        for m in self.msgs.get(gid, []):
+            if m["id"] in targets and m.get("from") == dmsg.get("from") and m.get("deleted") != "everyone":
+                if m.get("file") and m.get("from") == self.me:
+                    self.groups[gid].get("files", {}).pop(m["file"]["id"], None)     # stop serving it
+                if m.get("file") and m.get("from") != self.me:
+                    path = self.local_file(gid, m["file"]["id"])
+                    if path and (str(path).startswith(str(CHAT_DIR))):
+                        try:
+                            os.remove(path)
+                        except OSError:
+                            pass
+                for k in ("text", "file", "sticker", "voice", "sig"):
+                    m.pop(k, None)
+                m["deleted"] = "everyone"
+                changed = True
+        if changed:
+            self._schedule_rewrite(gid)
+
+    def clear_chat(self, gid):
+        self.delete_for_me(gid, [m["id"] for m in self.msgs.get(gid, []) if not m.get("deleted")])
+        self.unread[gid] = 0
+
+    def hide_chat(self, gid):
+        """Delete a friend chat from the list (it comes back when a new message arrives)."""
+        self.clear_chat(gid)
+        g = self.groups.get(gid)
+        if g:
+            g["hidden"] = True
+            self.save()
+        self.ui("on_chat_changed", None)
 
     # ---------- one-time messages
     def _rewrite(self, gid):
@@ -7500,14 +7669,24 @@ class Chat:
                 cipher = StreamCipher(_hm(key, "chatfile", fid))
                 mac = hmacmod.new(_hm(key, "chatfile-mac", fid), digestmod=hashlib.sha256)
                 left = size
+                pg = self._progress_start(fid, "down", size, msg.get("name", "?"))
                 with open(tmp, "wb") as f:
                     while left > 0:
+                        if pg["cancel"]:
+                            break
                         chunk = r.read(min(1 << 18, left))
                         if not chunk:
                             break
                         mac.update(chunk)
                         f.write(cipher.apply(chunk))
                         left -= len(chunk)
+                        self._progress_add(pg, len(chunk))
+                cancelled = pg["cancel"]
+                self.progress.pop(fid, None)
+                if cancelled:
+                    c.close()
+                    tmp.unlink(missing_ok=True)
+                    return
                 tag = r.read(32)
                 c.close()
                 if left or not hmacmod.compare_digest(tag, mac.digest()):
@@ -7589,7 +7768,9 @@ class Chat:
             if g.get("owner_only") and did != g.get("owner"):
                 return reply({"ok": False, "reason": "only the owner can post in this group"}, 403)
             if self._append(gid, m):
-                self.unread[gid] = self.unread.get(gid, 0) + 1
+                if m["kind"] not in ("system", "delete"):
+                    self.unread[gid] = self.unread.get(gid, 0) + 1
+                    self.queue_receipt(gid, m["from"], m["id"], "d")
                 self.ui("on_chat_message", gid, m)
                 if m.get("file"):
                     self._maybe_download(gid, m)
@@ -7598,9 +7779,10 @@ class Chat:
             known = set(req.get("ids") or [])
             cutoff = time.time() - CHAT_HISTORY_DAYS * 86400
             with self.lock:
-                out = [{k: v for k, v in m.items() if k not in ("local", "opened_by")} for m in self.msgs.get(gid, [])
+                out = [{k: v for k, v in m.items() if k not in ("local", "opened_by", "delivered", "read", "r_sent")}
+                       for m in self.msgs.get(gid, [])
                        if m["id"] not in known and m.get("ts", 0) > cutoff and not m.get("local")
-                       and not m.get("opened")
+                       and not m.get("opened") and not m.get("deleted")
                        and not (m.get("once") and (m.get("from") != self.me or did in m.get("opened_by", [])))]
             return reply({"ok": True, "msgs": out[-2000:]})
         if path == "/c/meta" and pair and did == g.get("owner"):
@@ -7610,6 +7792,9 @@ class Chat:
             if did not in g["members"]:
                 return reply({"id": gid, "removed": True})
             return reply(self._meta_for_members(g))
+        if path == "/c/receipt" and not pair:
+            self._got_receipt(gid, did, req)
+            return reply({"ok": True})
         if path == "/c/viewed" and not pair:
             self._viewed_by(gid, str(req.get("id", "")), did)
             return reply({"ok": True})
@@ -7667,17 +7852,26 @@ class Chat:
         h.end_headers()
         cipher = StreamCipher(_hm(key, "chatfile", fid))
         mac = hmacmod.new(_hm(key, "chatfile-mac", fid), digestmod=hashlib.sha256)
-        with open(src, "rb") as f:
-            left = size
-            while left > 0:
-                chunk = f.read(min(1 << 18, left))
-                if not chunk:
-                    break
-                enc = cipher.apply(chunk)
-                mac.update(enc)
-                h.wfile.write(enc)
-                left -= len(chunk)
-        h.wfile.write(mac.digest())
+        who = (self.groups[gid].get("members", {}).get(did) or {}).get("name", "someone")
+        pg = self._progress_start(f"{fid}:{did}", "up", size, who) if size > 2_000_000 else None
+        try:
+            with open(src, "rb") as f:
+                left = size
+                while left > 0:
+                    chunk = f.read(min(1 << 18, left))
+                    if not chunk:
+                        break
+                    enc = cipher.apply(chunk)
+                    mac.update(enc)
+                    h.wfile.write(enc)
+                    left -= len(chunk)
+                    if pg:
+                        self._progress_add(pg, len(chunk))
+            h.wfile.write(mac.digest())
+        finally:
+            if pg:
+                self.progress.pop(f"{fid}:{did}", None)
+                self.ui("on_chat_changed", gid)
 
 
 # ---------------------------------------------------------------- Audio: intercom calls and voice messages
@@ -8074,6 +8268,16 @@ CHAT_CSS = b"""
 .chat-mine .chat-text text { color: #ffffff; }
 .chat-system { opacity: 0.65; }
 .chat-code { font-size: 22px; font-weight: bold; letter-spacing: 4px; }
+@keyframes arckad-stripes { from { background-position: 0px 0px; } to { background-position: 28px 0px; } }
+@keyframes arckad-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.3; } 100% { opacity: 1.0; } }
+progressbar.arckad-transfer trough { min-height: 8px; border-radius: 5px; }
+progressbar.arckad-transfer progress { min-height: 8px; border-radius: 5px; background-color: #2f7fd8;
+  background-image: linear-gradient(135deg, rgba(255,255,255,0.30) 25%, transparent 25%, transparent 50%,
+                    rgba(255,255,255,0.30) 50%, rgba(255,255,255,0.30) 75%, transparent 75%, transparent);
+  background-size: 28px 28px; animation: arckad-stripes 0.7s linear infinite; }
+progressbar.arckad-up progress { background-color: #26a269; }
+.arckad-pulse { animation: arckad-pulse 1.1s ease-in-out infinite; }
+.chat-selected { background-color: alpha(#2f7fd8, 0.16); border-radius: 10px; }
 """
 _chat_css_loaded = []
 
@@ -8456,6 +8660,10 @@ class ChatPanel(Gtk.Box):
             it = Gtk.MenuItem(label=label)
             it.connect("activate", lambda _i, cb=cb: cb())
             lmenu.append(it)
+        rr = Gtk.CheckMenuItem(label="Send read receipts (blue ticks)")
+        rr.set_active(win.cfg.get("read_receipts", True))
+        rr.connect("toggled", lambda i: win.cfg.__setitem__("read_receipts", i.get_active()))
+        lmenu.append(rr)
         snd = Gtk.CheckMenuItem(label="Message sounds")
         snd.set_active(win.cfg.get("chat_sound", True))
 
@@ -8537,6 +8745,11 @@ class ChatPanel(Gtk.Box):
         tb.add(self.conv_title)
         tb.add(self.info)
         head.pack_start(tb, True, True, 0)
+        self.find_btn = Gtk.ToggleButton()
+        self.find_btn.add(Gtk.Image.new_from_icon_name("edit-find-symbolic", Gtk.IconSize.BUTTON))
+        self.find_btn.set_tooltip_text("Search messages, filter by type and date")
+        self.find_btn.connect("toggled", self._toggle_find)
+        head.add(self.find_btn)
         self.call_btn = Gtk.Button(label="📞")
         self.call_btn.set_tooltip_text("Call (intercom)")
         self.call_btn.connect("clicked", lambda *_: self.start_call())
@@ -8561,6 +8774,29 @@ class ChatPanel(Gtk.Box):
             self.code_box.add(w)
         self.code_box.set_no_show_all(True)
         conv.add(self.code_box)
+
+        # search and filters (🔍 in the header)
+        self.find_bar = Gtk.Box(spacing=4)
+        self.find_text = Gtk.SearchEntry(placeholder_text="Search messages", hexpand=True)
+        self.find_text.connect("search-changed", lambda *_: self.show_messages())
+        self.find_kind = Gtk.ComboBoxText()
+        for k, label in (("all", "Everything"), ("text", "Messages"), ("file", "Files"), ("photo", "Photos"),
+                         ("sticker", "Stickers"), ("voice", "Voice"), ("call", "Calls")):
+            self.find_kind.append(k, label)
+        self.find_kind.set_active_id("all")
+        self.find_kind.connect("changed", lambda *_: self.show_messages())
+        self.find_date = Gtk.ComboBoxText()
+        for k, label in (("any", "Any time"), ("today", "Today"), ("yesterday", "Yesterday"), ("7", "Last 7 days"),
+                         ("30", "Last 30 days"), ("day", "Pick a day…")):
+            self.find_date.append(k, label)
+        self.find_date.set_active_id("any")
+        self.find_date.connect("changed", self._date_changed)
+        self.find_day = None
+        for w in (self.find_text, self.find_kind, self.find_date):
+            self.find_bar.add(w)
+        self.find_bar.set_no_show_all(True)
+        conv.add(self.find_bar)
+        self.select_mode, self.selected = False, set()
 
         self.stack = Gtk.Stack()
         self.stack.add_named(Gtk.Label(), "empty")
@@ -8632,6 +8868,21 @@ class ChatPanel(Gtk.Box):
         self.rec_bar.set_no_show_all(True)
         conv.add(self.rec_bar)
         self.recorder, self.players = None, {}
+        self.sel_bar = Gtk.Box(spacing=6)
+        self.sel_label = Gtk.Label(xalign=0, hexpand=True)
+        self.sel_bar.pack_start(self.sel_label, True, True, 0)
+        for label, cb, style in (("Delete for me", lambda: self.delete_selected(False), None),
+                                 ("Delete for everyone", lambda: self.delete_selected(True), "destructive-action"),
+                                 ("Cancel", lambda: self.set_select(False), None)):
+            b = Gtk.Button(label=label)
+            if style:
+                b.get_style_context().add_class(style)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            self.sel_bar.add(b)
+        self.sel_bar.set_no_show_all(True)
+        conv.add(self.sel_bar)
+        self._live = {}                     # transfer key -> (progress bar, label) while files move
+        GLib.timeout_add(300, self._tick_transfers)
         self.readonly = Gtk.Label(label="Only the group owner can post here.")
         self.readonly.get_style_context().add_class("dim-label")
         self.readonly.set_no_show_all(True)
@@ -8697,9 +8948,14 @@ class ChatPanel(Gtk.Box):
             self.refresh()
             return
         self.gid = gid
+        if self.select_mode:
+            self.set_select(False)
+        if not (self.chat.join_active() and self.chat.join["gid"] == gid):
+            self.code_box.hide()                      # another group's join code doesn't belong here
         self.pages.set_visible_child_name("conv")
         self.show_messages()
         self.update_info()
+        self.chat.mark_read(gid)
         self.chat.unread[gid] = 0
         self.win.update_chat_button()
         self.entry.grab_focus()
@@ -8749,6 +9005,8 @@ class ChatPanel(Gtk.Box):
         order = sorted(self.chat.groups, key=lambda g: -((self.chat.msgs.get(g) or [{}])[-1].get("ts", 0)
                                                           or self.chat.groups[g].get("created", 0)))
         for g in order:
+            if self.chat.groups[g].get("hidden"):
+                continue
             self.chat_list.add(self._chat_row(g))
         self.chat_list.show_all()
         self.list_stack.set_visible_child_name("chats" if order else "empty")
@@ -8771,9 +9029,14 @@ class ChatPanel(Gtk.Box):
         top = Gtk.Box(spacing=6)
         name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
         icon = "" if g.get("kind") == "direct" else "👥 "
-        name.set_markup(f"<b>{esc(icon + self.chat_title(gid))}</b>" + (" <small>(left)</small>" if g.get("removed") else ""))
+        unread = self.chat.unread.get(gid, 0)
+        weight = "heavy" if unread else "bold"
+        name.set_markup(f"<span weight='{weight}'>{esc(icon + self.chat_title(gid))}</span>"
+                        + (" <small>(left)</small>" if g.get("removed") else ""))
+        ev_box = Gtk.EventBox()
         top.pack_start(name, True, True, 0)
-        last = (self.chat.msgs.get(gid) or [None])[-1]
+        visible = [m for m in self.chat.msgs.get(gid, []) if m.get("kind") != "delete" and m.get("deleted") != "me"]
+        last = visible[-1] if visible else None
         if last:
             when = last.get("ts", 0)
             stamp = time.strftime("%H:%M", time.localtime(when)) if time.time() - when < 86400 else \
@@ -8793,6 +9056,8 @@ class ChatPanel(Gtk.Box):
                 what = "🎤 Voice message"
             if last.get("once"):
                 what = "👁 One-time message"
+            if last.get("deleted") == "everyone":
+                what = "🚫 Message deleted"
             prev = (who + what).replace("\n", " ")
         else:
             prev = "Say hello 👋" if g.get("kind") == "direct" else "No messages yet"
@@ -8806,8 +9071,34 @@ class ChatPanel(Gtk.Box):
             bottom.add(badge)
         texts.add(bottom)
         box.pack_start(texts, True, True, 0)
-        row.add(box)
+        ev_box.add(box)
+        ev_box.connect("button-press-event", lambda w, event, gid=gid: (self.chat_menu(gid, event), True)[1]
+                       if event.button == 3 else False)
+        row.add(ev_box)
         return row
+
+    def chat_menu(self, gid, event):
+        g = self.chat.groups[gid]
+        menu = Gtk.Menu()
+
+        def add(label, cb):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda *_: cb())
+            menu.append(it)
+        if self.chat.unread.get(gid):
+            add("Mark as read", lambda: (self.chat.mark_read(gid), self.refresh()))
+        else:
+            add("Mark as unread", lambda: self.chat.mark_unread(gid))
+        add("Clear chat (delete all messages here)", lambda: self.win.confirm(
+            f"Delete all messages in “{self.chat_title(gid)}” from this computer?") and self.chat.clear_chat(gid))
+        if g.get("kind") == "direct":
+            add("Delete chat", lambda: self.win.confirm(
+                f"Delete the chat with {self.chat_title(gid)}?\n\nIts messages are removed from this computer and it "
+                "leaves the list until a new message arrives. You stay friends.") and self.chat.hide_chat(gid))
+        else:
+            add("Leave or delete group…", lambda: (self.open_chat(gid), self.leave()))
+        menu.show_all()
+        menu.popup_at_pointer(event)
 
     def update_info(self):
         g = self.chat.groups.get(self.gid) if self.gid else None
@@ -9107,9 +9398,19 @@ class ChatPanel(Gtk.Box):
             self.stack.set_visible_child_name("empty")
             return
         self.stack.set_visible_child_name("messages")
-        self.chat.unread[self.gid] = 0
+        if self.pages.get_visible_child_name() == "conv" and self.get_mapped():
+            self.chat.mark_read(self.gid)
+        self._live = {}
         last_day = None
-        for m in self.chat.msgs.get(self.gid, [])[-300:]:
+        shown = [m for m in self.chat.msgs.get(self.gid, []) if m.get("kind") != "delete" and m.get("deleted") != "me"]
+        shown = [m for m in shown if self._matches(m)]
+        if self.find_bar.get_visible() and not shown:
+            e = Gtk.Label(label="No messages match the search or filters.", margin=20)
+            e.get_style_context().add_class("dim-label")
+            r = Gtk.ListBoxRow(activatable=False)
+            r.add(e)
+            self.list.add(r)
+        for m in shown[-300:]:
             day = time.strftime("%A %d %B %Y", time.localtime(m.get("ts", 0)))
             if day != last_day:
                 last_day = day
@@ -9123,6 +9424,149 @@ class ChatPanel(Gtk.Box):
         self.list.show_all()
         GLib.idle_add(self._scroll_bottom)
         self.win.update_chat_button()
+
+    # ---------- search and filters
+    def _toggle_find(self, btn):
+        on = btn.get_active()
+        self.find_bar.set_no_show_all(not on)
+        self.find_bar.set_visible(on)
+        if on:
+            self.find_bar.show_all()
+            self.find_text.grab_focus()
+        else:
+            self.find_text.set_text("")
+            self.find_kind.set_active_id("all")
+            self.find_date.set_active_id("any")
+        self.show_messages()
+
+    def _date_changed(self, combo):
+        if combo.get_active_id() == "day":
+            pop = Gtk.Popover(relative_to=combo)
+            cal = Gtk.Calendar(margin=6)
+
+            def picked(c):
+                y, mo, d = c.get_date()
+                self.find_day = time.mktime((y, mo + 1, d, 0, 0, 0, 0, 0, -1))
+                pop.popdown()
+                self.show_messages()
+            cal.connect("day-selected-double-click", picked)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            box.add(cal)
+            ok = Gtk.Button(label="Show this day")
+            ok.connect("clicked", lambda *_: picked(cal))
+            box.add(ok)
+            pop.add(box)
+            pop.show_all()
+            pop.popup()
+            return
+        self.show_messages()
+
+    def _matches(self, m):
+        if not self.find_bar.get_visible():
+            return True
+        q = self.find_text.get_text().strip().lower()
+        kind = self.find_kind.get_active_id() or "all"
+        f = m.get("file") or {}
+        if q and q not in (m.get("text", "") + " " + f.get("name", "") + " " + m.get("name", "")).lower():
+            return False
+        is_call = m.get("kind") == "system" and (m.get("text", "").startswith("📞"))
+        if kind == "text" and not (m.get("kind") == "text"):
+            return False
+        if kind == "file" and not (f and not m.get("voice") and m.get("kind") == "file"):
+            return False
+        if kind == "photo" and not (f and ext_of(f.get("name", "")) in IMAGE_EXTS and m.get("kind") == "file"):
+            return False
+        if kind == "sticker" and m.get("kind") != "sticker":
+            return False
+        if kind == "voice" and not m.get("voice"):
+            return False
+        if kind == "call" and not is_call:
+            return False
+        when = self.find_date.get_active_id() or "any"
+        ts = m.get("ts", 0)
+        lt = time.localtime()
+        midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        if when == "today" and ts < midnight:
+            return False
+        if when == "yesterday" and not (midnight - 86400 <= ts < midnight):
+            return False
+        if when in ("7", "30") and ts < time.time() - int(when) * 86400:
+            return False
+        if when == "day" and self.find_day and not (self.find_day <= ts < self.find_day + 86400):
+            return False
+        return True
+
+    # ---------- select and delete
+    def set_select(self, on):
+        self.select_mode, self.selected = on, set()
+        self.sel_bar.set_no_show_all(not on)
+        self.sel_bar.set_visible(on)
+        if on:
+            self.sel_bar.show_all()
+        self.composer.set_visible(not on and self.chat.can_post(self.gid))
+        self._update_sel_label()
+        self.show_messages()
+
+    def _update_sel_label(self):
+        n = len(self.selected)
+        self.sel_label.set_markup(f"<b>{n} selected</b>" if n else "Tick the messages to delete")
+
+    def toggle_selected(self, mid, on):
+        (self.selected.add if on else self.selected.discard)(mid)
+        self._update_sel_label()
+
+    def delete_selected(self, everyone):
+        ids = set(self.selected)
+        if not ids:
+            return
+        if everyone:
+            mine = [m for m in self.chat.msgs.get(self.gid, []) if m["id"] in ids and m.get("from") == self.chat.me]
+            if len(mine) < len(ids):
+                self.win.info("Only your own messages can be deleted for everyone. Others' messages were left as they are "
+                              "(use Delete for me for those).")
+            if not mine or not self.win.confirm(f"Delete {len(mine)} message{'s' if len(mine) != 1 else ''} for "
+                                                "everyone?\n\nThey'll show as “This message was deleted”."):
+                return
+            self.chat.delete_for_everyone(self.gid, [m["id"] for m in mine])
+        else:
+            if not self.win.confirm(f"Delete {len(ids)} message{'s' if len(ids) != 1 else ''} from this computer?"):
+                return
+            self.chat.delete_for_me(self.gid, ids)
+        self.set_select(False)
+
+    def message_menu(self, m, event):
+        menu = Gtk.Menu()
+        mine = m.get("from") == self.chat.me
+
+        def add(label, cb, ok=True):
+            it = Gtk.MenuItem(label=label)
+            it.set_sensitive(ok)
+            it.connect("activate", lambda *_: cb())
+            menu.append(it)
+        if m.get("kind") == "text" and not m.get("once") and not m.get("deleted"):
+            add("Copy text", lambda: self.win.copy_text(m.get("text", "")))
+        add("Select…", lambda: (self.set_select(True), self.toggle_selected(m["id"], True), self.show_messages()))
+        add("Info (time, delivered, read)", lambda: self.message_info(m))
+        menu.append(Gtk.SeparatorMenuItem())
+        add("Delete for me", lambda: self.win.confirm("Delete this message from this computer?")
+            and self.chat.delete_for_me(self.gid, [m["id"]]))
+        if mine and m.get("kind") not in ("system",) and not m.get("deleted"):
+            add("Delete for everyone", lambda: self.win.confirm("Delete this message for everyone?")
+                and self.chat.delete_for_everyone(self.gid, [m["id"]]), self.chat.can_post(self.gid))
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def message_info(self, m):
+        g = self.chat.groups.get(self.gid) or {}
+        names = lambda ids: ", ".join((g.get("members", {}).get(d) or {}).get("name", "?") for d in ids) or "nobody yet"
+        lines = [time.strftime("Sent %A %d %B %Y at %H:%M:%S", time.localtime(m.get("ts", 0)))]
+        if m.get("from") == self.chat.me and m.get("kind") != "system":
+            lines += [f"Delivered to: {names(m.get('delivered', []))}", f"Read by: {names(m.get('read', []))}"]
+        else:
+            lines.append(f"From: {m.get('name', '?')}")
+        if m.get("file"):
+            lines.append(f"File: {m['file']['name']} ({human_size(m['file']['size'])})")
+        self.win.info("\n".join(lines))
 
     def _scroll_bottom(self):
         adj = self.scroll.get_vadjustment()
@@ -9140,6 +9584,11 @@ class ChatPanel(Gtk.Box):
             row.add(lbl)
             return row
         outer = Gtk.Box(margin_start=6, margin_end=6, margin_top=3, margin_bottom=3)
+        if self.select_mode:
+            tick = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            tick.set_active(m["id"] in self.selected)
+            tick.connect("toggled", lambda b, mid=m["id"]: self.toggle_selected(mid, b.get_active()))
+            outer.pack_start(tick, False, False, 0)
         bubble = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         ctx = bubble.get_style_context()
         ctx.add_class("chat-bubble")
@@ -9148,7 +9597,12 @@ class ChatPanel(Gtk.Box):
             nm = Gtk.Label(xalign=0)
             nm.set_markup(f"<small><b>{esc(m.get('name', '?'))}</b></small>")
             bubble.add(nm)
-        if m.get("once"):
+        if m.get("deleted") == "everyone":
+            dl = Gtk.Label(xalign=0)
+            dl.set_markup("<i>🚫 " + ("You deleted this message" if mine else "This message was deleted") + "</i>")
+            dl.set_opacity(0.8)
+            bubble.add(dl)
+        elif m.get("once"):
             bubble.add(self._once_widget(m, mine))
         elif m.get("voice") and m.get("file"):
             bubble.add(self._voice_widget(m))
@@ -9167,17 +9621,52 @@ class ChatPanel(Gtk.Box):
                                   "per-person signatures.")
             bubble.add(warn)
         tl = Gtk.Label(xalign=1)
-        tl.set_markup(f"<small>{when}</small>")
-        tl.set_opacity(0.75)
+        ticks = self._ticks(m) if mine and m.get("deleted") != "everyone" else ""
+        tl.set_markup(f"<small>{when}</small>{ticks}")
+        tl.set_opacity(0.9)
+        tl.set_tooltip_text(time.strftime("%A %d %B %Y, %H:%M:%S", time.localtime(m.get("ts", 0)))
+                            + (("\n" + self._tick_text(m)) if mine else ""))
+        tl.set_has_tooltip(True)
         bubble.add(tl)
+        ev = Gtk.EventBox()
+        ev.add(bubble)
+        ev.connect("button-press-event", lambda w, event, m=m: (self.message_menu(m, event), True)[1]
+                   if event.button == 3 else False)
         if mine:
-            outer.pack_end(bubble, False, False, 0)
+            outer.pack_end(ev, False, False, 0)
             outer.set_margin_start(40)
         else:
-            outer.pack_start(bubble, False, False, 0)
+            outer.pack_start(ev, False, False, 0)
             outer.set_margin_end(40)
+        if m["id"] in self.selected:
+            outer.get_style_context().add_class("chat-selected")
         row.add(outer)
         return row
+
+    def _others(self):
+        g = self.chat.groups.get(self.gid) or {}
+        return [d for d in g.get("members", {}) if d != self.chat.me]
+
+    def _ticks(self, m):
+        """✓ sent · ✓✓ delivered · blue ✓✓ read (by everyone)."""
+        others = self._others()
+        read, delivered = set(m.get("read", [])), set(m.get("delivered", []))
+        if others and all(d in read for d in others):
+            return "  <span foreground='#7df9ff' weight='heavy'>✓✓</span>"
+        if delivered or read:
+            return "  <span weight='bold'>✓✓</span>"
+        return "  <span>✓</span>"
+
+    def _tick_text(self, m):
+        others = self._others()
+        read, delivered = set(m.get("read", [])), set(m.get("delivered", []))
+        if others and all(d in read for d in others):
+            return "Read" if len(others) == 1 else "Read by everyone"
+        if read:
+            return f"Read by {len(read)} of {len(others)}"
+        if delivered:
+            return "Delivered" if len(others) == 1 else f"Delivered to {len(delivered)} of {len(others)}"
+        return "Sent"
 
     # ---------- voice messages
     def _voice_widget(self, m):
@@ -9439,14 +9928,83 @@ class ChatPanel(Gtk.Box):
             btns.add(o)
             btns.add(sh)
         elif f["id"] in self.chat.downloading:
-            btns.add(Gtk.Label(label="Downloading…"))
+            texts.add(self._progress_widget(f["id"], "down"))
+            cancel = Gtk.Button(label="Cancel")
+            cancel.connect("clicked", lambda *_: self.chat.cancel_download(f["id"]))
+            btns.add(cancel)
         else:
             d = Gtk.Button(label="Download")
             d.set_tooltip_text("Downloads from the sender (or another member who has it) while they're online")
             d.connect("clicked", lambda *_: self.chat.download(self.gid, m))
             btns.add(d)
         texts.add(btns)
+        if m.get("from") == self.chat.me:
+            for i, pg in enumerate(self.chat.uploads_for(f["id"])):
+                texts.add(self._progress_widget(f["id"], "up", pg))
         return box
+
+    def _progress_widget(self, fid, direction, pg=None):
+        """An animated progress bar with size, speed and time left (kept up to date by _tick_transfers)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, margin_top=4)
+        top = Gtk.Box(spacing=6)
+        arrow = Gtk.Label(label="⬇" if direction == "down" else "⬆")
+        arrow.get_style_context().add_class("arckad-pulse")
+        lbl = Gtk.Label(xalign=0)
+        top.add(arrow)
+        top.add(lbl)
+        bar = Gtk.ProgressBar()
+        bar.set_size_request(230, -1)
+        bar.get_style_context().add_class("arckad-transfer")
+        if direction == "up":
+            bar.get_style_context().add_class("arckad-up")
+        box.add(top)
+        box.add(bar)
+        key = fid if direction == "down" else f"{fid}:{id(pg)}"
+        self._live[key] = (bar, lbl, direction, fid, pg)
+        self._update_progress(key)
+        return box
+
+    @staticmethod
+    def _fmt_time(secs):
+        if secs is None:
+            return "working out the time…"
+        secs = int(secs)
+        if secs < 60:
+            return f"{secs} s left"
+        if secs < 3600:
+            return f"about {secs // 60} min {secs % 60:02d} s left"
+        return f"about {secs // 3600} h {secs % 3600 // 60:02d} min left"
+
+    def _update_progress(self, key):
+        bar, lbl, direction, fid, pg = self._live[key]
+        if direction == "down":
+            pg = self.chat.progress.get(fid)
+        if not pg:
+            lbl.set_markup("<small>Starting…</small>")
+            bar.pulse()
+            return
+        done, total, speed, left = Chat.progress_stats(pg)
+        bar.set_fraction(min(1.0, done / total))
+        who = "" if direction == "down" else f"Sending to {esc(pg.get('peer', '?'))} · "
+        lbl.set_markup(f"<small>{who}<b>{done * 100 // total}%</b> · {human_size(done)} of {human_size(total)} · "
+                       f"{human_size(speed)}/s · {self._fmt_time(left)}</small>")
+
+    def _tick_transfers(self):
+        for key in list(self._live):
+            try:
+                if self._live[key][0].get_mapped():
+                    self._update_progress(key)
+            except KeyError:
+                pass
+        # a new upload started (someone is downloading my file): show it
+        if self.gid and self.pages.get_visible_child_name() == "conv":
+            mine = {(m.get("file") or {}).get("id") for m in self.chat.msgs.get(self.gid, [])
+                    if m.get("from") == self.chat.me and m.get("file")}
+            ups = sum(1 for k, pg in list(self.chat.progress.items()) if pg["dir"] == "up" and k.split(":")[0] in mine)
+            shown = sum(1 for v in self._live.values() if v[2] == "up")
+            if ups != shown and self.get_mapped():
+                self.show_messages()
+        return True
 
     # ---------- actions
     def send(self):
@@ -9818,6 +10376,14 @@ class ChatPanel(Gtk.Box):
             self.more_menu.show_all()
             return
         owner = self.chat.is_owner(self.gid)
+        for label, cb in (("Search and filter…", lambda: self.find_btn.set_active(True)),
+                          ("Select messages…", lambda: self.set_select(True)),
+                          ("Clear chat…", lambda: self.win.confirm("Delete all messages here from this computer?")
+                           and self.chat.clear_chat(self.gid))):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            self.more_menu.append(it)
+        self.more_menu.append(Gtk.SeparatorMenuItem())
         if g.get("kind") == "direct":
             for label, cb, ok in (("Safety code…", self.show_safety_code, not g.get("removed")),
                                   ("Open the attachments folder", lambda: (
@@ -12479,7 +13045,7 @@ class MainWindow(Gtk.ApplicationWindow):
         visible = any(p.gid == gid and p.get_mapped() and p.pages.get_visible_child_name() == "conv"
                       for p in self.chat_panels())
         if visible and (self.is_active() or any(w.is_active() for w in self.chat_windows)):
-            self.chat.unread[gid] = 0
+            self.chat.mark_read(gid)
             self.update_chat_button()
             return False
         if msg["kind"] == "system":

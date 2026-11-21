@@ -166,6 +166,12 @@ final class ChatEngine {
     }
 
     boolean append(String gid, JSONObject m) {
+        if ("delete".equals(m.optString("kind"))) applyDelete(gid, m);
+        JSONObject hg = groups.get(gid);
+        if (hg != null && hg.optBoolean("hidden") && !"delete".equals(m.optString("kind")) && !"system".equals(m.optString("kind"))) {
+            hg.remove("hidden");
+            save();
+        }
         synchronized (lock) {
             if (!groups.containsKey(gid)) return false;
             Set<String> set = ids.computeIfAbsent(gid, k -> Collections.synchronizedSet(new HashSet<>()));
@@ -280,7 +286,8 @@ final class ChatEngine {
         String id = m.optString("id");
         if (id.isEmpty() || id.length() > 40) return null;
         String kind = m.optString("kind");
-        if (!kind.equals("text") && !kind.equals("file") && !kind.equals("system") && !kind.equals("sticker")) return null;
+        if (!kind.equals("text") && !kind.equals("file") && !kind.equals("system") && !kind.equals("sticker") && !kind.equals("delete"))
+            return null;
         JSONObject out = new JSONObject();
         put(out, "id", id);
         put(out, "from", cut(m.optString("from"), 40));
@@ -1298,7 +1305,9 @@ final class ChatEngine {
         if (list != null) for (int i = 0; i < Math.min(list.length(), 2000); i++) {
             JSONObject m = clean(list.opt(i), gid);
             if (m != null && append(gid, m)) {
+                if ("system".equals(m.optString("kind")) || "delete".equals(m.optString("kind"))) continue;
                 added++;
+                queueReceipt(gid, m.optString("from"), m.optString("id"), false);
                 if (m.optJSONObject("file") != null) maybeDownload(gid, m);
             }
         }
@@ -1306,6 +1315,137 @@ final class ChatEngine {
             unread.merge(gid, added, Integer::sum);
             ui.changed(gid);
         }
+    }
+
+    // ================================================================= receipts (✓✓ delivered, blue ✓✓ read)
+    private final Map<String, Map<String, Set<String>[]>> receiptsOut = new ConcurrentHashMap<>();
+    volatile boolean sendReadReceipts = true;
+
+    @SuppressWarnings("unchecked")
+    void queueReceipt(String gid, String sender, String mid, boolean read) {
+        if (sender == null || sender.isEmpty() || sender.equals(me) || (read && !sendReadReceipts)) return;
+        Set<String>[] box = receiptsOut.computeIfAbsent(sender, k -> new ConcurrentHashMap<>())
+                .computeIfAbsent(gid, k -> new Set[]{Collections.synchronizedSet(new HashSet<>()), Collections.synchronizedSet(new HashSet<>())});
+        box[read ? 1 : 0].add(mid);
+        bg(() -> {
+            sleep(800);
+            flushReceipts(sender);
+        });
+    }
+
+    void flushReceipts(String sender) {
+        Map<String, Set<String>[]> m = receiptsOut.get(sender);
+        if (m == null) return;
+        for (Map.Entry<String, Set<String>[]> e : m.entrySet()) {
+            Set<String>[] box = e.getValue();
+            List<String> d = new ArrayList<>(box[0]), r = new ArrayList<>(box[1]);
+            if (d.isEmpty() && r.isEmpty()) continue;
+            try {
+                request(e.getKey(), sender, "POST", "/c/receipt", new Obj().putOpt("d", new JSONArray(d)).putOpt("r", new JSONArray(r)), null, 6000);
+                box[0].removeAll(d);
+                box[1].removeAll(r);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** The conversation is on screen: its messages are read. */
+    void markRead(String gid) {
+        unread.put(gid, 0);
+        boolean changed = false;
+        for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
+            String k = m.optString("kind");
+            if (!me.equals(m.optString("from")) && !k.equals("system") && !k.equals("delete") && !m.optBoolean("r_sent") && !m.has("deleted")) {
+                put(m, "r_sent", true);
+                changed = true;
+                queueReceipt(gid, m.optString("from"), m.optString("id"), true);
+            }
+        }
+        if (changed) rewrite(gid);
+    }
+
+    private void gotReceipt(String gid, String did, JSONObject req) {
+        Set<String> d = new HashSet<>(), r = new HashSet<>();
+        JSONArray a = req.optJSONArray("d"), b = req.optJSONArray("r");
+        if (a != null) for (int i = 0; i < a.length(); i++) d.add(a.optString(i));
+        if (b != null) for (int i = 0; i < b.length(); i++) r.add(b.optString(i));
+        boolean changed = false;
+        for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
+            if (!me.equals(m.optString("from"))) continue;
+            String id = m.optString("id");
+            if (d.contains(id) || r.contains(id)) changed |= addTo(m, "delivered", did);
+            if (r.contains(id)) changed |= addTo(m, "read", did);
+        }
+        if (changed) {
+            rewrite(gid);
+            ui.changed(gid);
+        }
+    }
+
+    private static boolean addTo(JSONObject m, String field, String did) {
+        JSONArray a = m.optJSONArray(field);
+        if (a == null) {
+            a = new JSONArray();
+            put(m, field, a);
+        }
+        for (int i = 0; i < a.length(); i++) if (did.equals(a.optString(i))) return false;
+        a.put(did);
+        return true;
+    }
+
+    void rewrite(String gid) {
+        synchronized (lock) {
+            StringBuilder b = new StringBuilder();
+            for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) b.append(m.toString()).append('\n');
+            writeFile(new File(dir, gid + ".jsonl"), utf8(b.toString()));
+        }
+    }
+
+    // ================================================================= deleting
+    void deleteForMe(String gid, Set<String> ids) {
+        for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>())))
+            if (ids.contains(m.optString("id"))) {
+                for (String k : new String[]{"text", "file", "sticker", "voice", "sig"}) m.remove(k);
+                put(m, "deleted", "me");
+            }
+        rewrite(gid);
+        ui.changed(gid);
+    }
+
+    int deleteForEveryone(String gid, Set<String> ids) {
+        List<String> mine = new ArrayList<>();
+        for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>())))
+            if (ids.contains(m.optString("id")) && me.equals(m.optString("from")) && !"system".equals(m.optString("kind"))
+                    && !"everyone".equals(m.optString("deleted"))) mine.add(m.optString("id"));
+        if (mine.isEmpty() || !canPost(gid)) return 0;
+        JSONObject m = msg("delete");
+        StringBuilder joined = new StringBuilder();
+        for (String id : mine) joined.append(joined.length() > 0 ? "," : "").append(id);
+        put(m, "text", joined.toString());
+        sign(gid, m);
+        append(gid, m);
+        deliver(gid, m);
+        ui.changed(gid);
+        return mine.size();
+    }
+
+    private void applyDelete(String gid, JSONObject dm) {
+        Set<String> targets = new HashSet<>();
+        for (String t : dm.optString("text").split(",")) if (!t.isEmpty()) targets.add(t);
+        boolean changed = false;
+        for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
+            if (!targets.contains(m.optString("id")) || !m.optString("from").equals(dm.optString("from"))
+                    || "everyone".equals(m.optString("deleted"))) continue;
+            JSONObject f = m.optJSONObject("file");
+            if (f != null && me.equals(m.optString("from"))) {
+                JSONObject g = groups.get(gid);
+                if (g != null && g.optJSONObject("files") != null) g.optJSONObject("files").remove(f.optString("id"));
+            }
+            for (String k : new String[]{"text", "file", "sticker", "voice", "sig"}) m.remove(k);
+            put(m, "deleted", "everyone");
+            changed = true;
+        }
+        if (changed) rewrite(gid);
     }
 
     // ================================================================= sending
@@ -1713,7 +1853,10 @@ final class ChatEngine {
                 code = 403;
             } else {
                 if (append(gid, m)) {
-                    unread.merge(gid, 1, Integer::sum);
+                    if (!"system".equals(m.optString("kind")) && !"delete".equals(m.optString("kind"))) {
+                        unread.merge(gid, 1, Integer::sum);
+                        queueReceipt(gid, did, m.optString("id"), false);
+                    }
                     ui.message(gid, m);
                     if (m.optJSONObject("file") != null) maybeDownload(gid, m);
                 }
@@ -1726,12 +1869,11 @@ final class ChatEngine {
             double cutoff = now() - HISTORY_DAYS * 86400;
             JSONArray out = new JSONArray();
             for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
-                if (known.contains(m.optString("id")) || m.optDouble("ts", 0) <= cutoff || m.optBoolean("local") || m.optBoolean("opened"))
-                    continue;
+                if (known.contains(m.optString("id")) || m.optDouble("ts", 0) <= cutoff || m.optBoolean("local") || m.optBoolean("opened")
+                        || m.has("deleted")) continue;
                 if (m.optBoolean("once") && !me.equals(m.optString("from"))) continue;
                 JSONObject c = new JSONObject(m.toString());
-                c.remove("local");
-                c.remove("opened_by");
+                for (String field : new String[]{"local", "opened_by", "delivered", "read", "r_sent"}) c.remove(field);
                 out.put(c);
             }
             JSONArray last = new JSONArray();
@@ -1770,6 +1912,9 @@ final class ChatEngine {
         } else if (path.equals("/c/call")) {
             res = err("Calls on this phone arrive in the next Arckad-D update.");
             code = 403;
+        } else if (path.equals("/c/receipt") && !pair) {
+            gotReceipt(gid, did, req);
+            res = new Obj().putOpt("ok", true);
         } else if (path.equals("/c/viewed")) {
             res = new Obj().putOpt("ok", true);
         } else {

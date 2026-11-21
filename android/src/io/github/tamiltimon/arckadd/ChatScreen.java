@@ -191,7 +191,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             t.setPadding(Ui.dp(a, 24), Ui.dp(a, 60), Ui.dp(a, 24), 0);
             box.addView(t);
         }
-        for (String g : order) box.addView(chatRow(g));
+        for (String g : order) if (!e.groups.get(g).optBoolean("hidden")) box.addView(chatRow(g));
         root.addView(sc);
     }
 
@@ -221,8 +221,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
         top.addView(name, MainActivity.grow());
-        List<JSONObject> l = e.msgs.get(g);
-        JSONObject last = l == null || l.isEmpty() ? null : l.get(l.size() - 1);
+        List<JSONObject> l = new ArrayList<>();
+        for (JSONObject x : e.msgs.getOrDefault(g, new ArrayList<>()))
+            if (!"delete".equals(x.optString("kind")) && !"me".equals(x.optString("deleted"))) l.add(x);
+        JSONObject last = l.isEmpty() ? null : l.get(l.size() - 1);
         if (last != null) top.addView(Ui.text(a, when(last.optDouble("ts")), 12, Ui.DIM, false));
         t.addView(top);
         LinearLayout bottom = new LinearLayout(a);
@@ -252,6 +254,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     }
 
     static String preview(JSONObject m) {
+        if ("everyone".equals(m.optString("deleted"))) return "🚫 Message deleted";
         if (m.optBoolean("once")) return "👁 One-time message";
         if (m.optDouble("voice", 0) > 0) return "🎤 Voice message";
         if (m.optJSONObject("file") != null && !"sticker".equals(m.optString("kind"))) return "📎 " + m.optJSONObject("file").optString("name");
@@ -301,6 +304,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         col.addView(msgScroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         String lastDay = "";
         List<JSONObject> list = new ArrayList<>(e.msgs.getOrDefault(gid, new ArrayList<>()));
+        e.markRead(gid);
+        List<JSONObject> vis = new ArrayList<>();
+        for (JSONObject m : list) if (!"delete".equals(m.optString("kind")) && !"me".equals(m.optString("deleted"))) vis.add(m);
+        list = vis;
         for (JSONObject m : list.subList(Math.max(0, list.size() - 250), list.size())) {
             String day = new SimpleDateFormat("EEEE d MMMM yyyy", Locale.getDefault()).format(new Date((long) (m.optDouble("ts") * 1000)));
             if (!day.equals(lastDay)) {
@@ -346,7 +353,11 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         if (!sticker) b.setBackground(Ui.round(mine ? 0xff2f7fd8 : Ui.CARD, Ui.dp(a, 16)));
         int fg = mine && !sticker ? Color.WHITE : Ui.TEXT;
         if (!mine && !"direct".equals(g.optString("kind"))) b.addView(Ui.text(a, m.optString("name"), 12, fg, true));
-        if (m.optBoolean("once")) {
+        if ("everyone".equals(m.optString("deleted"))) {
+            TextView t = Ui.text(a, mine ? "🚫 You deleted this message" : "🚫 This message was deleted", 14, fg, false);
+            t.setTypeface(null, Typeface.ITALIC);
+            b.addView(t);
+        } else if (m.optBoolean("once")) {
             b.addView(Ui.text(a, mine ? "👁 One-time message (sent)" : "👁 One-time message: view it in Arckad-D on your computer "
                     + "(phones can show these in the next update)", 14, fg, false));
         } else if ("text".equals(kind)) {
@@ -364,11 +375,76 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             b.addView(fileView(m, fg));
         }
         if (m.optBoolean("unverified")) b.addView(Ui.text(a, "⚠ not signed (sent before signatures)", 11, fg, false));
-        TextView tm = Ui.text(a, time, 11, mine && !sticker ? 0xddffffff : Ui.DIM, false);
+        TextView tm = Ui.text(a, time + (mine && !m.has("deleted") ? "  " + ticks(m) : ""), 11, mine && !sticker ? 0xddffffff : Ui.DIM, false);
+        if (mine && read(m)) {
+            android.text.SpannableString ss = new android.text.SpannableString(tm.getText());
+            ss.setSpan(new android.text.style.ForegroundColorSpan(0xff4fc3f7), ss.length() - 2, ss.length(), 0);
+            tm.setText(ss);
+        }
+        b.setOnLongClickListener(v -> {
+            messageMenu(m);
+            return true;
+        });
         tm.setGravity(Gravity.END);
         b.addView(tm, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         outer.addView(b);
         return outer;
+    }
+
+    private List<String> others() {
+        List<String> o = new ArrayList<>();
+        JSONObject g = e.groups.get(gid);
+        JSONObject mem = g == null ? null : g.optJSONObject("members");
+        if (mem != null) for (Iterator<String> it = mem.keys(); it.hasNext(); ) {
+            String d = it.next();
+            if (!d.equals(e.me)) o.add(d);
+        }
+        return o;
+    }
+
+    private static boolean has(JSONObject m, String field, String did) {
+        org.json.JSONArray arr = m.optJSONArray(field);
+        if (arr != null) for (int i = 0; i < arr.length(); i++) if (did.equals(arr.optString(i))) return true;
+        return false;
+    }
+
+    private boolean read(JSONObject m) {
+        List<String> o = others();
+        if (o.isEmpty()) return false;
+        for (String d : o) if (!has(m, "read", d)) return false;
+        return true;
+    }
+
+    /** ✓ sent · ✓✓ delivered · blue ✓✓ read */
+    private String ticks(JSONObject m) {
+        if (read(m)) return "✓✓";
+        org.json.JSONArray d = m.optJSONArray("delivered"), r = m.optJSONArray("read");
+        return (d != null && d.length() > 0) || (r != null && r.length() > 0) ? "✓✓" : "✓";
+    }
+
+    private void messageMenu(JSONObject m) {
+        List<String> labels = new ArrayList<>();
+        List<Runnable> acts = new ArrayList<>();
+        if ("text".equals(m.optString("kind")) && !m.has("deleted") && !m.optBoolean("once")) {
+            labels.add("Copy text");
+            acts.add(() -> {
+                android.content.ClipboardManager cm = (android.content.ClipboardManager) a.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("message", m.optString("text")));
+                Ui.toast(a, "Copied");
+            });
+        }
+        labels.add("Delete for me");
+        acts.add(() -> e.deleteForMe(gid, Collections.singleton(m.optString("id"))));
+        if (e.me.equals(m.optString("from")) && !m.has("deleted") && e.canPost(gid)) {
+            labels.add("Delete for everyone");
+            acts.add(() -> Ui.confirm(a, "Delete for everyone?", "It shows as “This message was deleted” for everyone.", "Delete",
+                    () -> e.deleteForEveryone(gid, Collections.singleton(m.optString("id")))));
+        }
+        labels.add("Info");
+        acts.add(() -> Ui.info(a, "Message", new SimpleDateFormat("EEEE d MMMM yyyy, HH:mm:ss", Locale.getDefault())
+                .format(new Date((long) (m.optDouble("ts") * 1000))) + (e.me.equals(m.optString("from"))
+                ? "\n" + (read(m) ? "Read" : ticks(m).equals("✓✓") ? "Delivered" : "Sent") : "\nFrom " + m.optString("name"))));
+        Ui.dialog(a).setItems(labels.toArray(new String[0]), (d, w) -> acts.get(w).run()).show();
     }
 
     private View stickerView(JSONObject m) {
