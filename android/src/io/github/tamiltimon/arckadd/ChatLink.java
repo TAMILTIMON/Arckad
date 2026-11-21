@@ -267,8 +267,80 @@ final class ChatLink {
         }
     }
 
-    /** Become the linked account: its files replace this phone's chat data; the app restarts the engine. */
+    // ---------- safety copies: a link never destroys a profile
+    File safetyDir() {
+        return new File(e.dir.getParentFile(), "chat-before-link");
+    }
+
+    int[] summary() {
+        int groups = 0, msgs = 0;
+        for (JSONObject g : e.groups.values()) if (!"direct".equals(g.optString("kind")) && !g.optBoolean("removed")) groups++;
+        for (List<JSONObject> l : e.msgs.values()) msgs += l.size();
+        return new int[]{e.friends().length(), groups, msgs};
+    }
+
+    boolean hasData() {
+        int[] s = summary();
+        return s[0] + s[1] + s[2] > 0;
+    }
+
+    void saveSafetyCopy(String reason) {
+        if (!hasData()) return;
+        File dest = new File(safetyDir(), new java.text.SimpleDateFormat("yyyy-MM-dd HH.mm.ss", java.util.Locale.ROOT).format(new java.util.Date()));
+        File chat = new File(dest, "chat");
+        chat.mkdirs();
+        copyDir(e.dir, chat);
+        int[] s = summary();
+        writeJson(new File(dest, "info.json"), new Obj().putOpt("name", e.myName()).putOpt("friends", s[0]).putOpt("groups", s[1])
+                .putOpt("messages", s[2]).putOpt("device_id", e.me).putOpt("reason", reason).putOpt("saved", now()));
+    }
+
+    private static void copyDir(File src, File dst) {
+        File[] all = src.listFiles();
+        if (all == null) return;
+        dst.mkdirs();
+        for (File f : all) {
+            File t = new File(dst, f.getName());
+            if (f.isDirectory()) copyDir(f, t);
+            else try {
+                writeFile(t, readAll(f));
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    List<Object[]> safetyCopies() {
+        List<Object[]> out = new ArrayList<>();
+        File[] all = safetyDir().listFiles();
+        if (all == null) return out;
+        java.util.Arrays.sort(all, (x, y) -> y.getName().compareTo(x.getName()));
+        for (File d : all) {
+            JSONObject info = readJson(new File(d, "info.json"));
+            if (info.length() > 0 && new File(d, "chat").isDirectory()) out.add(new Object[]{d, info});
+        }
+        return out;
+    }
+
+    /** Bring back a saved profile; the current one is saved too. Restarts the engine as that profile. */
+    void restoreSafetyCopy(File folder) {
+        JSONObject info = readJson(new File(folder, "info.json"));
+        saveSafetyCopy("before restoring an older profile");
+        e.stop();
+        File[] all = e.dir.listFiles();
+        if (all != null) for (File f : all) deleteTree(f);
+        copyDir(new File(folder, "chat"), e.dir);
+        e.ui.relinked(info.optString("device_id", e.me));
+    }
+
+    private static void deleteTree(File f) {
+        File[] kids = f.listFiles();
+        if (kids != null) for (File k : kids) deleteTree(k);
+        f.delete();
+    }
+
+    /** Become the linked account: its files replace this phone's chat data (saved first); the engine restarts. */
     void adopt(JSONObject b, String linkKey, JSONObject twin, String ip, int port) throws Exception {
+        saveSafetyCopy("linked to " + twin.optString("name", "another device"));
         e.stop();
         File[] old = e.dir.listFiles();
         if (old != null) for (File f : old) if (f.getName().endsWith(".jsonl")) f.delete();
@@ -561,6 +633,7 @@ final class ChatLink {
 
     /** This phone was unlinked: remove the shared account (it starts fresh). */
     void wipeHere() {
+        saveSafetyCopy("unlinked");
         e.stop();
         File[] all = e.dir.listFiles();
         if (all != null) for (File f : all) if (f.isFile()) f.delete();

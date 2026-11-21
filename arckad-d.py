@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.23.0"
+APP_VERSION = "3.23.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -8819,9 +8819,66 @@ class LinkedDevices:
         self.adopt(data["bundle"], data["link_key"], data["twin"], ip, r1.get("port") or port)
         return True, data["twin"].get("name", "your device")
 
-    def adopt(self, b, link_key, twin, ip, port):
-        """This device becomes the linked account (its own previous chat profile is replaced)."""
+    # ---------- safety copies: a link never destroys a profile
+    @staticmethod
+    def safety_dir():
+        return CHAT_DIR.parent / "chat-before-link"
+
+    def summary(self):
+        """What this device's chat profile holds (to show before it's replaced)."""
         c = self.chat
+        groups = [g for g in c.groups.values() if g.get("kind") != "direct" and not g.get("removed")]
+        return {"name": c.my_name(), "friends": len(c.contacts.get("friends", {})), "groups": len(groups),
+                "messages": sum(len(v) for v in c.msgs.values())}
+
+    def has_data(self):
+        s = self.summary()
+        return bool(s["friends"] or s["groups"] or s["messages"])
+
+    def save_safety_copy(self, reason):
+        """A complete copy of this device's chat profile, restorable with “Restore my profile from before a link”."""
+        if not CHAT_DIR.exists() or not self.has_data():
+            return None
+        dest = self.safety_dir() / time.strftime("%Y-%m-%d %H.%M.%S")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(CHAT_DIR, dest / "chat")
+        info = dict(self.summary(), device_id=self.chat.me, reason=reason, saved=time.time())
+        write_json(dest / "info.json", info)
+        if not IS_WIN:
+            try:
+                os.chmod(self.safety_dir(), 0o700)
+            except OSError:
+                pass
+        return dest
+
+    def safety_copies(self):
+        out = []
+        try:
+            for d in sorted(self.safety_dir().iterdir(), reverse=True):
+                info = read_json(d / "info.json", {})
+                if info and (d / "chat").is_dir():
+                    out.append((d, info))
+        except OSError:
+            pass
+        return out
+
+    def restore_safety_copy(self, folder):
+        """Bring back a profile saved before a link (the current link on this device is dropped)."""
+        c = self.chat
+        info = read_json(Path(folder) / "info.json", {})
+        current = self.save_safety_copy("before restoring an older profile")
+        with c.lock:
+            if CHAT_DIR.exists():
+                shutil.rmtree(CHAT_DIR)
+            shutil.copytree(Path(folder) / "chat", CHAT_DIR)
+            c.win.cfg["device_id"] = info.get("device_id", c.me)
+            write_json(CONFIG_FILE, c.win.cfg)
+        return current
+
+    def adopt(self, b, link_key, twin, ip, port):
+        """This device becomes the linked account. Its own previous profile is saved first (restorable)."""
+        c = self.chat
+        self.save_safety_copy(f"linked to {twin.get('name', 'another device')}")
         with c.lock:
             for gid in list(c.groups):
                 try:
@@ -9045,8 +9102,9 @@ class LinkedDevices:
         return told
 
     def wipe_here(self):
-        """This device was unlinked: remove the shared account from it (it starts fresh)."""
+        """This device was unlinked: remove the shared account from it (it starts fresh; a safety copy is kept)."""
         c = self.chat
+        self.save_safety_copy("unlinked")
         with c.lock:
             for gid in list(c.groups):
                 try:
@@ -9665,6 +9723,7 @@ class ChatPanel(Gtk.Box):
                           ("Back up chats…", self.backup), ("Restore chats from a backup…", self.restore),
                           ("Automatic backups…", self.auto_backup_settings),
                           ("Linked devices (phone + PC, one account)…", self.linked_devices),
+                          ("Restore my profile from before a link…", self.restore_before_link),
                           ("Export my profile (move to a new computer)…", self.export_profile),
                           ("Import a profile…", self.import_profile)):
             it = Gtk.MenuItem(label=label)
@@ -10474,17 +10533,69 @@ class ChatPanel(Gtk.Box):
         L.code = None
         d.destroy()
 
+    def restore_before_link(self):
+        copies = self.chat.linked.safety_copies()
+        if not copies:
+            self.win.info("No saved profiles yet.\n\nFrom Arckad-D 3.23.1 on, a complete copy of a device's profile is "
+                          "kept automatically whenever linking replaces it. Earlier links didn't keep one: if you have "
+                          "an exported profile or a backup, use ⋯ → Import a profile instead.")
+            return
+        d = Gtk.Dialog(title="Restore my profile from before a link", transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Restore", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(14)
+        box.add(Gtk.Label(label="Choose the profile to bring back:", xalign=0))
+        group = None
+        radios = []
+        for folder, info in copies:
+            label = (f"“{info.get('name', '?')}” · {info.get('friends', 0)} friends · {info.get('groups', 0)} groups · "
+                     f"{info.get('messages', 0)} messages\n    saved {time.strftime('%d %b %Y %H:%M', time.localtime(info.get('saved', 0)))}"
+                     f" ({info.get('reason', '')})")
+            rb = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            group = group or rb
+            radios.append((rb, folder))
+            box.add(rb)
+        note = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+        note.set_markup("<small>The profile on this computer now is saved too before it's replaced, so you can switch "
+                        "back. This computer stops being linked. Restart Arckad-D afterwards.</small>")
+        box.add(note)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK:
+            folder = next(f for rb, f in radios if rb.get_active())
+            try:
+                self.chat.linked.restore_safety_copy(folder)
+                self.win.info("Profile restored ✓\n\nRestart Arckad-D now (tray → Quit, then open it again) to finish.")
+            except OSError as ex:
+                self.win.error(f"The profile couldn't be restored: {ex}")
+        d.destroy()
+
     def link_this_device(self):
         d = Gtk.Dialog(title="Link this device to my account", transient_for=self.get_toplevel(), modal=True)
         d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Link", Gtk.ResponseType.OK)
         box = d.get_content_area()
         box.set_spacing(8)
         box.set_border_width(14)
-        warn = Gtk.Label(xalign=0, wrap=True, max_width_chars=52)
-        warn.set_markup("On your other device: ⋯ → <b>Linked devices</b> → <b>Link a new device</b>. Type the code it "
-                        "shows. <b>This device's current chat profile is replaced</b> by that account (export it first "
-                        "if you need it).")
+        warn = Gtk.Label(xalign=0, wrap=True, max_width_chars=54)
+        warn.set_markup("This device will <b>join the account shown on your other device</b>. On that device: ⋯ → "
+                        "<b>Linked devices</b> → <b>Link a new device</b>, then type the code it shows here.\n\n"
+                        "<small>To keep THIS device's profile instead, do it the other way round: show the code here "
+                        "(⋯ → Linked devices → Link a new device) and type it on the other device.</small>")
         box.add(warn)
+        L = self.chat.linked
+        replace_ok = Gtk.CheckButton()
+        if L.has_data():
+            s = L.summary()
+            r = Gtk.Label(xalign=0, wrap=True, max_width_chars=54)
+            r.set_markup(f"<span foreground='#e01b24'><b>This computer's profile “{esc(s['name'])}” "
+                         f"({s['friends']} friends, {s['groups']} groups, {s['messages']} messages) will be replaced.</b>"
+                         "</span>\n<small>A safety copy is kept: ⋯ → Restore my profile from before a link brings it "
+                         "back.</small>")
+            box.add(r)
+            replace_ok.set_label(f"Replace “{s['name']}” on this computer")
+            box.add(replace_ok)
+        else:
+            replace_ok.set_active(True)
         code = Gtk.Entry(placeholder_text="6-digit link code", max_length=7)
         ip = Gtk.Entry(placeholder_text="its IP address (only if on another network)")
         box.add(code)
@@ -10493,6 +10604,10 @@ class ChatPanel(Gtk.Box):
         box.add(status)
         d.show_all()
         while d.run() == Gtk.ResponseType.OK:
+            if not replace_ok.get_active():
+                status.set_markup("<span foreground='#e01b24'>Tick “Replace …” to continue, or do it the other way "
+                                  "round to keep this profile.</span>")
+                continue
             c = "".join(ch for ch in code.get_text() if ch.isdigit())
             if len(c) != 6:
                 status.set_text("The link code has 6 digits.")

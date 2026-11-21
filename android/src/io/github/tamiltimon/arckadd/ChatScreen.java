@@ -903,10 +903,15 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
 
     private void listMenu() {
         String[] items = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
-                "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)"};
+                "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)",
+                "Restore my profile from before a link"};
         Ui.dialog(a).setItems(items, (d, w) -> {
             if (w == 5) {
                 linkedDevices();
+                return;
+            }
+            if (w == 6) {
+                restoreBeforeLink();
                 return;
             }
             if (w == 3) {
@@ -1487,6 +1492,25 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 .setNegativeButton("Close", null).show();
     }
 
+    private void restoreBeforeLink() {
+        List<Object[]> copies = e.link.safetyCopies();
+        if (copies.isEmpty()) {
+            Ui.info(a, "No saved profiles", "From Arckad-D 3.23.1 on, a full copy of this phone's profile is kept whenever "
+                    + "linking replaces it. Earlier links didn't keep one.");
+            return;
+        }
+        String[] labels = new String[copies.size()];
+        for (int i = 0; i < copies.size(); i++) {
+            JSONObject info = (JSONObject) copies.get(i)[1];
+            labels[i] = "“" + info.optString("name") + "” · " + info.optInt("friends") + " friends · " + info.optInt("groups")
+                    + " groups · " + info.optInt("messages") + " messages\nsaved " + new SimpleDateFormat("d MMM yyyy HH:mm",
+                    Locale.getDefault()).format(new Date((long) (info.optDouble("saved") * 1000))) + " (" + info.optString("reason") + ")";
+        }
+        Ui.dialog(a).setTitle("Restore which profile?").setItems(labels, (d, w) -> Ui.confirm(a, "Restore this profile?",
+                "The profile on this phone now is saved too, so you can switch back. This phone stops being linked.", "Restore",
+                () -> ChatEngine.bg(() -> e.link.restoreSafetyCopy((File) copies.get(w)[0])))).show();
+    }
+
     private void showLinkCode() {
         String code = e.link.newCode();
         TextView t = Ui.text(a, code.substring(0, 3) + " " + code.substring(3), 34, Ui.TEXT, true);
@@ -1509,8 +1533,20 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         LinearLayout box = new LinearLayout(a);
         box.setOrientation(LinearLayout.VERTICAL);
         box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
-        box.addView(Ui.text(a, "On your PC: Chat → ⋯ → Linked devices → Link a new device. Type the code it shows. "
-                + "This phone's current chat profile is replaced by that account.", 13, Ui.DIM, false));
+        box.addView(Ui.text(a, "This phone will JOIN the account on your PC. On the PC: Chat → ⋯ → Linked devices → Link a "
+                + "new device, then type its code here. To keep THIS phone's profile instead, show the code here and type "
+                + "it on the PC.", 13, Ui.DIM, false));
+        Switch replace = new Switch(a);
+        if (e.link.hasData()) {
+            int[] s = e.link.summary();
+            TextView w = Ui.text(a, "This phone's profile “" + e.myName() + "” (" + s[0] + " friends, " + s[1] + " groups, "
+                    + s[2] + " messages) will be replaced. A safety copy is kept: ⋮ → Restore my profile from before a link.",
+                    13, 0xffe01b24, true);
+            box.addView(w);
+            replace.setText("Replace “" + e.myName() + "” on this phone");
+            replace.setTextColor(Ui.TEXT);
+            box.addView(replace);
+        } else replace.setChecked(true);
         EditText code = new EditText(a);
         code.setHint("6-digit link code");
         code.setInputType(InputType.TYPE_CLASS_NUMBER);
@@ -1520,6 +1556,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         box.addView(ip);
         Ui.dialog(a).setTitle("Link this phone to my account").setView(box).setPositiveButton("Link", (x, w) -> {
             String c = code.getText().toString().replaceAll("[^0-9]", ""), host = ip.getText().toString().trim();
+            if (!replace.isChecked()) {
+                Ui.toast(a, "Tick “Replace …” to continue, or link the other way round to keep this profile");
+                return;
+            }
             Ui.toast(a, "Linking… confirm on the PC");
             ChatEngine.bg(() -> {
                 String err = e.link.linkWithCode(c, host.isEmpty() ? null : host);
