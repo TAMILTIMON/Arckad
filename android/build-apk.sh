@@ -18,7 +18,11 @@ sed -i "s/static final String VERSION = \".*\";/static final String VERSION = \"
     src/io/github/tamiltimon/arckadd/BuildInfo.java
 
 "$BT/aapt2" compile --dir res -o build/res.zip
-"$BT/aapt2" link -I "$JAR" --manifest AndroidManifest.xml -o build/base.apk build/res.zip \
+# assets: the same emoji set as the desktop (from ../emoji) and the built-in stickers
+mkdir -p build/assets/emoji
+cp ../emoji/noto-emoji.zip ../emoji/categories.json build/assets/emoji/
+cp -r assets/stickers build/assets/
+"$BT/aapt2" link -I "$JAR" --manifest AndroidManifest.xml -o build/base.apk build/res.zip -A build/assets -0 zip \
     --min-sdk-version 24 --target-sdk-version 34 --version-code "$CODE" --version-name "$VERSION" --auto-add-overlay
 # Java's own library (for lambdas) + Android's classes on the class path
 javac -encoding UTF-8 --release 8 -classpath "$JAR" -nowarn -Xlint:none \

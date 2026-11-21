@@ -9,6 +9,10 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:label="Arckad-D"
@@ -35,6 +39,15 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
         <activity android:name=".TextActivity" android:exported="false"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+
+        <service android:name=".ChatService" android:exported="false"
+            android:foregroundServiceType="remoteMessaging" />
+        <receiver android:name=".ChatService$Boot" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <provider
             android:name=".Provider"

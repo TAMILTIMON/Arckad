@@ -57,6 +57,7 @@ public class MainActivity extends Activity implements Net.NearbyUi {
     private RecentScreen recent;
     private ShareScreens.Send send;
     private ShareScreens.Receive receive;
+    ChatScreen chat;
     private final Map<String, Screen> screens = new LinkedHashMap<>();
     private final Map<String, TextView[]> navItems = new LinkedHashMap<>();
     private Screen current;
@@ -129,6 +130,7 @@ public class MainActivity extends Activity implements Net.NearbyUi {
         addNav("recent", "🕘", "Recent");
         addNav("send", "📤", "Send");
         addNav("receive", "📥", "Receive");
+        addNav("chat", "💬", "Chat");
         root.addView(nav, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, Ui.dp(this, 64)));
         setContentView(root);
         if (hasStorage()) start(getIntent());
@@ -162,8 +164,12 @@ public class MainActivity extends Activity implements Net.NearbyUi {
         screens.put("recent", recent);
         screens.put("send", send);
         screens.put("receive", receive);
+        chat = new ChatScreen(this);
+        screens.put("chat", chat);
         String tab = intent != null ? intent.getStringExtra("tab") : null;
         showTab(tab != null && screens.containsKey(tab) ? tab : "files");
+        openChatFrom(intent);
+        ChatHub.get(this).start();                   // chat keeps running in the background once it's in use
         main.post(ticker);
         if (System.currentTimeMillis() - prefs.getLong("update_checked", 0) > 86_400_000L) {
             main.postDelayed(() -> Updater.check(this, false), 5000);
@@ -287,6 +293,25 @@ public class MainActivity extends Activity implements Net.NearbyUi {
         super.onNewIntent(intent);
         String tab = intent.getStringExtra("tab");
         if (tab != null) showTab(tab);
+        openChatFrom(intent);
+    }
+
+    private void openChatFrom(Intent intent) {
+        if (intent == null || chat == null || !"chat".equals(intent.getStringExtra("tab"))) return;
+        chat.open(intent.getStringExtra("chat"), intent.getStringExtra("chat_page"));
+    }
+
+    void openFolder(File dir) {
+        dir.mkdirs();
+        showTab("files");
+        files.open(dir, true);
+    }
+
+    @Override
+    protected void onActivityResult(int req, int result, Intent data) {
+        super.onActivityResult(req, result, data);
+        if (result == RESULT_OK && chat != null && (req == ChatScreen.REQ_ATTACH || req == ChatScreen.REQ_PHOTO))
+            chat.onResult(req, data);
     }
 
     @Override

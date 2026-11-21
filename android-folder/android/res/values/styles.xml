@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- No opening/closing animations; each screen sets light or dark itself when it starts. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowBackground">@android:color/background_light</item>
+    </style>
+</resources>
