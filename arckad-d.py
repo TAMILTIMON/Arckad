@@ -19,6 +19,7 @@ import lzma
 import mimetypes
 import os
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -72,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.17.0"
+APP_VERSION = "3.18.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -9982,6 +9983,238 @@ class CallWindow(Gtk.Window):
         return True
 
 
+# ---------------------------------------------------------------- Tray, desktop pop-ups, start at log-in
+def _with_dot(pb):
+    """The tray icon with a red dot (messages waiting)."""
+    pb = pb.copy()
+    size = pb.get_width()
+    d = max(8, size // 2)
+    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><circle cx="5" cy="5" r="4.4" fill="#e01b24" stroke="#fff" stroke-width="1"/></svg>'
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.set_size(d, d)
+        loader.write(svg.encode())
+        loader.close()
+        dot = loader.get_pixbuf()
+        dot.composite(pb, size - d, 0, d, d, size - d, 0, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+    except Exception:
+        pass
+    return pb
+
+
+class Tray:
+    """The notification-area icon: click opens Arckad-D; right-click menu. Linux uses AppIndicator when the
+    desktop has it (Ubuntu does), otherwise a classic tray icon."""
+
+    def __init__(self, win):
+        self.win, self.unread, self.ind, self.icon = win, 0, None, None
+        self.menu = Gtk.Menu()
+        self.open_item = Gtk.MenuItem(label=f"Open {APP_NAME}")
+        self.open_item.connect("activate", lambda *_: win.show_from_tray())
+        self.chat_item = Gtk.MenuItem(label="💬 Chat")
+        self.chat_item.connect("activate", lambda *_: win.show_from_tray(chat=True))
+        quit_item = Gtk.MenuItem(label=f"Quit {APP_NAME}")
+        quit_item.connect("activate", lambda *_: win.quit_app())
+        for it in (self.open_item, self.chat_item, Gtk.SeparatorMenuItem(), quit_item):
+            self.menu.append(it)
+        self.menu.show_all()
+        self.base = logo_pixbuf(64) or GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 64, 64)
+        if not IS_WIN:
+            for name in ("AyatanaAppIndicator3", "AppIndicator3"):
+                try:
+                    gi.require_version(name, "0.1")
+                    mod = __import__("gi.repository", fromlist=[name])
+                    AI = getattr(mod, name)
+                except (ValueError, ImportError, AttributeError):
+                    continue
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                self._icon_files = {False: CACHE_DIR / "tray.png", True: CACHE_DIR / "tray-unread.png"}
+                self.base.savev(str(self._icon_files[False]), "png", [], [])
+                _with_dot(self.base).savev(str(self._icon_files[True]), "png", [], [])
+                self.ind = AI.Indicator.new(APP_SLUG, str(self._icon_files[False]),
+                                            AI.IndicatorCategory.APPLICATION_STATUS)
+                self.ind.set_status(AI.IndicatorStatus.ACTIVE)
+                self.ind.set_title(APP_NAME)
+                self.ind.set_menu(self.menu)
+                self.AI = AI
+                break
+        if self.ind is None:
+            self.icon = Gtk.StatusIcon.new_from_pixbuf(self.base.scale_simple(32, 32, GdkPixbuf.InterpType.HYPER))
+            self.icon.set_tooltip_text(APP_NAME)
+            self.icon.set_title(APP_NAME)
+            self.icon.connect("activate", lambda *_: win.toggle_from_tray())
+            self.icon.connect("popup-menu", lambda icon, button, t: self.menu.popup(
+                None, None, Gtk.StatusIcon.position_menu, icon, button, t))
+            self.icon.set_visible(True)
+
+    def set_unread(self, n):
+        if n == self.unread:
+            return
+        self.unread = n
+        self.chat_item.set_label(f"💬 Chat ({n} new)" if n else "💬 Chat")
+        if self.ind is not None:
+            self.ind.set_icon_full(str(self._icon_files[bool(n)]), APP_NAME)
+        elif self.icon is not None:
+            pb = self.base.scale_simple(32, 32, GdkPixbuf.InterpType.HYPER)
+            self.icon.set_from_pixbuf(_with_dot(pb) if n else pb)
+            self.icon.set_tooltip_text(f"{APP_NAME}: {n} new message{'s' if n != 1 else ''}" if n else APP_NAME)
+
+    def remove(self):
+        if self.icon is not None:
+            self.icon.set_visible(False)
+        if self.ind is not None:
+            self.ind.set_status(self.AI.IndicatorStatus.PASSIVE)
+
+
+class CornerPopup(Gtk.Window):
+    """A pop-up in the bottom-right corner of the screen (above the taskbar), for when Arckad-D's window is
+    hidden or in the background. Click to open; it closes by itself after a few seconds."""
+    current = None
+
+    def __init__(self, title, body, pixbuf, action, seconds=7):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        if CornerPopup.current is not None:
+            try:
+                CornerPopup.current.destroy()
+            except Exception:
+                pass
+        CornerPopup.current = self
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_type_hint(Gdk.WindowTypeHint.NOTIFICATION)
+        self.set_resizable(False)
+        frame = Gtk.Frame()
+        frame.get_style_context().add_class("app-notification")
+        ev = Gtk.EventBox()
+        box = Gtk.Box(spacing=12, margin=10)
+        box.add(Gtk.Image.new_from_pixbuf(pixbuf))
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, valign=Gtk.Align.CENTER)
+        t = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=36)
+        t.set_markup(f"<b>{esc(title)}</b>")
+        b = Gtk.Label(label=body.replace("\n", " ")[:140], xalign=0, ellipsize=Pango.EllipsizeMode.END,
+                      max_width_chars=40)
+        a = Gtk.Label(xalign=0)
+        a.set_markup(f"<small>{APP_NAME}</small>")
+        a.set_opacity(0.7)
+        for w in (a, t, b):
+            texts.add(w)
+        box.pack_start(texts, True, True, 0)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        close.connect("clicked", lambda *_: self.destroy())
+        box.add(close)
+        ev.add(box)
+        ev.connect("button-press-event", lambda *_: (self.destroy(), action() if action else None, True)[2])
+        frame.add(ev)
+        self.add(frame)
+        self.show_all()
+        display = Gdk.Display.get_default()
+        mon = display.get_primary_monitor() or display.get_monitor(0)
+        wa = mon.get_workarea()
+        w, h = self.get_size()
+        self.move(wa.x + wa.width - w - 16, wa.y + wa.height - h - 16)
+        GLib.timeout_add_seconds(seconds, lambda: (self.destroy() if CornerPopup.current is self else None) and False)
+
+    def destroy(self):
+        if CornerPopup.current is self:
+            CornerPopup.current = None
+        super().destroy()
+
+
+def set_start_at_login(on):
+    """Start Arckad-D quietly in the tray when you log in (Windows: Run key; Linux: autostart)."""
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "--background"]
+    elif INSTALLED and not IS_WIN:
+        cmd = ["/usr/bin/arckad-d", "--background"]
+    else:
+        exe = sys.executable
+        if IS_WIN and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
+            exe = exe[:-10] + "pythonw.exe"
+        cmd = [exe, os.path.abspath(__file__), "--background"]
+    try:
+        if IS_WIN:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                                 winreg.KEY_SET_VALUE)
+            try:
+                if on:
+                    winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+                else:
+                    try:
+                        winreg.DeleteValue(key, APP_NAME)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                winreg.CloseKey(key)
+        else:
+            path = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "autostart" / f"{APP_SLUG}.desktop"
+            if on:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"[Desktop Entry]\nType=Application\nName={APP_NAME}\n"
+                                f"Comment=Keeps chat, calls and sharing running in the background\n"
+                                f"Exec={' '.join(shlex.quote(c) for c in cmd)}\nIcon={APP_SLUG}\nTerminal=false\n"
+                                f"X-GNOME-Autostart-enabled=true\nX-GNOME-Autostart-Delay=5\n")
+            else:
+                path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+# ---- one running copy: a second start hands over to the running one (works on Windows and Linux)
+INSTANCE_FILE = CONFIG_DIR / "instance.json"
+
+
+def hand_over_to_running(folder, background):
+    info = read_json(INSTANCE_FILE, {})
+    if not info.get("port") or not info.get("token"):
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", int(info["port"])), timeout=1.5) as s:
+            s.sendall(json.dumps({"token": info["token"], "cmd": "background" if background else "show",
+                                  "folder": folder}).encode() + b"\n")
+            return s.recv(8).startswith(b"ok")
+    except (OSError, ValueError):
+        return False
+
+
+def start_instance_listener(win):
+    token = secrets.token_hex(16)
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    write_json(INSTANCE_FILE, {"port": srv.getsockname()[1], "token": token, "pid": os.getpid()})
+    if not IS_WIN:
+        try:
+            os.chmod(INSTANCE_FILE, 0o600)
+        except OSError:
+            pass
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(3)
+                data = json.loads(conn.makefile().readline() or "{}")
+                if data.get("token") == token:
+                    if data.get("cmd") == "show":
+                        GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder")) or False)
+                    conn.sendall(b"ok")
+            except (OSError, ValueError):
+                pass
+            finally:
+                conn.close()
+    threading.Thread(target=serve, daemon=True).start()
+    return srv
+
+
 class ChatWindow(Gtk.Window):
     def __init__(self, win):
         super().__init__(title=f"{APP_NAME} Chat")
@@ -10040,6 +10273,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.paired = Paired(self)
         self.chat = Chat(self)
         self.chat_windows = []
+        self.setup_tray()
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
         self.share_win = None
 
@@ -10054,7 +10288,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._build_ui()
         self.watch_drives()
         self.connect("key-press-event", self.on_key)
-        self.connect("delete-event", self.on_close)
+        self.connect("delete-event", self.on_delete)
         self.connect("set-focus", self.on_set_focus)
 
         tabs = self.cfg.get("tabs", {})
@@ -10142,15 +10376,25 @@ class MainWindow(Gtk.ApplicationWindow):
         self.hidden_item = Gtk.CheckMenuItem(label="Show hidden files (Ctrl+H)")
         self.hidden_item.set_active(self.cfg["show_hidden"])
         self.hidden_item.connect("toggled", self.on_hidden_toggled)
+        self.tray_item = Gtk.CheckMenuItem(label="Keep running in the tray when closed")
+        self.tray_item.set_active(self.cfg.get("keep_in_tray", True))
+        self.tray_item.connect("toggled", lambda i: (self.cfg.__setitem__("keep_in_tray", i.get_active()),
+                                                     write_json(CONFIG_FILE, self.cfg)))
+        self.login_item = Gtk.CheckMenuItem(label="Start when I log in (in the tray)")
+        self.login_item.set_active(self.cfg.get("start_at_login", True))
+        self.login_item.connect("toggled", lambda i: (self.cfg.__setitem__("start_at_login", i.get_active()),
+                                                      set_start_at_login(i.get_active()),
+                                                      write_json(CONFIG_FILE, self.cfg)))
         self.icons_item = Gtk.CheckMenuItem(label="Colourful file icons")
         self.icons_item.set_active(ICON_STYLE["colour"])
         self.icons_item.connect("toggled", self.on_icons_toggled)
         hb.pack_end(self._menu_button(None, "open-menu-symbolic", [
-            self.hidden_item, self.icons_item, None,
+            self.hidden_item, self.icons_item, None, self.tray_item, self.login_item, None,
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
             ("New folder… (Ctrl+Shift+N)", lambda: self.new_folder(self.active)),
             ("New empty file…", lambda: self.new_file(self.active)),
             ("Team chat in its own window", lambda: self.open_chat_window()),
+            (f"Quit {APP_NAME} (stop running in the tray)", lambda: self.quit_app()),
             ("Chat profile (name and photo)…", lambda: self.chat_panel.edit_profile()),
             ("Open terminal here (F4)", lambda: self.open_terminal(self.active.location
                                                                    if is_folder_loc(self.active.location) else str(HOME))),
@@ -10409,7 +10653,8 @@ class MainWindow(Gtk.ApplicationWindow):
         if it fails, it reopens this version, which then explains what happened."""
         log = Path(tempfile.gettempdir()) / "arckad-d-update.log"
         try:
-            subprocess.Popen([str(path), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", f"/LOG={log}"],
+            subprocess.Popen([str(path), "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/UPDATE",
+                              f"/LOG={log}"],
                              creationflags=0x00000008 | 0x00000200, close_fds=True)   # detached
         except OSError as ex:
             self.error(f"Couldn't start the installer: {ex.strerror or ex}\n\nIt was downloaded to:\n{path}\n\n"
@@ -12147,7 +12392,9 @@ class MainWindow(Gtk.ApplicationWindow):
     def ask_call(self, ev):
         name = "A friend" if self.chat.is_locked() else ev["name"]
         d = Gtk.Window(title="Incoming call")
-        d.set_transient_for(self)
+        if self.get_visible():
+            d.set_transient_for(self)
+        d.set_position(Gtk.WindowPosition.CENTER)
         d.set_keep_above(True)
         d.set_resizable(False)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, border_width=20)
@@ -12186,8 +12433,9 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add(2200, ring)
         d.show_all()
         d.present()
-        self.show_toast(f"📞 {name} is calling", "Accept or decline in the call window", avatar_pixbuf(name, None, 40),
-                        lambda: d.present(), seconds=30)
+        if self.get_visible():
+            self.show_toast(f"📞 {name} is calling", "Accept or decline in the call window",
+                            avatar_pixbuf(name, None, 40), lambda: d.present(), seconds=30)
         try:
             n = Gio.Notification.new(f"📞 {name} is calling")
             self.get_application().send_notification("call", n)
@@ -12204,9 +12452,13 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_friend_request(self, pid):
         self.on_people_changed()
         name = self.chat.contacts["incoming"].get(pid, {}).get("name", "Someone")
-        self.show_toast(f"{name} wants to be your friend", "Click to accept or decline",
-                        avatar_pixbuf(name, self.chat.avatar_file(pid), 40),
-                        lambda: (self.show_right("chat"), self.chat_panel.show_people()), seconds=10)
+        act = lambda: (self.show_from_tray(chat=True), self.chat_panel.show_people())
+        if self.get_visible() and self.is_active():
+            self.show_toast(f"{name} wants to be your friend", "Click to accept or decline",
+                            avatar_pixbuf(name, self.chat.avatar_file(pid), 40), act, seconds=10)
+        else:
+            self.notify_desktop(f"{name} wants to be your friend", "Click to accept or decline",
+                                avatar_pixbuf(name, self.chat.avatar_file(pid), 40), act)
         if self.cfg.get("chat_sound", True):
             play_sound("request")
         try:
@@ -12240,22 +12492,19 @@ class MainWindow(Gtk.ApplicationWindow):
         pix = avatar_pixbuf(msg.get("name", "?"), self.chat.avatar_file(msg.get("from")), 40)
         if self.chat.is_locked():                            # nothing private on screen while locked
             title, body, pix = "🔒 New message", "Unlock the chat to read it", avatar_pixbuf("🔒", None, 40)
-        self.show_toast(title, body, pix, lambda: self.open_chat_from_toast(gid))
         if self.cfg.get("chat_sound", True):
             play_sound("message")
-        if self.is_active() or any(w.is_active() for w in self.chat_windows):
-            return False                                 # the pop-up is enough while you're in Arckad-D
-        try:
-            n = Gio.Notification.new(title)                    # already hidden if the chat is locked
-            n.set_body(body[:200])
-            self.get_application().send_notification(f"chat-{gid}", n)
-        except Exception:
-            pass
+        if self.get_visible() and (self.is_active() or any(w.is_active() for w in self.chat_windows)):
+            self.show_toast(title, body, pix, lambda: self.open_chat_from_toast(gid))
+        else:                                           # hidden in the tray or another app in front
+            self.notify_desktop(title, body, pix, lambda: self.open_chat_from_toast(gid))
         return False
 
     def update_chat_button(self):
         total = sum(n for g, n in self.chat.unread.items() if g in self.chat.groups) + len(self.chat.contacts["incoming"])
         self.chat_btn.set_label(f"💬 Chat ({total})" if total else "💬 Chat")
+        if getattr(self, "tray", None):
+            self.tray.set_unread(total)
         return False
 
     def flash_all(self, text):
@@ -12641,6 +12890,87 @@ class MainWindow(Gtk.ApplicationWindow):
             return False
         return True
 
+    # ---------- tray: closing hides Arckad-D; chat, calls and sharing keep running
+    def setup_tray(self):
+        self.cfg.setdefault("keep_in_tray", True)
+        self.cfg.setdefault("start_at_login", True)
+        self.tray = None
+        try:
+            self.tray = Tray(self)
+        except Exception as ex:
+            print(f"{APP_NAME}: no tray icon ({ex})", file=sys.stderr)
+        set_start_at_login(self.cfg["start_at_login"])
+        self.instance_srv = start_instance_listener(self)
+
+    def on_delete(self, *_):
+        if self.cfg.get("keep_in_tray", True) and not getattr(self, "quitting", False):
+            self.save_state()
+            self.hide()
+            for w in list(self.chat_windows):
+                w.hide()
+            if not self.cfg.get("tray_hint_shown"):
+                self.cfg["tray_hint_shown"] = True
+                write_json(CONFIG_FILE, self.cfg)
+                self.notify_desktop(f"{APP_NAME} is still running",
+                                    "Chat, calls and file sharing keep working. Open it again from the tray icon.",
+                                    avatar_pixbuf("A", None, 40, group=True) if not logo_pixbuf(40) else logo_pixbuf(40),
+                                    lambda: self.show_from_tray())
+            return True
+        return self.on_close()
+
+    def save_state(self):
+        self.preview.flush_note()
+        if self._right and self.right_box.get_visible():
+            self.cfg["right_width"] = self.right_box.get_allocated_width()
+        if self.get_visible():
+            self.cfg["size"] = list(self.get_size())
+        self.cfg["tabs"] = {side: [nb.get_nth_page(i).location for i in range(nb.get_n_pages())]
+                            for side, nb in (("left", self.left_nb), ("right", self.right_nb))}
+        write_json(CONFIG_FILE, self.cfg)
+
+    def show_from_tray(self, chat=False, folder=None):
+        self.show()
+        self.deiconify()
+        self.present()
+        if folder and os.path.isdir(folder):
+            self.new_tab(self.left_nb, folder)
+        if chat:
+            self.show_right("chat")
+        return False
+
+    def toggle_from_tray(self):
+        if self.get_visible() and self.is_active():
+            self.on_delete()
+        else:
+            self.show_from_tray()
+
+    def quit_app(self):
+        self.quitting = True
+        app = self.get_application()            # before destroy(): the window lets go of it then
+        if self.tray:
+            self.tray.remove()
+        self.on_close()
+        try:
+            INSTANCE_FILE.unlink()
+        except OSError:
+            pass
+        self.destroy()
+        if app:
+            app.quit()
+
+    def notify_desktop(self, title, body, pixbuf, action):
+        """A notification when Arckad-D's window isn't in front: Windows gets Arckad-D's own corner pop-up
+        (GTK's notifications don't work there); Linux uses the desktop's notifications."""
+        if IS_WIN:
+            CornerPopup(title, body, pixbuf, lambda: (self.show_from_tray(), action() if action else None))
+            return
+        try:
+            n = Gio.Notification.new(title)
+            n.set_body(body[:200])
+            self.get_application().send_notification(None, n)
+        except Exception:
+            CornerPopup(title, body, pixbuf, lambda: (self.show_from_tray(), action() if action else None))
+
     def on_close(self, *_):
         self.preview.flush_note()
         if self._right and self.right_box.get_visible():
@@ -12724,6 +13054,9 @@ def main():
         failed = sys.argv[i + 1] if len(sys.argv) > i + 1 else "?"
     start = next((os.path.abspath(os.path.expanduser(a)) for a in sys.argv[1:]
                   if os.path.isdir(os.path.expanduser(a))), None)
+    background = "--background" in sys.argv
+    if not failed and hand_over_to_running(start, background):
+        return                                     # already running (maybe in the tray): it shows itself
     fix_user_launcher()
     GLib.set_prgname(APP_SLUG)
     GLib.set_application_name(APP_NAME)
@@ -12732,7 +13065,11 @@ def main():
     def activate(a):
         try:
             win = MainWindow(a, start)
-            win.present()
+            if background:                         # started at log-in: just the tray icon
+                a.hold()
+                win.hide()
+            else:
+                win.present()
             if failed:
                 GLib.timeout_add(800, lambda: win.show_update_failure(failed) or False)
         except Exception:

@@ -28,6 +28,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=force
 
+[Registry]
+; remove "start when I log in" (and the auto-sort helper's entry) when Arckad-D is uninstalled
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "Arckad-D"; Flags: uninsdeletevalue dontcreatekey
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "Arckad-D AutoSort"; Flags: uninsdeletevalue dontcreatekey
+
 [InstallDelete]
 ; clear the previous version's program files first, so old and new Python files never mix
 Type: filesandordirs; Name: "{app}\_internal"
@@ -77,7 +82,8 @@ var
   waited: Integer;
 begin
   waited := 0;
-  while CheckForMutexes('ArckadD-Running') and (waited < 240) do
+  { only for updates started from inside Arckad-D; a manual install closes Arckad-D right away instead }
+  while HasParam('/UPDATE') and CheckForMutexes('ArckadD-Running') and (waited < 240) do
   begin
     Sleep(250);
     waited := waited + 1;
