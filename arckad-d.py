@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.24.0"
+APP_VERSION = "3.25.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -11389,7 +11389,8 @@ class ChatPanel(Gtk.Box):
         others = self._others()
         read, delivered = set(m.get("read", [])), set(m.get("delivered", []))
         if others and all(d in read for d in others):
-            return "  <span foreground='#7df9ff' weight='heavy'>✓✓</span>"
+            blue = "#0a6cff" if self.win.cfg.get("theme") == "mono" else "#7df9ff"   # visible on every bubble colour
+            return f"  <span foreground='{blue}' weight='heavy'>✓✓</span>"
         if delivered or read:
             return "  <span weight='bold'>✓✓</span>"
         return "  <span>✓</span>"
@@ -11590,6 +11591,7 @@ class ChatPanel(Gtk.Box):
         parts = split_emoji(text)
         if not any(is_e for is_e, _ in parts):
             t = Gtk.Label(label=text, xalign=0, wrap=True, selectable=True, max_width_chars=38)
+            t.set_can_focus(False)                # no automatic select-all when the chat opens
             t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
             return t
         only = all(is_e or not piece.strip() for is_e, piece in parts)
@@ -12671,6 +12673,119 @@ Middle-click a folder  open it in a new tab
 Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
 
 
+# ---------------------------------------------------------------- Skins: modern, glossy themes
+SKINS = {
+    "midnight": dict(dark=True, bg="#111114", bg2="#18181c", surface="#1b1b20", surface_hi="#25252c", side="#15151a",
+                     text="#ededf2", dim="#9b9ba8", border="rgba(255,255,255,0.08)", accent="#ff7a1a", accent2="#ff9b45",
+                     accent_dark="#d4520a", on_accent="#ffffff", glow="rgba(255,122,26,0.38)",
+                     glow_soft="rgba(255,122,26,0.16)", hdr1="#26262d", hdr2="#16161a", btn1="#2c2c34", btn2="#1f1f25",
+                     menu="#1d1d23", scroll="rgba(255,255,255,0.22)", bubble_text="#ffffff"),
+    "snow": dict(dark=False, bg="#f4f4f7", bg2="#ffffff", surface="#ffffff", surface_hi="#f1f1f5", side="#f7f7fa",
+                 text="#1c1c22", dim="#6a6a76", border="rgba(0,0,0,0.09)", accent="#f26b00", accent2="#ff9038",
+                 accent_dark="#c85400", on_accent="#ffffff", glow="rgba(242,107,0,0.30)",
+                 glow_soft="rgba(242,107,0,0.12)", hdr1="#ffffff", hdr2="#ececf1", btn1="#ffffff", btn2="#eeeef3",
+                 menu="#ffffff", scroll="rgba(0,0,0,0.25)", bubble_text="#ffffff"),
+    "mono": dict(dark=True, bg="#0c0c0e", bg2="#141417", surface="#18181b", surface_hi="#232327", side="#111114",
+                 text="#f3f3f3", dim="#9d9da4", border="rgba(255,255,255,0.10)", accent="#f3f3f3", accent2="#ffffff",
+                 accent_dark="#cfcfd4", on_accent="#0c0c0e", glow="rgba(255,255,255,0.22)",
+                 glow_soft="rgba(255,255,255,0.08)", hdr1="#222226", hdr2="#121215", btn1="#26262b", btn2="#1a1a1e",
+                 menu="#1a1a1e", scroll="rgba(255,255,255,0.25)", bubble_text="#0c0c0e"),
+}
+
+_SKIN_TEMPLATE = """
+* { font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", sans-serif; }
+window, dialog, messagedialog, .background { background-color: $bg; color: $text; }
+window.background { background-image: radial-gradient(circle at 100% 0%, $glow_soft, transparent 42%),
+                                      linear-gradient(to bottom, $bg2, $bg); }
+label { color: $text; }
+.dim-label, label.dim-label { color: $dim; opacity: 1; }
+headerbar, .titlebar { background-image: linear-gradient(to bottom, $hdr1, $hdr2); border: none;
+  border-bottom: 1px solid $border; box-shadow: inset 0 1px rgba(255,255,255,0.07); color: $text; min-height: 44px; }
+headerbar .title { font-weight: 700; }
+button { background-image: linear-gradient(to bottom, $btn1, $btn2); background-color: transparent; color: $text;
+  border: 1px solid $border; border-radius: 10px; text-shadow: none; -gtk-icon-shadow: none;
+  box-shadow: inset 0 1px rgba(255,255,255,0.09), 0 1px 2px rgba(0,0,0,0.22); transition: all 160ms ease; }
+button:hover { border-color: $accent; box-shadow: inset 0 1px rgba(255,255,255,0.12), 0 0 0 1px $glow_soft, 0 2px 8px $glow_soft; }
+button:active, button:checked, menubutton button:checked {
+  background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent; border-color: $accent_dark;
+  box-shadow: inset 0 1px rgba(255,255,255,0.30), 0 0 12px $glow; }
+button:checked label, button:active label { color: $on_accent; }
+button:disabled { opacity: 0.45; box-shadow: none; }
+button.flat { background-image: none; border-color: transparent; box-shadow: none; }
+button.flat:hover { background-color: $glow_soft; border-color: transparent; }
+button.suggested-action { background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent;
+  border-color: $accent_dark; font-weight: 600; box-shadow: inset 0 1px rgba(255,255,255,0.35), 0 2px 12px $glow; }
+button.suggested-action label { color: $on_accent; }
+button.destructive-action { background-image: linear-gradient(to bottom, #ef5350, #c62828); color: #ffffff;
+  border-color: #b71c1c; box-shadow: inset 0 1px rgba(255,255,255,0.3), 0 2px 10px rgba(229,57,53,0.35); }
+button.destructive-action label { color: #ffffff; }
+entry, spinbutton:not(.vertical), searchbar entry { background-color: $surface; background-image: none; color: $text;
+  border: 1px solid $border; border-radius: 10px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.20); caret-color: $accent; }
+entry:focus, spinbutton:focus { border-color: $accent; box-shadow: 0 0 0 3px $glow_soft; }
+entry selection, label selection, textview text selection { background-color: $accent; color: $on_accent; }
+.view, treeview.view, iconview, textview text, list { background-color: $surface; color: $text; }
+list row:selected, row:selected { background-image: linear-gradient(to right, $accent, $accent2);
+  background-color: $accent; color: $on_accent; }
+treeview.view:selected, treeview.view:selected:focus, iconview:selected, iconview:selected:focus, .view:selected {
+  background-image: none; background-color: $accent; color: $on_accent; }
+row:selected label { color: $on_accent; }
+treeview.view:hover, list row:hover { background-color: $glow_soft; }
+treeview.view header button { background-image: none; background-color: $surface_hi; color: $dim; font-weight: 600;
+  border: none; border-bottom: 1px solid $border; border-radius: 0; box-shadow: none; }
+notebook > header { background-color: $bg2; border-color: $border; }
+notebook > header tab { color: $dim; border-radius: 9px 9px 0 0; padding: 4px 14px; }
+notebook > header tab:hover { color: $text; background-color: $glow_soft; }
+notebook > header tab:checked { color: $text; background-color: $surface; box-shadow: inset 0 -3px $accent; }
+notebook > stack { background-color: $surface; }
+.arckad-sidebar, .arckad-sidebar row { background-color: $side; }
+.arckad-sidebar row:selected { background-image: linear-gradient(to right, $accent, $accent2); border-radius: 10px; }
+paned > separator, separator { background-color: $border; }
+scrollbar { background-color: transparent; border: none; }
+scrollbar slider { background-color: $scroll; border-radius: 8px; min-width: 6px; min-height: 6px; border: none; }
+scrollbar slider:hover, scrollbar slider:active { background-color: $accent; }
+progressbar trough { background-color: $surface_hi; border-radius: 6px; border: none; }
+progressbar progress { background-image: linear-gradient(to right, $accent2, $accent); border-radius: 6px; border: none; }
+levelbar block.filled { background-color: $accent; }
+switch { background-color: $surface_hi; border: 1px solid $border; border-radius: 14px; }
+switch:checked { background-color: $accent; background-image: linear-gradient(to bottom, $accent2, $accent_dark); }
+switch slider { background-image: linear-gradient(to bottom, #ffffff, #e2e2e6); border-radius: 50%; border: none;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.35); }
+check, radio { border: 1px solid $border; background-image: linear-gradient(to bottom, $btn1, $btn2); }
+check:checked, radio:checked { background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent;
+  border-color: $accent_dark; }
+scale trough { background-color: $surface_hi; border-radius: 4px; }
+scale highlight { background-image: linear-gradient(to right, $accent2, $accent); border-radius: 4px; }
+scale slider { background-image: linear-gradient(to bottom, #ffffff, #e2e2e6); border: 1px solid $border; border-radius: 50%; }
+menu, .menu, .context-menu, popover, popover.background { background-color: $menu; color: $text;
+  border: 1px solid $border; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
+menuitem { padding: 6px 12px; border-radius: 8px; }
+menuitem:hover { background-image: linear-gradient(to right, $accent, $accent2); color: $on_accent; }
+menuitem:hover label { color: $on_accent; }
+tooltip, tooltip.background { background-color: $menu; color: $text; border: 1px solid $border; border-radius: 9px; }
+tooltip label { color: $text; }
+infobar, infobar > revealer > box { background-color: $surface_hi; background-image: none; color: $text; border: none; }
+frame.app-notification, .app-notification { background-image: linear-gradient(to bottom, $hdr1, $hdr2); color: $text;
+  border: 1px solid $border; border-radius: 14px; box-shadow: 0 6px 24px rgba(0,0,0,0.35), 0 0 16px $glow_soft; }
+.chat-mine { background-color: $accent; background-image: linear-gradient(to bottom, $accent2, $accent_dark);
+  box-shadow: 0 2px 8px $glow_soft; }
+.chat-mine label { color: $bubble_text; }
+.chat-mine label selection, .chat-theirs label selection { background-color: $glow; color: $text; }
+.chat-mine textview, .chat-mine textview text, .chat-theirs textview, .chat-theirs textview text {
+  background-color: transparent; background-image: none; }
+.chat-mine textview text { color: $bubble_text; }
+.chat-theirs textview text { color: $text; }
+.chat-theirs { background-color: $surface_hi; box-shadow: 0 1px 4px rgba(0,0,0,0.18); }
+progressbar.arckad-transfer progress { background-color: $accent; }
+calendar { background-color: $surface; color: $text; }
+calendar:selected { background-color: $accent; color: $on_accent; }
+"""
+
+
+def skin_css(name):
+    from string import Template
+    return Template(_SKIN_TEMPLATE).safe_substitute(SKINS[name]).encode()
+
+
 class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, app, start=None):
         super().__init__(application=app, title=APP_NAME)
@@ -12682,7 +12797,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.cfg.setdefault("file_icons", "colour" if IS_WIN else "system")
         ICON_STYLE["colour"] = self.cfg["file_icons"] == "colour" and colour_icons_supported()
         self.set_default_size(*self.cfg.get("size", [1280, 760]))
-        self.cfg.setdefault("theme", "system")
+        self.cfg.setdefault("theme", "midnight")
         self.active = None
         self.clipboard = None
         self.sorter = None
@@ -12909,6 +13024,7 @@ class MainWindow(Gtk.ApplicationWindow):
         main.set_position(220)
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.sidebar = Gtk.ListBox()
+        self.sidebar.get_style_context().add_class("arckad-sidebar")
         self.sidebar.get_style_context().add_class("navigation-sidebar")
         self.sidebar.connect("row-activated", lambda lb, row: self.sidebar_activate(row))
         self.sidebar.connect("button-press-event", self.on_sidebar_click)
@@ -13124,8 +13240,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self.get_application().quit()
         return False
 
-    # ---------- light / dark theme
-    THEMES = [("system", "🖥", "Follow system"), ("light", "☀", "Light"), ("dark", "🌙", "Dark")]
+    # ---------- themes: the modern skins (glossy, rounded) and the classic look
+    THEMES = [("midnight", "🟠", "Midnight Orange (black + orange)"), ("snow", "🔆", "Snow Orange (white + orange)"),
+              ("mono", "◐", "Mono (black + white)"), ("system", "🖥", "Classic: follow system"),
+              ("light", "☀", "Classic light"), ("dark", "🌙", "Classic dark")]
 
     def _theme_button(self):
         menu = Gtk.Menu()
@@ -13150,6 +13268,9 @@ class MainWindow(Gtk.ApplicationWindow):
             self.cfg["theme"] = key
             self.apply_theme(key)
             self.update_theme_button()
+            for panel in self.chat_panels():                  # tick colours follow the theme
+                if panel.gid and panel.pages.get_visible_child_name() == "conv":
+                    panel.show_messages()
             write_json(CONFIG_FILE, self.cfg)
 
     def update_theme_button(self):
@@ -13165,6 +13286,16 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def apply_theme(self, mode):
         s = Gtk.Settings.get_default()
+        if not hasattr(self, "_skin_css"):
+            self._skin_css = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self._skin_css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 5)
+        if mode in SKINS:
+            s.set_property("gtk-theme-name", "Adwaita")          # a known base under the skin
+            s.set_property("gtk-application-prefer-dark-theme", SKINS[mode]["dark"])
+            self._skin_css.load_from_data(skin_css(mode))
+            return
+        self._skin_css.load_from_data(b"")
         base = self.system_theme
         light = base[:-5] if base.lower().endswith("-dark") else base
         if light != "Adwaita" and not self._theme_exists(light):
