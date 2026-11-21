@@ -240,6 +240,91 @@ final class ChatEngine {
         }
     }
 
+    // ================================================================= work profile card
+    static final String[][] CARD_FIELDS = {{"about", "About", "160"}, {"designation", "Designation", "60"},
+            {"department", "Department", "60"}, {"company", "Company", "80"}, {"location", "Office / location", "80"},
+            {"phone", "Phone / extension", "40"}, {"email", "Work email", "80"}};
+
+    static JSONObject cleanCard(JSONObject c) {
+        JSONObject out = new JSONObject();
+        if (c == null) return out;
+        for (String[] f : CARD_FIELDS) {
+            String v = c.optString(f[0]).trim();
+            if (!v.isEmpty()) put(out, f[0], cut(v, Integer.parseInt(f[2])));
+        }
+        return out;
+    }
+
+    JSONObject myCard() {
+        return cleanCard(profile.optJSONObject("card"));
+    }
+
+    /** Same as the desktop: sha256 of the card as sorted JSON, first 10 hex digits ("" when empty). */
+    String cardHash() {
+        JSONObject c = myCard();
+        if (c.length() == 0) return "";
+        java.util.TreeMap<String, Object> sorted = new java.util.TreeMap<>();
+        for (Iterator<String> it = c.keys(); it.hasNext(); ) {
+            String k = it.next();
+            sorted.put(k, c.opt(k));
+        }
+        StringBuilder b = new StringBuilder("{");
+        for (Map.Entry<String, Object> en : sorted.entrySet()) {
+            if (b.length() > 1) b.append(", ");
+            b.append(ChatCrypto.pyJson(en.getKey())).append(": ").append(ChatCrypto.pyJson(en.getValue()));
+        }
+        return sha256hex(b.append("}").toString()).substring(0, 10);
+    }
+
+    void setCard(JSONObject card) {
+        put(profile, "card", cleanCard(card));
+        put(profile, "updated", now());
+        saveContacts();
+        ui.people();
+    }
+
+    JSONObject cardOf(String pid) {
+        if (pid.equals(me)) return myCard();
+        JSONObject f = friends().optJSONObject(pid), p = people.get(pid);
+        JSONObject c = f != null && f.optJSONObject("card") != null ? f.optJSONObject("card") : p == null ? null : p.optJSONObject("card");
+        return cleanCard(c);
+    }
+
+    static String cardLine(JSONObject c) {
+        String a = c.optString("designation"), b = c.optString("department");
+        if (b.isEmpty()) b = c.optString("company");
+        return a.isEmpty() ? b : b.isEmpty() ? a : a + " · " + b;
+    }
+
+    private void fetchCard(String pid, String ip, int port, String pv) {
+        JSONObject data = null;
+        try {
+            HttpURLConnection c = (HttpURLConnection) new URL("http://" + ip + ":" + port + "/f/card").openConnection();
+            c.setConnectTimeout(5000);
+            c.setReadTimeout(8000);
+            try (InputStream in = c.getInputStream()) {
+                data = new JSONObject(new String(readStream(in, 100_000), StandardCharsets.UTF_8));
+            }
+        } catch (Exception ignored) {
+        }
+        JSONObject p = people.get(pid);
+        if (p != null) put(p, "card_busy", false);
+        if (data == null || !data.optBoolean("ok")) return;
+        JSONObject card = cleanCard(data.optJSONObject("card"));
+        if (p != null) {
+            put(p, "card", card);
+            put(p, "pv_fetched", pv);
+        }
+        JSONObject f = friends().optJSONObject(pid);
+        if (f != null) {
+            put(f, "card", card);
+            put(f, "pv", pv);
+            saveContacts();
+        }
+        ui.people();
+        ui.changed(null);
+    }
+
     String photoHash() {
         byte[] d = photoBytes();
         return d.length == 0 ? "" : hex(sha256(d)).substring(0, 16);
@@ -736,6 +821,19 @@ final class ChatEngine {
         put(p, "os", cut(who.optString("os"), 10));
         put(p, "seen", now());
         put(p, "hidden", who.optBoolean("hidden"));
+        String pv = cut(who.optString("pv"), 16);
+        put(p, "pv", pv);
+        JSONObject fr = friends().optJSONObject(pid);
+        JSONObject keep = old != null && old.optJSONObject("card") != null ? old.optJSONObject("card")
+                : fr != null ? fr.optJSONObject("card") : null;
+        if (keep != null) put(p, "card", keep);
+        String known = fr != null ? fr.optString("pv") : old == null ? "" : old.optString("pv_fetched");
+        if (old != null) put(p, "pv_fetched", old.optString("pv_fetched"));
+        if (!pv.isEmpty() && !pv.equals(known) && (old == null || !old.optBoolean("card_busy"))) {
+            put(p, "card_busy", true);
+            final int fport = port;
+            bg(() -> fetchCard(pid, ip, fport, pv));
+        }
         people.put(pid, p);
         JSONObject f = friends().optJSONObject(pid);
         if (f != null && (!ip.equals(f.optString("ip")) || f.optInt("port") != port)) {
@@ -1915,7 +2013,7 @@ final class ChatEngine {
         boolean anyone = friends().length() > 0 || outgoing().length() > 0;
         if ((profile.optBoolean("setup") && profile.optBoolean("visible")) || anyone) {
             JSONObject who = new Obj().putOpt("id", me).putOpt("name", cut(myName(), 40)).putOpt("os", osName).putOpt("ph", photoHash())
-                    .putOpt("ver", version);
+                    .putOpt("ver", version).putOpt("pv", cardHash());
             if (!(profile.optBoolean("setup") && profile.optBoolean("visible"))) put(who, "hidden", true);
             put(msg, "who", who);
         }
@@ -2114,7 +2212,11 @@ final class ChatEngine {
         String path = r.path;
         if (r.method.equals("GET") && path.equals("/f/hello")) {      // for profile codes: who is at this address?
             r.json(200, new Obj().putOpt("ok", true).putOpt("id", me).putOpt("name", myName()).putOpt("os", osName)
-                    .putOpt("ph", photoHash()).putOpt("ver", version));
+                    .putOpt("ph", photoHash()).putOpt("ver", version).putOpt("card", myCard()));
+            return;
+        }
+        if (r.method.equals("GET") && path.equals("/f/card")) {       // the work profile (only what was filled in)
+            r.json(200, new Obj().putOpt("ok", true).putOpt("card", myCard()).putOpt("pv", cardHash()));
             return;
         }
         if (r.method.equals("GET")) {

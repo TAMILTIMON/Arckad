@@ -144,6 +144,14 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             t.addView(n);
             t.addView(Ui.text(a, subtitle(gid), 12, Ui.DIM, false));
             bar.addView(t, MainActivity.grow());
+            final String hg = gid;
+            View.OnClickListener open = v -> {
+                JSONObject gg = e.groups.get(hg);
+                if (gg != null && "direct".equals(gg.optString("kind"))) viewProfile(gg.optString("peer"));
+                else members();
+            };
+            av.setOnClickListener(open);
+            t.setOnClickListener(open);
             bar.addView(Ui.icon(a, "🔒", "Lock chat", v -> lockNow()));
             bar.addView(Ui.icon(a, "⋮", "More", v -> convMenu()));
         } else if ("people".equals(page)) {
@@ -293,7 +301,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             JSONObject f = e.friends().optJSONObject(pid);
             if (grp.optBoolean("removed") || f == null) return "not friends any more";
             if (f.optJSONObject("pending_accept") != null) return "finishing… (they need to come online)";
-            return e.personOnline(pid) ? "online" : "offline";
+            String cl = ChatEngine.cardLine(e.cardOf(pid));
+            return (e.personOnline(pid) ? "online" : "offline") + (cl.isEmpty() ? "" : " · " + cl);
         }
         JSONObject members = grp.optJSONObject("members");
         int n = members == null ? 0 : members.length();
@@ -1017,6 +1026,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 labels.add("Safety code");
                 acts.add(() -> Ui.info(a, "Safety code with " + title(gid), e.safetyCode(g.optString("peer"))
                         + "\n\nOpen this on your friend's device too. If both show the same numbers, your chat is private."));
+                labels.add("View profile");
+                acts.add(() -> viewProfile(g.optString("peer")));
                 labels.add("Remove friend completely");
                 acts.add(() -> removeFriendDialog(g.optString("peer"), title(gid)));
             }
@@ -1362,8 +1373,11 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         t.setOrientation(LinearLayout.VERTICAL);
         t.setPadding(Ui.dp(a, 10), 0, 0, 0);
         t.addView(Ui.text(a, name, 15, Ui.TEXT, true));
-        t.addView(Ui.text(a, sub, 12, Ui.DIM, false));
+        String cl = ChatEngine.cardLine(e.cardOf(pid));
+        t.addView(Ui.text(a, cl.isEmpty() ? sub : cl + " · " + sub, 12, Ui.DIM, false));
         row.addView(t, MainActivity.grow());
+        av.setOnClickListener(v -> viewProfile(pid));
+        t.setOnClickListener(v -> viewProfile(pid));
         for (View b : buttons) row.addView(b);
         return row;
     }
@@ -1408,15 +1422,95 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         box.addView(vis, Ui.matchWrap(a, 10));
         box.addView(Ui.text(a, "Your name and photo appear in colleagues' People list so they can send you a friend "
                 + "request. Off: only your friends see you.", 12, Ui.DIM, false));
-        Ui.dialog(a).setTitle("Your profile").setView(box).setPositiveButton("Save", (d, w) -> {
+        box.addView(Ui.text(a, "Work profile (optional: only what you fill in is shown)", 15, Ui.TEXT, true), Ui.matchWrap(a, 14));
+        JSONObject card = e.myCard();
+        java.util.Map<String, EditText> fields = new java.util.LinkedHashMap<>();
+        for (String[] f : ChatEngine.CARD_FIELDS) {
+            EditText et = new EditText(a);
+            et.setHint(f[1]);
+            et.setText(card.optString(f[0]));
+            et.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(Integer.parseInt(f[2]))});
+            if (f[0].equals("email")) et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+            else if (f[0].equals("phone")) et.setInputType(InputType.TYPE_CLASS_PHONE);
+            else et.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+            fields.put(f[0], et);
+            box.addView(et);
+        }
+        android.widget.ScrollView sv = new android.widget.ScrollView(a);
+        sv.addView(box);
+        Ui.dialog(a).setTitle("Your profile").setView(sv).setPositiveButton("Save", (d, w) -> {
             String n = name.getText().toString().trim();
             e.setProfile(n.isEmpty() ? e.myName() : n, pendingPhoto, remove[0], vis.isChecked());
+            JSONObject nc = new JSONObject();
+            for (java.util.Map.Entry<String, EditText> en : fields.entrySet())
+                ChatEngine.put(nc, en.getKey(), en.getValue().getText().toString());
+            e.setCard(nc);
             avatars.evictAll();
             hub.start();
             a.refreshTopBar();
             render();
             if (then != null) then.run();
         }).setNegativeButton("Cancel", null).show();
+    }
+
+    /** A person's profile card: photo, name, work details (tap phone or email to copy, or to call / write). */
+    void viewProfile(String pid) {
+        JSONObject f = e.friends().optJSONObject(pid), p = e.people.get(pid);
+        String name = pid.equals(e.me) ? e.myName() : f != null ? f.optString("name") : p != null ? p.optString("name") : "Someone";
+        JSONObject card = e.cardOf(pid);
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 12), Ui.dp(a, 20), Ui.dp(a, 4));
+        ImageView av = new ImageView(a);
+        av.setImageBitmap(avatar(name, e.avatarFile(pid), 112, false));
+        box.addView(av, new LinearLayout.LayoutParams(Ui.dp(a, 112), Ui.dp(a, 112)));
+        TextView nm = Ui.text(a, name, 22, Ui.TEXT, true);
+        nm.setGravity(Gravity.CENTER);
+        box.addView(nm);
+        String cl = ChatEngine.cardLine(card);
+        if (!cl.isEmpty()) {
+            TextView c = Ui.text(a, cl, 15, Ui.TEXT, false);
+            c.setGravity(Gravity.CENTER);
+            box.addView(c);
+        }
+        if (!pid.equals(e.me)) {
+            TextView st = Ui.text(a, (e.personOnline(pid) ? "online" : "offline") + (f != null ? " · friend" : ""), 13, Ui.DIM, false);
+            st.setGravity(Gravity.CENTER);
+            box.addView(st);
+        }
+        if (!card.optString("about").isEmpty()) {
+            TextView ab = Ui.text(a, "“" + card.optString("about") + "”", 14, Ui.TEXT, false);
+            ab.setTypeface(null, Typeface.ITALIC);
+            ab.setGravity(Gravity.CENTER);
+            ab.setPadding(0, Ui.dp(a, 8), 0, Ui.dp(a, 4));
+            box.addView(ab);
+        }
+        String[][] icons = {{"designation", "💼"}, {"department", "🏢"}, {"company", "🏛"}, {"location", "📍"}, {"phone", "📞"}, {"email", "✉"}};
+        int shown = 0;
+        for (String[] ic : icons) {
+            String v = card.optString(ic[0]);
+            if (v.isEmpty()) continue;
+            String label = "";
+            for (String[] f2 : ChatEngine.CARD_FIELDS) if (f2[0].equals(ic[0])) label = f2[1];
+            TextView row = Ui.text(a, ic[1] + "  " + label + "\n      " + v, 14, Ui.TEXT, false);
+            row.setPadding(0, Ui.dp(a, 6), 0, 0);
+            row.setTextIsSelectable(true);
+            final String key = ic[0];
+            if (key.equals("phone") || key.equals("email")) row.setOnClickListener(vv -> {
+                android.content.ClipboardManager cm = (android.content.ClipboardManager) a.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                cm.setPrimaryClip(android.content.ClipData.newPlainText(key, v));
+                Ui.toast(a, "Copied " + v);
+            });
+            box.addView(row, Ui.matchWrap(a, 0));
+            shown++;
+        }
+        if (shown == 0 && card.length() == 0) box.addView(Ui.text(a, "No work details shared yet.", 13, Ui.DIM, false));
+        android.widget.ScrollView sv = new android.widget.ScrollView(a);
+        sv.addView(box);
+        android.app.AlertDialog.Builder b = Ui.dialog(a).setView(sv).setNegativeButton("Close", null);
+        if (f != null && !pid.equals(e.me)) b.setPositiveButton("💬 Message", (d, w) -> show("conv", e.directGid(pid)));
+        b.show();
     }
 
     // ---------- avatars: a photo, or coloured initials in a circle

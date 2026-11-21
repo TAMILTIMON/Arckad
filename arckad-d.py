@@ -90,7 +90,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.27.1"
+APP_VERSION = "3.28.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5280,7 +5280,7 @@ def make_pair_handler(pr):
         def do_GET(self):
             try:
                 path = self.path.split("?")[0]
-                if (path.startswith("/c/file/") or path in ("/f/photo", "/f/hello")) and getattr(pr.win, "chat", None):
+                if (path.startswith("/c/file/") or path in ("/f/photo", "/f/hello", "/f/card")) and getattr(pr.win, "chat", None):
                     return pr.win.chat.handle_get(self, path)
                 self._plain(404, {"ok": False})
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -6495,10 +6495,10 @@ class Chat:
             out["fcode"] = hashlib.sha256(f"arckad-friend-code|{self.fcode['code']}".encode()).hexdigest()[:20]
         if self.profile.get("setup") and self.profile.get("visible"):
             out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
-                          "ver": APP_VERSION}
+                          "ver": APP_VERSION, "pv": self.card_hash()}
         elif self.contacts["outgoing"] or self.contacts["friends"]:
             out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
-                          "hidden": True}            # friends and people I asked still see me
+                          "hidden": True, "pv": self.card_hash()}    # friends and people I asked still see me
         return out
 
     def _expected(self):
@@ -6852,8 +6852,15 @@ class Chat:
         name = str(who.get("name") or "Someone")[:40]
         ph = str(who.get("ph") or "")[:16]
         old = self.people.get(pid)
+        pv = str(who.get("pv") or "")[:16]
         self.people[pid] = {"name": name, "ip": ip, "port": port, "ph": ph, "os": str(who.get("os", ""))[:10],
-                            "seen": time.time(), "hidden": bool(who.get("hidden")), "ver": str(who.get("ver", ""))[:12]}
+                            "seen": time.time(), "hidden": bool(who.get("hidden")), "ver": str(who.get("ver", ""))[:12],
+                            "pv": pv, "card": (old or {}).get("card") or (self.contacts["friends"].get(pid) or {}).get("card")}
+        known = ((self.contacts["friends"].get(pid) or {}).get("pv") if pid in self.contacts["friends"]
+                 else (old or {}).get("pv_fetched"))
+        if pv and pv != known and not (old or {}).get("card_busy"):
+            self.people[pid]["card_busy"] = True
+            threading.Thread(target=self._fetch_card, args=(pid, ip, port, pv), daemon=True).start()
         f = self.contacts["friends"].get(pid)
         if f and (f.get("ip") != ip or f.get("port") != port):
             f["ip"], f["port"] = ip, port
@@ -6877,6 +6884,65 @@ class Chat:
             threading.Thread(target=self._deliver_accept, args=(pid,), daemon=True).start()
         if changed:
             self.ui("on_people_changed")
+
+    # ---------- work profile card (about, designation, department, company, location, phone, email)
+    CARD_FIELDS = (("about", "About", 160), ("designation", "Designation", 60), ("department", "Department", 60),
+                   ("company", "Company", 80), ("location", "Office / location", 80), ("phone", "Phone / extension", 40),
+                   ("email", "Work email", 80))
+
+    @classmethod
+    def clean_card(cls, card):
+        card = card if isinstance(card, dict) else {}
+        return {k: str(card.get(k) or "").strip()[:n] for k, _l, n in cls.CARD_FIELDS if str(card.get(k) or "").strip()}
+
+    def my_card(self):
+        return self.clean_card(self.profile.get("card"))
+
+    def card_hash(self):
+        c = self.my_card()
+        return hashlib.sha256(json.dumps(c, sort_keys=True).encode()).hexdigest()[:10] if c else ""
+
+    def set_card(self, card):
+        self.profile["card"] = self.clean_card(card)
+        self.profile["updated"] = time.time()             # linked devices take the newer profile
+        self.save_contacts()
+        self.pr.last_beacon = 0                           # tell everyone soon
+        self.ui("on_people_changed")
+
+    def card_of(self, pid):
+        if pid == self.me:
+            return self.my_card()
+        f = self.contacts["friends"].get(pid) or {}
+        return self.clean_card(f.get("card") or (self.people.get(pid) or {}).get("card"))
+
+    @staticmethod
+    def card_line(card):
+        """“Senior Engineer · IT Infrastructure” (or the company) for lists and headers."""
+        parts = [card.get("designation"), card.get("department") or card.get("company")]
+        return " · ".join(p for p in parts if p)
+
+    def _fetch_card(self, pid, ip, port, pv):
+        import http.client
+        try:
+            c = http.client.HTTPConnection(ip, port, timeout=8)
+            c.request("GET", "/f/card")
+            r = c.getresponse()
+            data = json.loads(r.read(100_000) or b"{}")
+            c.close()
+        except (OSError, ValueError):
+            data = {}
+        p = self.people.get(pid) or {}
+        p["card_busy"] = False
+        if not data.get("ok"):
+            return
+        card = self.clean_card(data.get("card"))
+        p["card"], p["pv_fetched"] = card, pv
+        f = self.contacts["friends"].get(pid)
+        if f is not None:
+            f["card"], f["pv"] = card, pv
+            self.save_contacts()
+        self.ui("on_people_changed")
+        self.ui("on_chat_changed", None)
 
     def _fetch_photo(self, pid, ip, port, ph):
         import http.client
@@ -8295,7 +8361,9 @@ class Chat:
     def handle_get(self, h, path):
         if path == "/f/hello":                       # for profile codes: who is at this address?
             return h._plain(200, {"ok": True, "id": self.me, "name": self.my_name(), "os": OS_NAME,
-                                  "ph": self.photo_hash(), "ver": APP_VERSION})
+                                  "ph": self.photo_hash(), "ver": APP_VERSION, "card": self.my_card()})
+        if path == "/f/card":                        # the work profile (only what the person filled in)
+            return h._plain(200, {"ok": True, "card": self.my_card(), "pv": self.card_hash()})
         if path == "/f/photo":
             data = self.photo_bytes()
             if not data:
@@ -10008,8 +10076,30 @@ class ProfileDialog(Gtk.Dialog):
         vr.pack_start(vl, True, True, 0)
         vr.add(self.visible)
         box.add(vr)
+        wh = Gtk.Label(xalign=0, margin_top=8)
+        wh.set_markup("<b>Work profile</b> <small>(optional: only what you fill in is shown to friends and "
+                      "colleagues)</small>")
+        wh.set_line_wrap(True)
+        box.add(wh)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        card = chat.my_card()
+        hints = {"about": "e.g. Network admin. Ask me about VPN access.", "designation": "e.g. Senior System Engineer",
+                 "department": "e.g. IT Infrastructure", "company": "e.g. Arckad Solutions Pvt Ltd",
+                 "location": "e.g. Chennai, Block B, 2nd floor", "phone": "e.g. Ext. 2041 or +91 98…",
+                 "email": "e.g. name@company.com"}
+        self.card_entries = {}
+        for i, (key, label, n) in enumerate(Chat.CARD_FIELDS):
+            grid.attach(Gtk.Label(label=label, xalign=1), 0, i, 1, 1)
+            e = Gtk.Entry(max_length=n, hexpand=True, placeholder_text=hints.get(key, ""))
+            e.set_text(card.get(key, ""))
+            grid.attach(e, 1, i, 1, 1)
+            self.card_entries[key] = e
+        box.add(grid)
         self.update_pic()
         self.show_all()
+
+    def card(self):
+        return {k: e.get_text() for k, e in self.card_entries.items()}
 
     def current_photo(self):
         if self.new_photo:
@@ -10311,15 +10401,21 @@ class ChatPanel(Gtk.Box):
         back.set_tooltip_text("All chats")
         back.connect("clicked", lambda *_: self.show_list())
         head.add(back)
+        who = Gtk.EventBox()                       # click the photo or name: their profile card
+        who.set_tooltip_text("View profile")
+        wb = Gtk.Box(spacing=6)
         self.conv_avatar = Gtk.Image()
-        head.add(self.conv_avatar)
+        wb.add(self.conv_avatar)
         tb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.conv_title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
         self.info = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
         self.info.get_style_context().add_class("dim-label")
         tb.add(self.conv_title)
         tb.add(self.info)
-        head.pack_start(tb, True, True, 0)
+        wb.pack_start(tb, True, True, 0)
+        who.add(wb)
+        who.connect("button-press-event", lambda *_: self._header_clicked() or True)
+        head.pack_start(who, True, True, 0)
         lock2 = Gtk.Button()
         lock2.add(Gtk.Image.new_from_icon_name("system-lock-screen-symbolic", Gtk.IconSize.BUTTON))
         lock2.set_tooltip_text("Lock the chat")
@@ -10683,6 +10779,76 @@ class ChatPanel(Gtk.Box):
         menu.show_all()
         menu.popup_at_pointer(event)
 
+    def _header_clicked(self):
+        g = self.chat.groups.get(self.gid) if self.gid else None
+        if not g:
+            return
+        if g.get("kind") == "direct":
+            self.view_profile(g["peer"])
+        else:
+            self.members()
+
+    def view_profile(self, pid):
+        """A person's profile card: photo, name, work details (with Copy for phone and email)."""
+        ch = self.chat
+        f = ch.contacts["friends"].get(pid) or {}
+        p = ch.people.get(pid) or {}
+        name = ch.my_name() if pid == ch.me else (f.get("name") or p.get("name") or "Someone")
+        card = ch.card_of(pid)
+        d = Gtk.Dialog(title=name, transient_for=self.get_toplevel(), modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(400, -1)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(18)
+        box.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, ch.avatar_file(pid), 120)))
+        nl = Gtk.Label(justify=Gtk.Justification.CENTER)
+        nl.set_markup(f"<span size='x-large' weight='bold'>{esc(name)}</span>")
+        box.add(nl)
+        cl = ch.card_line(card)
+        if cl:
+            sl = Gtk.Label(label=cl, justify=Gtk.Justification.CENTER, wrap=True)
+            box.add(sl)
+        if pid != ch.me:
+            state = "online" if ch.person_online(pid) else "offline"
+            st = Gtk.Label(label=state + (" · friend" if f else ""))
+            st.get_style_context().add_class("dim-label")
+            box.add(st)
+        if card.get("about"):
+            ab = Gtk.Label(wrap=True, max_width_chars=44, justify=Gtk.Justification.CENTER, margin_top=6)
+            ab.set_markup(f"<i>“{esc(card['about'])}”</i>")
+            box.add(ab)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6, margin_top=10, halign=Gtk.Align.CENTER)
+        icons = {"designation": "💼", "department": "🏢", "company": "🏛", "location": "📍", "phone": "📞", "email": "✉"}
+        row = 0
+        for key, label, _n in Chat.CARD_FIELDS:
+            if key == "about" or not card.get(key):
+                continue
+            grid.attach(Gtk.Label(label=icons.get(key, "•")), 0, row, 1, 1)
+            v = Gtk.Label(xalign=0, selectable=True, wrap=True, max_width_chars=36)
+            v.set_markup(f"<small>{esc(label)}</small>\n{esc(card[key])}")
+            grid.attach(v, 1, row, 1, 1)
+            if key in ("phone", "email"):
+                cb = Gtk.Button(label="Copy")
+                cb.connect("clicked", lambda _b, t=card[key]: (Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(t, -1),
+                                                               self.win.flash_all("Copied")))
+                grid.attach(cb, 2, row, 1, 1)
+            row += 1
+        if row:
+            box.add(grid)
+        elif not card:
+            none = Gtk.Label(label="No work details shared yet.", margin_top=8)
+            none.get_style_context().add_class("dim-label")
+            box.add(none)
+        if f and pid != ch.me:
+            msg = Gtk.Button(label="💬 Message", margin_top=10)
+            msg.get_style_context().add_class("suggested-action")
+            msg.connect("clicked", lambda *_: (d.response(Gtk.ResponseType.CLOSE), self.open_chat(ch._direct_gid(pid))))
+            box.add(msg)
+        d.show_all()
+        d.run()
+        d.destroy()
+
     def update_info(self):
         g = self.chat.groups.get(self.gid) if self.gid else None
         if not g:
@@ -10699,7 +10865,8 @@ class ChatPanel(Gtk.Box):
             elif f.get("pending_accept"):
                 self.info.set_text("waiting for them to come online to finish the friendship")
             else:
-                self.info.set_text("online" if self.chat.person_online(pid) else "offline")
+                cl = self.chat.card_line(self.chat.card_of(pid))
+                self.info.set_text(("online" if self.chat.person_online(pid) else "offline") + (f" · {cl}" if cl else ""))
         else:
             self.call_btn.set_visible(False)
             members = g.get("members", {})
@@ -10729,7 +10896,16 @@ class ChatPanel(Gtk.Box):
 
         def person(pid, name, sub, buttons, online=None):
             row = Gtk.Box(spacing=10, margin=4)
-            row.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, ch.avatar_file(pid), 40)))
+            cl = ch.card_line(ch.card_of(pid))
+            if cl:
+                sub = f"{cl} · {sub}"
+            who = Gtk.EventBox()
+            who.set_tooltip_text("View profile")
+            wb = Gtk.Box(spacing=10)
+            wb.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, ch.avatar_file(pid), 40)))
+            who.add(wb)
+            who.connect("button-press-event", lambda *_a, pid=pid: self.view_profile(pid) or True)
+            row.add(who)
             t = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
             dot = "" if online is None else (f" <span foreground='{skin_color('ok')}'>●</span>" if online
                                              else f" <span foreground='{skin_color('off')}'>●</span>")
@@ -11462,6 +11638,7 @@ class ChatPanel(Gtk.Box):
             try:
                 self.chat.set_profile(d.name.get_text() or self.chat.my_name(), d.new_photo, d.remove_photo,
                                       d.visible.get_active())
+                self.chat.set_card(d.card())
             except GLib.Error as ex:
                 self.win.error(f"That photo couldn't be used: {ex.message}")
             d.destroy()
@@ -12468,7 +12645,8 @@ class ChatPanel(Gtk.Box):
             self.more_menu.append(it)
         self.more_menu.append(Gtk.SeparatorMenuItem())
         if g.get("kind") == "direct":
-            for label, cb, ok in (("Check connection…", self.check_connection, True),
+            for label, cb, ok in (("View profile…", lambda: self.view_profile(g["peer"]), True),
+                                  ("Check connection…", self.check_connection, True),
                                   ("Test my microphone and speaker…", self.test_sound, True),
                                   ("Safety code…", self.show_safety_code, not g.get("removed")),
                                   ("Open the attachments folder", lambda: (
@@ -12613,8 +12791,13 @@ class ChatPanel(Gtk.Box):
             lbl = Gtk.Label(xalign=0, hexpand=True)
             role = "owner" if m.get("role") == "owner" else "member"
             you = " (you)" if did == self.chat.me else ""
-            lbl.set_markup(f"<b>{esc(m['name'])}</b>{you}\n<small>{role} · {esc(m.get('os', ''))}</small>")
-            row.pack_start(lbl, True, True, 0)
+            cl = self.chat.card_line(self.chat.card_of(did))
+            lbl.set_markup(f"<b>{esc(m['name'])}</b>{you}\n<small>{role} · {esc(cl or m.get('os', ''))}</small>")
+            lev = Gtk.EventBox()
+            lev.set_tooltip_text("View profile")
+            lev.add(lbl)
+            lev.connect("button-press-event", lambda *_a, did=did: (dlg.hide(), self.view_profile(did), dlg.show()) and True)
+            row.pack_start(lev, True, True, 0)
             if did != self.chat.me and did not in self.chat.contacts["friends"]:
                 rel = self.chat.relation(did)
                 fb = Gtk.Button(label={"outgoing": "Request sent", "incoming": "Accept"}.get(rel, "Add friend"))
