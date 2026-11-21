@@ -43,6 +43,7 @@ final class ChatEngine {
     static final long AUTO_DOWNLOAD = 50L * 1024 * 1024;
     static final double HISTORY_DAYS = 120;
     static final String CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    static String version = "";                   // the app's version (for "Check connection" on other devices)
 
     interface Ui {
         void changed(String gid);                 // null = everything
@@ -1015,10 +1016,21 @@ final class ChatEngine {
         String pid = cut(req.optString("id"), 40);
         if (pid.isEmpty() || pid.equals(me)) return err("bad request");
         if (path.equals("/f/request")) {
-            JSONObject f = friends().optJSONObject(pid);
-            if (f != null && f.optJSONObject("pending_accept") == null) return err("You're already friends.");
             String dh = req.optString("dh"), sigpub = cut(req.optString("sigpub"), 1100);
             if (!rsaVerify(sigpub, utf8("arckad-friend|" + pid + "|" + me + "|" + dh), req.optString("dhsig"))) return err("bad signature");
+            JSONObject f = friends().optJSONObject(pid);
+            if (f != null && f.optJSONObject("pending_accept") == null) {
+                if (!sigpub.equals(f.optString("sigpub"))) return err("You're already friends (with a different key: remove and add again).");
+                // still friends here but they lost it: same person (same signing key), so re-connect with fresh keys
+                JSONObject inc = new Obj().putOpt("name", cut(req.optString("name", "?"), 40)).putOpt("os", cut(req.optString("os"), 10))
+                        .putOpt("sigpub", sigpub).putOpt("dh", dh).putOpt("ph", cut(req.optString("ph"), 16)).putOpt("ts", now());
+                Obj.put(incoming(), pid, inc);
+                people.put(pid, new Obj().putOpt("name", inc.optString("name")).putOpt("ip", ip).putOpt("port", req.opt("port"))
+                        .putOpt("ph", "").putOpt("os", "").putOpt("seen", now()));
+                bg(() -> acceptRequest(pid));
+                ui.event("🔄 Re-connected the friendship with " + req.optString("name", "a friend"));
+                return new Obj().putOpt("ok", true);
+            }
             JSONObject out = outgoing().optJSONObject(pid);
             if (out != null) {                                   // both asked each other: a yes from both
                 byte[] key = friendKey(new BigInteger(out.optString("x"), 16), dh, out.optString("dh"));
@@ -1600,7 +1612,8 @@ final class ChatEngine {
         if (fcodeActive()) put(msg, "fcode", sha256hex("arckad-friend-code|" + fcode.optString("code")).substring(0, 20));
         boolean anyone = friends().length() > 0 || outgoing().length() > 0;
         if ((profile.optBoolean("setup") && profile.optBoolean("visible")) || anyone) {
-            JSONObject who = new Obj().putOpt("id", me).putOpt("name", cut(myName(), 40)).putOpt("os", osName).putOpt("ph", photoHash());
+            JSONObject who = new Obj().putOpt("id", me).putOpt("name", cut(myName(), 40)).putOpt("os", osName).putOpt("ph", photoHash())
+                    .putOpt("ver", version);
             if (!(profile.optBoolean("setup") && profile.optBoolean("visible"))) put(who, "hidden", true);
             put(msg, "who", who);
         }
@@ -1912,6 +1925,8 @@ final class ChatEngine {
         } else if (path.equals("/c/call")) {
             res = err("Calls on this phone arrive in the next Arckad-D update.");
             code = 403;
+        } else if (path.equals("/c/ping") && !pair) {
+            res = new Obj().putOpt("ok", true).putOpt("ver", version).putOpt("os", osName).putOpt("calls", false);
         } else if (path.equals("/c/receipt") && !pair) {
             gotReceipt(gid, did, req);
             res = new Obj().putOpt("ok", true);

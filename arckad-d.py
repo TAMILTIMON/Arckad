@@ -73,7 +73,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.20.0"
+APP_VERSION = "3.21.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -6361,7 +6361,8 @@ class Chat:
         if self.fcode_active():
             out["fcode"] = hashlib.sha256(f"arckad-friend-code|{self.fcode['code']}".encode()).hexdigest()[:20]
         if self.profile.get("setup") and self.profile.get("visible"):
-            out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash()}
+            out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
+                          "ver": APP_VERSION}
         elif self.contacts["outgoing"] or self.contacts["friends"]:
             out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
                           "hidden": True}            # friends and people I asked still see me
@@ -6700,7 +6701,7 @@ class Chat:
         ph = str(who.get("ph") or "")[:16]
         old = self.people.get(pid)
         self.people[pid] = {"name": name, "ip": ip, "port": port, "ph": ph, "os": str(who.get("os", ""))[:10],
-                            "seen": time.time(), "hidden": bool(who.get("hidden"))}
+                            "seen": time.time(), "hidden": bool(who.get("hidden")), "ver": str(who.get("ver", ""))[:12]}
         f = self.contacts["friends"].get(pid)
         if f and (f.get("ip") != ip or f.get("port") != port):
             f["ip"], f["port"] = ip, port
@@ -7304,7 +7305,7 @@ class Chat:
             secs = int(time.time() - c["started"]) if c.get("started") else 0
             arrow = "Outgoing" if c["role"] == "caller" else "Incoming"
             self._call_log(c["gid"], f"📞 {arrow} call · {secs // 60}:{secs % 60:02d}" +
-                           (f" ({error})" if error else ""))
+                           (f" — failed: {error}" if error else ""))
             if self.call is c:
                 self.call = None
             self.ui("on_call_changed", error)
@@ -7426,6 +7427,62 @@ class Chat:
         self.ui("on_chat_lock_changed")
         self.ui("on_chat_changed", None)
 
+    def check_connection(self, pid):
+        """Background thread: a plain-language report on why a friend may show offline or calls fail.
+        Returns (report text, can_reconnect)."""
+        gid = self._direct_gid(pid)
+        f = self.contacts["friends"].get(pid) or {}
+        lines = [f"Friend: {f.get('name', '?')}"]
+        p, o = self.people.get(pid) or {}, self.online.get(pid) or {}
+        seen = max(p.get("seen", 0), o.get("seen", 0))
+        lines.append("Last seen: " + ("just now" if time.time() - seen < 15 else
+                                     (time.strftime("%d %b %H:%M", time.localtime(seen)) if seen else "not since Arckad-D started")))
+        ip, port = self._peer_address(pid)
+        lines.append(f"Address: {ip or 'unknown'}" + (f" (port {port})" if port else ""))
+        if p.get("ver"):
+            lines.append(f"Their Arckad-D: {p['ver']}" + ("  ← older than yours: ask them to update" if p["ver"] != APP_VERSION else ""))
+        if not ip or not port:
+            lines.append("✗ Their computer hasn't been seen on the network. It may be off, on another network (add them "
+                         "with a friend code and their IP), or blocked by a firewall.")
+            return "\n".join(lines), False
+        try:
+            with socket.create_connection((ip, int(port)), timeout=4):
+                pass
+            lines.append("✓ Their computer answers")
+        except OSError:
+            lines.append("✗ Their computer doesn't answer. Is Arckad-D running there? A firewall may block it: use "
+                         "🛡 Allow through firewall on both computers.")
+            return "\n".join(lines), False
+        try:
+            r = self._request(gid, pid, "POST", "/c/ping", {}, timeout=8)
+            lines.append("✓ Both sides have the same friendship keys (chat works)")
+            if r.get("ver"):
+                lines.append(f"Their Arckad-D: {r['ver']} on {r.get('os', '?')}")
+            lines.append("✓ Calls are possible there" if r.get("calls") else "✗ Calls can't start there (no sound tools)")
+            return "\n".join(lines), False
+        except PermissionError as ex:
+            lines.append(f"✗ Their computer doesn't accept this friendship any more ({ex}). Their side and yours have "
+                         "different keys, usually after one of you removed the other. Click Re-connect.")
+            return "\n".join(lines), True
+        except Exception as ex:
+            lines.append(f"✗ Their computer answered, but chat didn't ({ex}). They may need to update Arckad-D.")
+            return "\n".join(lines), True
+
+    def reconnect_friend(self, pid):
+        """Background thread: a fresh friend request; their side accepts it automatically if they still have us."""
+        f = self.contacts["friends"].get(pid) or {}
+        name = f.get("name", "?")
+        self.contacts["friends"].pop(pid, None)
+        if pid not in self.people:
+            ip, port = f.get("ip"), f.get("port")
+            self.people[pid] = {"name": name, "ip": ip, "port": port, "ph": f.get("ph", ""), "os": f.get("os", ""),
+                                "seen": 0, "hidden": True}
+        ok_msg = self.send_request(pid)
+        if not ok_msg[0]:
+            self.contacts["friends"][pid] = f                 # couldn't reach them: keep things as they were
+            self.save_contacts()
+        return ok_msg
+
     def remove_friend(self, pid):
         """Tell them (if they're online), then forget the friendship here. The chat history stays, read-only."""
         gid = self._direct_gid(pid)
@@ -7453,11 +7510,24 @@ class Chat:
         if not pid or pid == self.me:
             return {"ok": False, "reason": "bad request"}
         if path == "/f/request":
-            if pid in self.contacts["friends"] and not self.contacts["friends"][pid].get("pending_accept"):
-                return {"ok": False, "reason": "You're already friends."}
             dh, sigpub, sig = str(req.get("dh", "")), str(req.get("sigpub", ""))[:1100], str(req.get("dhsig", ""))
             if not rsa_verify(sigpub, f"arckad-friend|{pid}|{self.me}|{dh}".encode(), sig):
                 return {"ok": False, "reason": "bad signature"}
+            old = self.contacts["friends"].get(pid)
+            if old and not old.get("pending_accept"):
+                if old.get("sigpub") != sigpub:
+                    return {"ok": False, "reason": "You're already friends (with a different key: remove and add again)."}
+                # still friends here but they lost it (removed us while we were offline, reinstalled…): same
+                # person (same signing key), so re-connect with fresh keys straight away
+                self.contacts["incoming"][pid] = {"name": str(req.get("name", "?"))[:40], "os": str(req.get("os", ""))[:10],
+                                                  "sigpub": sigpub, "dh": dh, "ph": str(req.get("ph", ""))[:16],
+                                                  "ts": time.time()}
+                self.people.setdefault(pid, {"name": str(req.get("name", "?"))[:40], "ip": ip, "port": req.get("port"),
+                                             "ph": "", "os": "", "seen": time.time()})
+                self.people[pid].update(ip=ip, port=req.get("port"), seen=time.time())
+                threading.Thread(target=self.accept_request, args=(pid,), daemon=True).start()
+                self.ui("on_pair_event", f"🔄 Re-connected the friendship with {req.get('name', 'a friend')}")
+                return {"ok": True}
             if pid in self.contacts["outgoing"]:              # both asked each other: that's a yes from both
                 out = self.contacts["outgoing"][pid]
                 key = self._friend_key(int(out["x"], 16), dh, out["dh"])
@@ -7792,6 +7862,8 @@ class Chat:
             if did not in g["members"]:
                 return reply({"id": gid, "removed": True})
             return reply(self._meta_for_members(g))
+        if path == "/c/ping" and not pair:
+            return reply({"ok": True, "ver": APP_VERSION, "os": OS_NAME, "calls": audio_supported()[0]})
         if path == "/c/receipt" and not pair:
             self._got_receipt(gid, did, req)
             return reply({"ok": True})
@@ -7904,7 +7976,17 @@ def audio_supported():
 
 class _ProcCapture:
     def __init__(self, cmd):
-        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        self.cmd = cmd[0]
+        self.p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+
+    def error(self):
+        """Why the recording tool stopped (its own message)."""
+        try:
+            self.p.wait(timeout=1)
+            msg = (self.p.stderr.read() or b"").decode("utf-8", "replace").strip().splitlines()
+        except Exception:
+            msg = []
+        return f"{self.cmd} stopped: {msg[-1][:200] if msg else 'no microphone, or it is in use by another app'}"
 
     def read(self):
         buf = b""
@@ -7925,6 +8007,9 @@ class _ProcCapture:
 class _ProcPlayback:
     def __init__(self, cmd):
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.15)
+        if self.p.poll() is not None:
+            raise OSError(f"the speaker couldn't start ({cmd[0]} stopped)")
 
     def write(self, data):
         try:
@@ -7961,6 +8046,30 @@ if IS_WIN:
                          ("dwFlags", wintypes.DWORD), ("dwLoops", wintypes.DWORD),
                          ("lpNext", ctypes.POINTER(_WAVEHDR)), ("reserved", ctypes.c_size_t)]
     _WHDR_DONE, _WAVE_MAPPER = 0x1, 0xFFFFFFFF
+    _winmm = None
+
+    def _wm():
+        """winmm with every function's argument types declared (without them ctypes can't pass WAVE_MAPPER)."""
+        global _winmm
+        if _winmm is None:
+            w = ctypes.windll.winmm
+            P_HDR, H = ctypes.POINTER(_WAVEHDR), ctypes.c_void_p
+            for name in ("waveInOpen", "waveOutOpen"):
+                f = getattr(w, name)
+                f.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.POINTER(_WAVEFORMATEX),
+                              ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint]
+                f.restype = ctypes.c_uint
+            for name in ("waveInPrepareHeader", "waveInUnprepareHeader", "waveInAddBuffer",
+                         "waveOutPrepareHeader", "waveOutUnprepareHeader", "waveOutWrite"):
+                f = getattr(w, name)
+                f.argtypes = [H, P_HDR, ctypes.c_uint]
+                f.restype = ctypes.c_uint
+            for name in ("waveInStart", "waveInReset", "waveInClose", "waveOutReset", "waveOutClose"):
+                f = getattr(w, name)
+                f.argtypes = [H]
+                f.restype = ctypes.c_uint
+            _winmm = w
+        return _winmm
 
     def _wave_format():
         return _WAVEFORMATEX(1, 1, AUDIO_RATE, AUDIO_RATE * 2, 2, 16, 0)
@@ -7969,11 +8078,13 @@ if IS_WIN:
         """Microphone through waveIn: a ring of buffers that Windows fills; we poll for finished ones."""
 
         def __init__(self, n=8):
-            self.w = ctypes.windll.winmm
+            self.w = _wm()
             self.h = ctypes.c_void_p()
             fmt = _wave_format()
-            if self.w.waveInOpen(ctypes.byref(self.h), _WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0) != 0:
-                raise OSError("no microphone available")
+            err = self.w.waveInOpen(ctypes.byref(self.h), _WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0)
+            if err != 0:
+                raise OSError(f"the microphone couldn't start (Windows error {err}: is one connected and allowed in "
+                              "Settings → Privacy → Microphone?)")
             self.bufs = [ctypes.create_string_buffer(AUDIO_FRAME) for _ in range(n)]
             self.hdrs = [_WAVEHDR() for _ in range(n)]
             for b, hd in zip(self.bufs, self.hdrs):
@@ -8009,11 +8120,12 @@ if IS_WIN:
         """Speaker through waveOut: up to 12 queued frames (240 ms)."""
 
         def __init__(self, n=12):
-            self.w = ctypes.windll.winmm
+            self.w = _wm()
             self.h = ctypes.c_void_p()
             fmt = _wave_format()
-            if self.w.waveOutOpen(ctypes.byref(self.h), _WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0) != 0:
-                raise OSError("no speaker available")
+            err = self.w.waveOutOpen(ctypes.byref(self.h), _WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0)
+            if err != 0:
+                raise OSError(f"the speaker couldn't start (Windows error {err})")
             self.bufs = [ctypes.create_string_buffer(AUDIO_FRAME) for _ in range(n)]
             self.hdrs = [_WAVEHDR() for _ in range(n)]
             self.busy = [False] * n
@@ -8111,6 +8223,33 @@ class Recorder:
         return b"".join(self.frames)
 
 
+def sound_test(seconds=2.0):
+    """Records a few seconds and reports the loudest level. Returns (ok, message, pcm)."""
+    ok, why = audio_supported()
+    if not ok:
+        return False, why, b""
+    try:
+        cap = open_capture()
+    except Exception as ex:
+        return False, str(ex), b""
+    frames, end = [], time.time() + seconds
+    try:
+        while time.time() < end:
+            d = cap.read()
+            if d is None:
+                return False, cap.error() if hasattr(cap, "error") else "the microphone stopped", b""
+            frames.append(d)
+    finally:
+        cap.close()
+    pcm = b"".join(frames)
+    peak = max((abs(s) for s in struct.unpack(f"<{len(pcm) // 2}h", pcm[:len(pcm) // 2 * 2])[::4]), default=0)
+    pct = int(peak * 100 / 32767)
+    if pct < 2:
+        return True, (f"The microphone works but heard almost nothing (level {pct}%). Check it isn't muted, and that "
+                      "the right microphone is chosen in your sound settings."), pcm
+    return True, f"The microphone works (loudest level {pct}%).", pcm
+
+
 class WavPlayer:
     """Plays a WAV file; stop() ends it early."""
 
@@ -8176,8 +8315,14 @@ class CallStream:
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.sock.settimeout(15)
             self.cap, self.play = open_capture(), open_playback()
-        except OSError as ex:
-            self.end(str(ex))
+        except Exception as ex:                       # tell the other side why, then end
+            reason = str(ex) or ex.__class__.__name__
+            try:
+                data = reason.encode("utf-8")[:400]
+                self.sock.sendall(b"\xff\xff" + struct.pack(">H", len(data)) + data)
+            except OSError:
+                pass
+            self.end(reason)
             return
         threading.Thread(target=self._send_loop, daemon=True).start()
         enc_key, mac_key = _hm(self.key, "enc", self.recv_label), _hm(self.key, "mac", self.recv_label)
@@ -8187,6 +8332,11 @@ class CallStream:
                 n = struct.unpack(">H", head)[0]
                 if n == 0:
                     break                                 # the other side hung up
+                if n == 0xFFFF:                           # the other side couldn't start its sound
+                    size = struct.unpack(">H", self._recv(2))[0]
+                    why = self._recv(size).decode("utf-8", "replace")
+                    self.end(f"on their side: {why}")
+                    return
                 frame = self._recv(n)
                 seq, ct, tag = frame[:4], frame[4:-8], frame[-8:]
                 if not hmacmod.compare_digest(tag, _hm(mac_key, seq + ct)[:8]):
@@ -8196,6 +8346,9 @@ class CallStream:
                 self.play.write(pcm)
         except (OSError, struct.error, ValueError):
             pass
+        except Exception as ex:                       # never leave a call half-open
+            self.end(str(ex))
+            return
         self.end(None)
 
     def _recv(self, n):
@@ -8214,7 +8367,14 @@ class CallStream:
             while self.active:
                 pcm = self.cap.read()
                 if pcm is None:
-                    break
+                    why = self.cap.error() if hasattr(self.cap, "error") else "the microphone stopped"
+                    try:
+                        data = why.encode("utf-8")[:400]
+                        self.sock.sendall(b"\xff\xff" + struct.pack(">H", len(data)) + data)
+                    except OSError:
+                        pass
+                    self.end(why)
+                    return
                 if self.muted:
                     pcm = b"\0" * len(pcm)
                 self.tx_level = self._level(pcm)
@@ -8225,6 +8385,9 @@ class CallStream:
                 seq = (seq + 1) & 0xFFFFFFFF
         except OSError:
             pass
+        except Exception as ex:
+            self.end(str(ex))
+            return
         self.end(None)
 
     def hang_up(self):
@@ -10385,7 +10548,9 @@ class ChatPanel(Gtk.Box):
             self.more_menu.append(it)
         self.more_menu.append(Gtk.SeparatorMenuItem())
         if g.get("kind") == "direct":
-            for label, cb, ok in (("Safety code…", self.show_safety_code, not g.get("removed")),
+            for label, cb, ok in (("Check connection…", self.check_connection, True),
+                                  ("Test my microphone and speaker…", self.test_sound, True),
+                                  ("Safety code…", self.show_safety_code, not g.get("removed")),
                                   ("Open the attachments folder", lambda: (
                                       self.chat.files_dir(self.gid).mkdir(parents=True, exist_ok=True),
                                       self.win.active.go(str(self.chat.files_dir(self.gid)))), True),
@@ -10420,6 +10585,49 @@ class ChatPanel(Gtk.Box):
         self.more_menu.append(Gtk.SeparatorMenuItem())
         add("Delete group for everyone…" if owner else "Leave group…", self.leave)
         self.more_menu.show_all()
+
+    def test_sound(self):
+        self.win.flash_all("🎤 Say something for 2 seconds…")
+
+        def work():
+            ok, msg, pcm = sound_test()
+            if ok and pcm:
+                path = CACHE_DIR / "sound-test.wav"
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                write_wav(path, pcm)
+                WavPlayer(path)
+                msg += "\n\nNow playing it back: if you hear yourself, the speaker works too."
+            GLib.idle_add(lambda: self.win.info(("✓ " if ok else "✗ ") + msg) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def check_connection(self):
+        g = self.chat.groups.get(self.gid) or {}
+        pid = g.get("peer")
+        if not pid:
+            return
+        self.win.flash_all("Checking the connection…")
+
+        def work():
+            text, fixable = self.chat.check_connection(pid)
+            GLib.idle_add(show, text, fixable)
+
+        def show(text, fixable):
+            d = Gtk.MessageDialog(transient_for=self.get_toplevel(), modal=True, message_type=Gtk.MessageType.INFO,
+                                  buttons=Gtk.ButtonsType.NONE, text="Connection check")
+            d.format_secondary_text(text)
+            d.add_button("Close", Gtk.ResponseType.CLOSE)
+            if fixable:
+                d.add_button("Re-connect", Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+            r = d.run()
+            d.destroy()
+            if r == Gtk.ResponseType.OK:
+                threading.Thread(target=lambda: GLib.idle_add(
+                    lambda res=self.chat.reconnect_friend(pid): self.win.info(
+                        "Re-connect sent ✓\n\nTheir Arckad-D re-connects by itself (if it's 3.21 or newer; otherwise "
+                        "they accept your friend request). The chat works again once it's done." if res[0]
+                        else f"Couldn't re-connect: {res[1]}") and False), daemon=True).start()
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     def show_safety_code(self):
         pid = self.chat.groups[self.gid]["peer"]

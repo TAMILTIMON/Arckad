@@ -63,6 +63,7 @@ final class ChatHub implements ChatEngine.Ui {
             if (name == null || name.isEmpty()) name = Build.MODEL;
         }
         File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        ChatEngine.version = BuildInfo.VERSION;
         engine = new ChatEngine(new File(c.getFilesDir(), "chat"), dl, p.getString("device_id", "phone"), name, Net.OS, this);
         channels();
     }
