@@ -42,6 +42,23 @@ from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+def _clear_forced_theme():
+    """Arckad-D's skins are drawn on GTK's Adwaita. A system-wide GTK_THEME (set by some desktops or tweaks)
+    would force a different base under them, which can put light text on light panels: when a skin is
+    chosen, Arckad-D ignores it (the classic themes keep following the system)."""
+    base = (os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) if sys.platform == "win32" else \
+        (os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+    try:
+        with open(os.path.join(base, "arckad-d", "config.json"), encoding="utf-8") as f:
+            theme = json.load(f).get("theme", "midnight")
+    except (OSError, ValueError, AttributeError):
+        theme = "midnight"
+    if theme in ("midnight", "snow", "mono"):
+        os.environ.pop("GTK_THEME", None)
+
+
+_clear_forced_theme()
+
 try:
     import gi
     gi.require_version("Gtk", "3.0")
@@ -73,7 +90,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.26.0"
+APP_VERSION = "3.27.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -336,6 +353,97 @@ def is_hidden(name, st=None):
     if IS_WIN and st is not None:          # Windows "hidden" or "system" attribute
         return bool(getattr(st, "st_file_attributes", 0) & 0x6)
     return False
+
+
+def lower_my_priority():
+    """The calling thread works in the background: lowest disk and CPU priority, so whatever you're doing comes
+    first (Linux: idle I/O class and nice 19; Windows: background mode, which also lowers disk priority)."""
+    try:
+        if IS_WIN:
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.SetThreadPriority(k.GetCurrentThread(), 0x00010000)          # THREAD_MODE_BACKGROUND_BEGIN
+            return
+        tid = threading.get_native_id()
+        try:
+            os.setpriority(os.PRIO_PROCESS, tid, 19)
+        except (OSError, AttributeError):
+            pass
+        import ctypes
+        import platform
+        nr = {"x86_64": 251, "aarch64": 30, "i686": 289, "i386": 289, "armv7l": 314}.get(platform.machine())
+        if nr:
+            ctypes.CDLL(None, use_errno=True).syscall(nr, 1, tid, 3 << 13)  # ioprio_set(IOPRIO_CLASS_IDLE)
+    except Exception:
+        pass
+
+
+def _home_disk():
+    """The block device holding the home folder (Linux), e.g. 'nvme0n1p2' or 'sda3'."""
+    try:
+        st = os.stat(str(HOME))
+        with open(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}/uevent") as f:
+            for line in f:
+                if line.startswith("DEVNAME="):
+                    return line.split("=", 1)[1].strip()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _disk_snapshot():
+    """(io_ticks of the home disk in ms or None, {pid: (group, bytes read+written)})."""
+    ticks = None
+    dev = _home_disk()
+    if dev:
+        try:
+            with open("/proc/diskstats") as f:
+                for line in f:
+                    p = line.split()
+                    if len(p) > 12 and p[2] == dev:
+                        ticks = int(p[12])
+                        break
+        except (OSError, ValueError):
+            pass
+    procs = {}
+    me = os.getpid()
+    try:
+        pids = [x for x in os.listdir("/proc") if x.isdigit()]
+    except OSError:
+        pids = []
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip()
+            group = "Arckad-D" if int(pid) == me else ("Tracker" if comm.startswith(("tracker", "localsearch")) else None)
+            if not group:
+                continue
+            total = 0
+            with open(f"/proc/{pid}/io") as f:
+                for line in f:
+                    k, v = line.split(":")
+                    if k in ("read_bytes", "write_bytes"):
+                        total += int(v)
+            procs[pid] = (group, total)
+        except (OSError, ValueError):
+            pass
+    return ticks, procs
+
+
+def disk_activity(seconds=3.0):
+    """Linux: {"busy": % of the time the home disk was working (or None), "Tracker": bytes/s, "Arckad-D": bytes/s}."""
+    if IS_WIN:
+        return {"busy": None, "Tracker": 0.0, "Arckad-D": 0.0}
+    t0, a = time.time(), _disk_snapshot()
+    time.sleep(seconds)
+    dt, b = time.time() - t0, _disk_snapshot()
+    out = {"busy": None, "Tracker": 0.0, "Arckad-D": 0.0}
+    if a[0] is not None and b[0] is not None:
+        out["busy"] = max(0.0, min(100.0, (b[0] - a[0]) / (dt * 10)))
+    for pid, (group, v) in b[1].items():
+        if pid in a[1]:
+            out[group] += max(0, v - a[1][pid][1]) / dt
+    return out
 
 
 def walk_entries(root, hidden=False):
@@ -1067,8 +1175,16 @@ def logo_path():
     return custom_logo() or ensure_logo()
 
 
+def shipped_logo():
+    """Your own logo shipped with the app (branding/logo.png in the project), or None."""
+    for p in (BUNDLE_DIR / "logo.png", SCRIPT.parent / "branding" / "logo.png"):
+        if p.exists():
+            return p
+    return None
+
+
 def logo_pixbuf(size):
-    for path in (custom_logo(), ensure_logo(), BUNDLE_DIR / f"{APP_SLUG}.png"):
+    for path in (custom_logo(), shipped_logo(), ensure_logo(), BUNDLE_DIR / f"{APP_SLUG}.png"):
         if path and Path(path).exists():
             pb = load_scaled(path, size)
             if pb:
@@ -1385,15 +1501,26 @@ class FileIndex:
     def fresh(self, max_age=INDEX_MAX_AGE):
         return INDEX_DB.exists() and time.time() - self.updated < max_age
 
-    def rebuild(self):
+    postpone_until = 0
+
+    def rebuild(self, auto=False):
         if self.building:
             return
         self.building = True
         for cb in list(self.listeners):
             GLib.idle_add(cb)
-        threading.Thread(target=self._build, daemon=True).start()
+        threading.Thread(target=self._build, args=(auto,), daemon=True).start()
 
-    def _build(self):
+    def _build(self, auto=False):
+        lower_my_priority()                       # lowest disk and CPU priority: your work comes first
+        if auto and not IS_WIN:
+            busy = disk_activity(1.5)["busy"]
+            if busy is not None and busy > 60:    # the disk is busy now: try again in 10 minutes
+                self.postpone_until = time.time() + 600
+                self.building = False
+                for cb in list(self.listeners):
+                    GLib.idle_add(cb)
+                return
         try:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             tmp = INDEX_DB.with_name("index.tmp")
@@ -4636,7 +4763,7 @@ class ShareWindow(Gtk.Window):
             row.add(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DND))
             lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
             ip = (pr.online.get(p["id"]) or {}).get("ip") or p.get("last_ip") or "?"
-            state = (f"<span foreground='#2ec27e'>● Online</span> · {esc(ip)}" if online
+            state = (f"<span foreground='{skin_color('ok')}'>● Online</span> · {esc(ip)}" if online
                      else f"<span foreground='#9a9996'>● Offline</span> · last seen at {esc(ip)}")
             lbl.set_markup(f"<b>{esc(p['name'])}</b>  <small>🔒 {esc(p.get('os', ''))}</small>\n<small>{state}</small>")
             row.pack_start(lbl, True, True, 0)
@@ -9474,6 +9601,28 @@ def tracker_problem(st=None):
     return None
 
 
+def tracker_io_problem(act):
+    """A short reason when Tracker is keeping the disk busy, else None."""
+    t = act.get("Tracker", 0.0)
+    busy = act.get("busy")
+    if t > 10 * 1024 ** 2:
+        return f"Tracker is reading and writing {human_size(t)}/s."
+    if busy is not None and busy > 80 and t > 2 * 1024 ** 2 and t >= act.get("Arckad-D", 0.0):
+        return f"The disk is {busy:.0f}% busy and most of it is Tracker ({human_size(t)}/s)."
+    return None
+
+
+def tracker_pause():
+    """Stop Tracker for now; it starts again at the next login (a pause, not a setting)."""
+    _systemctl("stop", *TRACKER_UNITS)
+    for tool in ("tracker3", "localsearch"):
+        if shutil.which(tool):
+            try:
+                subprocess.run([tool, "daemon", "-t"], capture_output=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+
 def tracker_clean(remove_system_dumps=False):
     """Stop Tracker, delete its (oversized) database and crash files; it rebuilds a small one. Returns freed bytes."""
     before = tracker_status()
@@ -10582,8 +10731,8 @@ class ChatPanel(Gtk.Box):
             row = Gtk.Box(spacing=10, margin=4)
             row.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(name, ch.avatar_file(pid), 40)))
             t = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
-            dot = "" if online is None else (" <span foreground='#2ec27e'>●</span>" if online
-                                             else " <span foreground='#9a9996'>●</span>")
+            dot = "" if online is None else (f" <span foreground='{skin_color('ok')}'>●</span>" if online
+                                             else f" <span foreground='{skin_color('off')}'>●</span>")
             t.set_markup(f"<b>{esc(name)}</b>{dot}\n<small>{esc(sub)}</small>")
             row.pack_start(t, True, True, 0)
             for label, cb, style in buttons:
@@ -10847,7 +10996,7 @@ class ChatPanel(Gtk.Box):
             on = L.twin_online(inst)
             synced = t.get("synced")
             lab = Gtk.Label(xalign=0, hexpand=True)
-            lab.set_markup(f"<span foreground='{'#2ec27e' if on else '#9a9996'}'>●</span> <b>{esc(t.get('name', 'device'))}</b> "
+            lab.set_markup(f"<span foreground='{skin_color('ok') if on else skin_color('off')}'>●</span> <b>{esc(t.get('name', 'device'))}</b> "
                            f"({esc(t.get('os', ''))})\n<small>{'online' if on else 'offline'}"
                            + (f" · last synced {time.strftime('%d %b %H:%M', time.localtime(synced))}" if synced else "")
                            + "</small>")
@@ -11584,8 +11733,7 @@ class ChatPanel(Gtk.Box):
         others = self._others()
         read, delivered = set(m.get("read", [])), set(m.get("delivered", []))
         if others and all(d in read for d in others):
-            blue = "#0a6cff" if self.win.cfg.get("theme") == "mono" else "#7df9ff"   # visible on every bubble colour
-            return f"  <span foreground='{blue}' weight='heavy'>✓✓</span>"
+            return f"  <span foreground='{skin_color('tick')}' weight='heavy'>✓✓</span>"   # read: per theme
         if delivered or read:
             return "  <span weight='bold'>✓✓</span>"
         return "  <span>✓</span>"
@@ -12460,7 +12608,7 @@ class ChatPanel(Gtk.Box):
             row = Gtk.Box(spacing=8, margin=6)
             on = did == self.chat.me or self.chat.is_online(did)
             dot = Gtk.Label()
-            dot.set_markup(f"<span foreground='{'#2ec27e' if on else '#9a9996'}'>●</span>")
+            dot.set_markup(f"<span foreground='{skin_color('ok') if on else skin_color('off')}'>●</span>")
             row.add(dot)
             lbl = Gtk.Label(xalign=0, hexpand=True)
             role = "owner" if m.get("role") == "owner" else "member"
@@ -12594,7 +12742,7 @@ class CallWindow(Gtk.Window):
             self.status.set_text("Connecting…")
         elif state == "active":
             s = int(time.time() - c["started"])
-            self.status.set_markup(f"<span foreground='#2ec27e'>●</span> {s // 60}:{s % 60:02d}")
+            self.status.set_markup(f"<span foreground='{skin_color('ok')}'>●</span> {s // 60}:{s % 60:02d}")
             st = c.get("stream")
             if st:
                 self.level.set_value(max(st.rx_level, st.tx_level if not st.muted else 0))
@@ -12871,17 +13019,20 @@ Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
 # ---------------------------------------------------------------- Skins: modern, glossy themes
 SKINS = {
     "midnight": dict(dark=True, bg="#111114", bg2="#18181c", surface="#1b1b20", surface_hi="#25252c", side="#15151a",
-                     text="#ededf2", dim="#9b9ba8", border="rgba(255,255,255,0.08)", accent="#ff7a1a", accent2="#ff9b45",
+                     text="#ededf2", dim="#a3a3b0", border="rgba(255,255,255,0.08)", accent="#ff7a1a", accent2="#ff9b45",
+                     accent_mid="#d9600c", tick="#7df9ff", ok="#3ddc84", warn="#ffb020", off="#a3a3b0",
                      accent_dark="#d4520a", on_accent="#ffffff", glow="rgba(255,122,26,0.38)",
                      glow_soft="rgba(255,122,26,0.16)", hdr1="#26262d", hdr2="#16161a", btn1="#2c2c34", btn2="#1f1f25",
                      menu="#1d1d23", scroll="rgba(255,255,255,0.22)", bubble_text="#ffffff"),
     "snow": dict(dark=False, bg="#f4f4f7", bg2="#ffffff", surface="#ffffff", surface_hi="#f1f1f5", side="#f7f7fa",
-                 text="#1c1c22", dim="#6a6a76", border="rgba(0,0,0,0.09)", accent="#f26b00", accent2="#ff9038",
+                 text="#1c1c22", dim="#5f5f6b", border="rgba(0,0,0,0.09)", accent="#f26b00", accent2="#ff9038",
+                 accent_mid="#c95500", tick="#7df9ff", ok="#1a7f37", warn="#b35900", off="#5f5f6b",
                  accent_dark="#c85400", on_accent="#ffffff", glow="rgba(242,107,0,0.30)",
                  glow_soft="rgba(242,107,0,0.12)", hdr1="#ffffff", hdr2="#ececf1", btn1="#ffffff", btn2="#eeeef3",
                  menu="#ffffff", scroll="rgba(0,0,0,0.25)", bubble_text="#ffffff"),
     "mono": dict(dark=True, bg="#0c0c0e", bg2="#141417", surface="#18181b", surface_hi="#232327", side="#111114",
-                 text="#f3f3f3", dim="#9d9da4", border="rgba(255,255,255,0.10)", accent="#f3f3f3", accent2="#ffffff",
+                 text="#f3f3f3", dim="#a6a6ad", border="rgba(255,255,255,0.10)", accent="#f3f3f3", accent2="#ffffff",
+                 accent_mid="#e6e6e9", tick="#0a6cff", ok="#3ddc84", warn="#ffb020", off="#a6a6ad",
                  accent_dark="#cfcfd4", on_accent="#0c0c0e", glow="rgba(255,255,255,0.22)",
                  glow_soft="rgba(255,255,255,0.08)", hdr1="#222226", hdr2="#121215", btn1="#26262b", btn2="#1a1a1e",
                  menu="#1a1a1e", scroll="rgba(255,255,255,0.25)", bubble_text="#0c0c0e"),
@@ -12894,24 +13045,27 @@ window.background { background-image: radial-gradient(circle at 100% 0%, $glow_s
                                       linear-gradient(to bottom, $bg2, $bg); }
 label { color: $text; }
 .dim-label, label.dim-label { color: $dim; opacity: 1; }
-headerbar, .titlebar { background-image: linear-gradient(to bottom, $hdr1, $hdr2); border: none;
+headerbar, .titlebar { background-color: $hdr2; background-image: linear-gradient(to bottom, $hdr1, $hdr2); border: none;
   border-bottom: 1px solid $border; box-shadow: inset 0 1px rgba(255,255,255,0.07); color: $text; min-height: 44px; }
 headerbar .title { font-weight: 700; }
-button { background-image: linear-gradient(to bottom, $btn1, $btn2); background-color: transparent; color: $text;
+button { background-image: linear-gradient(to bottom, $btn1, $btn2); background-color: $btn2; color: $text;
   border: 1px solid $border; border-radius: 10px; text-shadow: none; -gtk-icon-shadow: none;
   box-shadow: inset 0 1px rgba(255,255,255,0.09), 0 1px 2px rgba(0,0,0,0.22); transition: all 160ms ease; }
 button:hover { border-color: $accent; box-shadow: inset 0 1px rgba(255,255,255,0.12), 0 0 0 1px $glow_soft, 0 2px 8px $glow_soft; }
 button:active, button:checked, menubutton button:checked {
-  background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent; border-color: $accent_dark;
+  background-color: $accent_mid; background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent;
+  border-color: $accent_dark;
   box-shadow: inset 0 1px rgba(255,255,255,0.30), 0 0 12px $glow; }
 button:checked label, button:active label { color: $on_accent; }
 button:disabled { opacity: 0.45; box-shadow: none; }
-button.flat { background-image: none; border-color: transparent; box-shadow: none; }
+button.flat { background-image: none; background-color: transparent; border-color: transparent; box-shadow: none; }
 button.flat:hover { background-color: $glow_soft; border-color: transparent; }
-button.suggested-action { background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent;
+button.suggested-action { background-color: $accent_mid; background-image: linear-gradient(to bottom, $accent2, $accent_dark);
+  color: $on_accent;
   border-color: $accent_dark; font-weight: 600; box-shadow: inset 0 1px rgba(255,255,255,0.35), 0 2px 12px $glow; }
 button.suggested-action label { color: $on_accent; }
-button.destructive-action { background-image: linear-gradient(to bottom, #ef5350, #c62828); color: #ffffff;
+button.destructive-action { background-color: #d32f2f; background-image: linear-gradient(to bottom, #ef5350, #c62828);
+  color: #ffffff;
   border-color: #b71c1c; box-shadow: inset 0 1px rgba(255,255,255,0.3), 0 2px 10px rgba(229,57,53,0.35); }
 button.destructive-action label { color: #ffffff; }
 entry, spinbutton:not(.vertical), searchbar entry { background-color: $surface; background-image: none; color: $text;
@@ -12919,10 +13073,10 @@ entry, spinbutton:not(.vertical), searchbar entry { background-color: $surface; 
 entry:focus, spinbutton:focus { border-color: $accent; box-shadow: 0 0 0 3px $glow_soft; }
 entry selection, label selection, textview text selection { background-color: $accent; color: $on_accent; }
 .view, treeview.view, iconview, textview text, list { background-color: $surface; color: $text; }
-list row:selected, row:selected { background-image: linear-gradient(to right, $accent, $accent2);
-  background-color: $accent; color: $on_accent; }
+list row:selected, row:selected { background-image: linear-gradient(to right, $accent_mid, $accent);
+  background-color: $accent_mid; color: $on_accent; }
 treeview.view:selected, treeview.view:selected:focus, iconview:selected, iconview:selected:focus, .view:selected {
-  background-image: none; background-color: $accent; color: $on_accent; }
+  background-image: none; background-color: $accent_mid; color: $on_accent; }
 row:selected label { color: $on_accent; }
 treeview.view:hover, list row:hover { background-color: $glow_soft; }
 treeview.view header button { background-image: none; background-color: $surface_hi; color: $dim; font-weight: 600;
@@ -12933,7 +13087,8 @@ notebook > header tab:hover { color: $text; background-color: $glow_soft; }
 notebook > header tab:checked { color: $text; background-color: $surface; box-shadow: inset 0 -3px $accent; }
 notebook > stack { background-color: $surface; }
 .arckad-sidebar, .arckad-sidebar row { background-color: $side; }
-.arckad-sidebar row:selected { background-image: linear-gradient(to right, $accent, $accent2); border-radius: 10px; }
+.arckad-sidebar row:selected { background-color: $accent_mid; background-image: linear-gradient(to right, $accent_mid, $accent);
+  border-radius: 10px; }
 paned > separator, separator { background-color: $border; }
 scrollbar { background-color: transparent; border: none; }
 scrollbar slider { background-color: $scroll; border-radius: 8px; min-width: 6px; min-height: 6px; border: none; }
@@ -12954,14 +13109,14 @@ scale slider { background-image: linear-gradient(to bottom, #ffffff, #e2e2e6); b
 menu, .menu, .context-menu, popover, popover.background { background-color: $menu; color: $text;
   border: 1px solid $border; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
 menuitem { padding: 6px 12px; border-radius: 8px; }
-menuitem:hover { background-image: linear-gradient(to right, $accent, $accent2); color: $on_accent; }
+menuitem:hover { background-color: $accent_mid; background-image: linear-gradient(to right, $accent, $accent2); color: $on_accent; }
 menuitem:hover label { color: $on_accent; }
 tooltip, tooltip.background { background-color: $menu; color: $text; border: 1px solid $border; border-radius: 9px; }
 tooltip label { color: $text; }
 infobar, infobar > revealer > box { background-color: $surface_hi; background-image: none; color: $text; border: none; }
 frame.app-notification, .app-notification { background-image: linear-gradient(to bottom, $hdr1, $hdr2); color: $text;
   border: 1px solid $border; border-radius: 14px; box-shadow: 0 6px 24px rgba(0,0,0,0.35), 0 0 16px $glow_soft; }
-.chat-mine { background-color: $accent; background-image: linear-gradient(to bottom, $accent2, $accent_dark);
+.chat-mine { background-color: $accent_mid; background-image: linear-gradient(to bottom, $accent2, $accent_dark);
   box-shadow: 0 2px 8px $glow_soft; }
 .chat-mine label { color: $bubble_text; }
 .chat-mine label selection, .chat-theirs label selection { background-color: $glow; color: $text; }
@@ -12974,6 +13129,16 @@ progressbar.arckad-transfer progress { background-color: $accent; }
 calendar { background-color: $surface; color: $text; }
 calendar:selected { background-color: $accent; color: $on_accent; }
 """
+
+
+_CLASSIC_COLOURS = {"ok": "#2ec27e", "off": "#9a9996", "warn": "#ff7800", "tick": "#3584e4"}
+_current_skin = {"name": None}
+
+
+def skin_color(key):
+    """A colour that suits the current theme (for colours written into text: status dots, ticks…)."""
+    s = SKINS.get(_current_skin["name"])
+    return s[key] if s and key in s else _CLASSIC_COLOURS.get(key, "#888888")
 
 
 def skin_css(name):
@@ -13009,6 +13174,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
         if not IS_WIN:
             GLib.timeout_add_seconds(120, self._tracker_guard_tick)
+            GLib.timeout_add_seconds(300, self._tracker_activity_tick)
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -13041,8 +13207,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.set_active(self.left_nb.get_nth_page(self.left_nb.get_current_page()))
 
         INDEX.listeners.append(self.on_index_updated)
-        if not INDEX.fresh():
-            INDEX.rebuild()
+        if not INDEX.available() or (self.index_every() and not INDEX.fresh(self.index_every())):
+            INDEX.rebuild(auto=True)
         GLib.timeout_add_seconds(60, self.tick)
         self.on_index_updated()
         self.apply_autosort(startup=True)
@@ -13152,6 +13318,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Receive files…", lambda: self.open_share(None, "receive")),
             None,
             ("Update search index now", INDEX.rebuild),
+            ("Search index settings…", self.index_settings),
         ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else [])))
         pair = Gtk.Box()
         pair.get_style_context().add_class("linked")
@@ -13487,6 +13654,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self._skin_css = Gtk.CssProvider()
             Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self._skin_css,
                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 5)
+        _current_skin["name"] = mode if mode in SKINS else None
         if mode in SKINS:
             s.set_property("gtk-theme-name", "Adwaita")          # a known base under the skin
             s.set_property("gtk-application-prefer-dark-theme", SKINS[mode]["dark"])
@@ -13979,9 +14147,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.update_spinner()
         return False
 
+    def index_every(self):
+        """Seconds between automatic index refreshes (0 = only when asked). Default: every 2 hours."""
+        return int(self.cfg.get("index_every", 7200))
+
     def tick(self):
-        if not INDEX.fresh() and not INDEX.building:
-            INDEX.rebuild()
+        every = self.index_every()
+        if not INDEX.building and time.time() > INDEX.postpone_until and (
+                not INDEX.available() or (every and not INDEX.fresh(every))):
+            INDEX.rebuild(auto=True)
         self.on_index_updated()
         return True
 
@@ -15119,6 +15293,34 @@ class MainWindow(Gtk.ApplicationWindow):
         self.update_chat_button()
         return False
 
+    def index_settings(self):
+        d = Gtk.Dialog(title="Search index settings", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        lb = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+        lb.set_markup("Arckad-D keeps a small list of your files' names for instant search. Refreshing it reads "
+                      "through your home folder, so it runs at the <b>lowest disk priority</b> and waits when the "
+                      "disk is busy. Folder views always show the live contents.")
+        box.add(lb)
+        row = Gtk.Box(spacing=8)
+        row.add(Gtk.Label(label="Refresh the search index:"))
+        cb = Gtk.ComboBoxText()
+        for secs, label in ((1800, "every 30 minutes"), (7200, "every 2 hours (recommended)"),
+                            (21600, "every 6 hours"), (86400, "once a day"), (0, "only when I ask")):
+            cb.append(str(secs), label)
+        cb.set_active_id(str(self.index_every()))
+        if cb.get_active_id() is None:
+            cb.set_active_id("7200")
+        row.add(cb)
+        box.add(row)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK:
+            self.cfg["index_every"] = int(cb.get_active_id())
+            write_json(CONFIG_FILE, self.cfg)
+        d.destroy()
+
     # ---------- Ubuntu Search Guard
     def _tracker_guard_tick(self):
         guard = self.cfg.get("tracker_guard", "ask")
@@ -15136,6 +15338,60 @@ class MainWindow(Gtk.ApplicationWindow):
             GLib.timeout_add_seconds(1800, self._tracker_guard_tick)       # then every 30 minutes
             return False
         return True
+
+    def _tracker_activity_tick(self):
+        """Every 5 minutes: is Tracker keeping the disk busy? Two busy checks in a row → act (or ask)."""
+        if self.cfg.get("tracker_guard", "ask") == "off" or getattr(self, "_tracker_busy", False) \
+                or not tracker_present() or tracker_mode() == "off":
+            return True
+
+        def work():
+            act = disk_activity(4.0)
+            problem = tracker_io_problem(act)
+            self._io_strikes = (getattr(self, "_io_strikes", 0) + 1) if problem else 0
+            if self._io_strikes >= 2:
+                self._io_strikes = 0
+                GLib.idle_add(self._tracker_io_alert, problem)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _tracker_io_alert(self, problem):
+        guard = self.cfg.get("tracker_guard", "ask")
+        if guard == "auto":
+            def work():
+                if tracker_mode() == "normal":
+                    tracker_set_mode("limited", self.cfg)
+                    write_json(CONFIG_FILE, self.cfg)
+                    what = "switched it to Limited mode (gentlest)"
+                else:
+                    tracker_pause()
+                    what = "paused it until you next log in"
+                GLib.idle_add(lambda: self.notify_desktop("Ubuntu Search Guard", f"{problem} Arckad-D {what}.", None, None)
+                              or False)
+            threading.Thread(target=work, daemon=True).start()
+            return False
+        if getattr(self, "_io_alerted", 0) > time.time() - 6 * 3600:
+            return False
+        self._io_alerted = time.time()
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.WARNING,
+                              buttons=Gtk.ButtonsType.NONE, text="Ubuntu's search indexer is keeping your disk busy")
+        d.format_secondary_text(problem + "\n\nThis is Ubuntu's Tracker, not Arckad-D. What should Arckad-D do?")
+        d.add_buttons("Not now", Gtk.ResponseType.CANCEL, "Turn it off", Gtk.ResponseType.REJECT,
+                      "Pause until next login", Gtk.ResponseType.NO, "Limit it (recommended)", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+
+        def respond(dlg, r):
+            dlg.destroy()
+            action = {Gtk.ResponseType.OK: "limited", Gtk.ResponseType.REJECT: "off", Gtk.ResponseType.NO: "pause"}.get(r)
+            if action:
+                threading.Thread(target=lambda: (tracker_pause() if action == "pause" else
+                                                 tracker_set_mode(action, self.cfg),
+                                                 write_json(CONFIG_FILE, self.cfg)), daemon=True).start()
+                self.flash_all({"limited": "Tracker: limited mode on", "off": "Tracker switched off",
+                                "pause": "Tracker paused until you next log in"}[action])
+        d.connect("response", respond)
+        d.show_all()
+        return False
 
     def _arckad_folders_to_hide(self):
         """Arckad-D's own folders that Tracker gains nothing from indexing."""
@@ -15219,8 +15475,21 @@ class MainWindow(Gtk.ApplicationWindow):
             f"Tracker database: <b>{human_size(st['db'])}</b>   ·   crash files: <b>{human_size(st['dumps'])}</b>\n"
             f"Free disk space: <b>{human_size(st['free'])}</b> of {human_size(st['total'])}\n"
             + (f"<span foreground='#e01b24'><b>⚠ {esc(problem)}</b></span>" if problem else
-               "<span foreground='#2ec27e'><b>✓ Healthy</b></span>"))
+               f"<span foreground='{skin_color('ok')}'><b>✓ Healthy</b></span>"))
         box.add(status)
+        activity = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
+        activity.set_markup("<small>Measuring disk activity…</small>")
+        box.add(activity)
+
+        def measure():
+            act = disk_activity(3.0)
+            busy = "?" if act["busy"] is None else f"{act['busy']:.0f}%"
+            prob = tracker_io_problem(act)
+            text = (f"Disk activity now: disk busy <b>{busy}</b>  ·  Tracker <b>{human_size(act['Tracker'])}/s</b>  ·  "
+                    f"Arckad-D <b>{human_size(act['Arckad-D'])}/s</b>"
+                    + (f"\n<span foreground='#e01b24'><b>⚠ {esc(prob)}</b></span>" if prob else ""))
+            GLib.idle_add(lambda: activity.get_mapped() and activity.set_markup(text) or False)
+        threading.Thread(target=measure, daemon=True).start()
         clean = Gtk.Button(label="🧹 Clean up now")
         clean.get_style_context().add_class("suggested-action" if problem else "")
         dumps_root = any(not mine for _p, _s, mine in st["dump_files"])
