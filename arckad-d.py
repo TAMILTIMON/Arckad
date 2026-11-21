@@ -72,7 +72,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.15.1"
+APP_VERSION = "3.16.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5937,6 +5937,10 @@ class Chat:
         for k in ("friends", "incoming", "outgoing"):
             self.contacts.setdefault(k, {})
         self.profile = self.contacts.setdefault("profile", {"name": "", "visible": True, "setup": False})
+        self.fcode = None                # friend code I'm showing: {"code", "until", "tries", "pending"}
+        self.fcode_seen = {}
+        self.lock_state = {"locked": bool(self.contacts.get("pin")), "fails": 0, "wait_until": 0,
+                           "last_use": time.time()}
         self.load()
         threading.Thread(target=self.identity, daemon=True).start()     # make the signing key in the background
 
@@ -6042,7 +6046,8 @@ class Chat:
 
     def active(self):
         return (any(not g.get("removed") for g in self.groups.values()) or self.join_active()
-                or (self.profile.get("setup") and self.profile.get("visible")) or bool(self.contacts["outgoing"]))
+                or (self.profile.get("setup") and self.profile.get("visible")) or bool(self.contacts["outgoing"])
+                or bool(self.contacts["friends"]) or self.fcode_active())
 
     def is_online(self, did):
         o = self.online.get(did)
@@ -6341,6 +6346,8 @@ class Chat:
             out["ctags"] = tags
         if self.join_active():
             out["chatjoin"] = hashlib.sha256(f"arckad-chat-code|{self.join['code']}".encode()).hexdigest()[:20]
+        if self.fcode_active():
+            out["fcode"] = hashlib.sha256(f"arckad-friend-code|{self.fcode['code']}".encode()).hexdigest()[:20]
         if self.profile.get("setup") and self.profile.get("visible"):
             out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash()}
         elif self.contacts["outgoing"] or self.contacts["friends"]:
@@ -6367,6 +6374,8 @@ class Chat:
     def on_udp(self, msg, ip):
         if msg.get("chatjoin") and msg.get("port"):
             self.code_seen[str(msg["chatjoin"])] = (ip, int(msg["port"]), time.time())
+        if msg.get("fcode") and msg.get("port"):
+            self.fcode_seen[str(msg["fcode"])] = (ip, int(msg["port"]), time.time())
         who = msg.get("who")
         if isinstance(who, dict) and isinstance(who.get("id"), str) and who["id"] != self.me and msg.get("port"):
             self._saw_person(who, ip, int(msg["port"]))
@@ -6384,7 +6393,11 @@ class Chat:
         return bool(seen)
 
     def direct_targets(self):
-        return {o["ip"] for o in self.online.values() if o.get("ip")}
+        """Addresses to greet directly (broadcasts don't cross VLANs): members seen this session, and every
+        friend's last known address, so friends on other networks reconnect after restarts."""
+        ips = {o["ip"] for o in self.online.values() if o.get("ip")}
+        ips |= {f["ip"] for f in self.contacts["friends"].values() if f.get("ip")}
+        return ips
 
     def ensure_my_pub(self, gid):
         """Groups made before signatures: give the owner this device's public key."""
@@ -6428,6 +6441,9 @@ class Chat:
         import http.client
         o = self.online.get(did) or {}
         ip, port = o.get("ip"), o.get("port")
+        if (not ip or not port) and did in self.contacts["friends"]:
+            f = self.contacts["friends"][did]
+            ip, port = f.get("ip"), f.get("port")
         if not ip or not port:
             raise OSError("not online")
         key = pair_key or self.key(gid)
@@ -6585,9 +6601,17 @@ class Chat:
         return str(target)
 
     def _deliver(self, gid, msg):
+        g = self.groups.get(gid) or {}
+        targets = set(self.online_members(gid))
+        if g.get("kind") == "direct" and not g.get("removed"):
+            targets.add(g["peer"])                   # try the friend's remembered address too (other VLANs)
+
         def work():
-            for did in self.online_members(gid):
-                self._try(lambda: self._request(gid, did, "POST", "/c/msg", {"msg": msg}, timeout=10))
+            for did in targets:
+                if self._try(lambda: self._request(gid, did, "POST", "/c/msg", {"msg": msg}, timeout=6)) is not None:
+                    o = self.online.get(did)
+                    if o:
+                        o["seen"] = time.time()
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- profile
@@ -6652,6 +6676,9 @@ class Chat:
         self.people[pid] = {"name": name, "ip": ip, "port": port, "ph": ph, "os": str(who.get("os", ""))[:10],
                             "seen": time.time(), "hidden": bool(who.get("hidden"))}
         f = self.contacts["friends"].get(pid)
+        if f and (f.get("ip") != ip or f.get("port") != port):
+            f["ip"], f["port"] = ip, port
+            self.save_contacts()
         changed = old is None or old.get("name") != name or old.get("ph") != ph
         if f and (f.get("name") != name or f.get("ph") != ph):
             f["name"] = name
@@ -6721,7 +6748,7 @@ class Chat:
         p = self.people.get(pid) or {}
         ip, port = p.get("ip"), p.get("port")
         if not ip or not port:
-            o = self.online.get(pid) or {}
+            o = self.online.get(pid) or self.contacts["friends"].get(pid) or {}
             ip, port = o.get("ip"), o.get("port")
         if not ip or not port:
             raise OSError("they're not on the network right now")
@@ -6816,7 +6843,9 @@ class Chat:
         return "dm-" + hashlib.sha256(f"{a}|{b}".encode()).hexdigest()[:14]
 
     def _become_friends(self, pid, name, os_name, sigpub, key, ph=""):
-        self.contacts["friends"][pid] = {"name": name, "os": os_name, "sigpub": sigpub, "since": time.time(), "ph": ph}
+        seen = self.people.get(pid) or {}
+        self.contacts["friends"][pid] = {"name": name, "os": os_name, "sigpub": sigpub, "since": time.time(), "ph": ph,
+                                         "ip": seen.get("ip"), "port": seen.get("port")}
         self.contacts["outgoing"].pop(pid, None)
         self.contacts["incoming"].pop(pid, None)
         gid = self._direct_gid(pid)
@@ -6842,6 +6871,184 @@ class Chat:
             threading.Thread(target=self._fetch_photo, args=(pid, p["ip"], p["port"], p["ph"]), daemon=True).start()
         self.ui("on_chat_changed", gid)
         return gid
+
+    # ---------- friend codes: add a friend on any network (other VLANs too) with a 6-character code
+    CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"        # no 0/O, 1/I/L look-alikes
+
+    @staticmethod
+    def norm_code(text):
+        return "".join(c for c in text.upper() if c.isalnum())[:6]
+
+    def new_friend_code(self):
+        self.start()
+        self.pr.ensure_running()
+        code = "".join(secrets.choice(self.CODE_ALPHABET) for _ in range(6))
+        self.fcode = {"code": code, "until": time.time() + 600, "tries": 0, "pending": {}}
+        self.pr.last_beacon = 0
+        return code
+
+    def fcode_active(self):
+        return bool(self.fcode) and time.time() < self.fcode["until"]
+
+    def stop_friend_code(self):
+        self.fcode = None
+
+    def add_by_code(self, code, host=None):
+        """Background thread: become friends with whoever is showing this code. host: their IP (other VLAN)."""
+        import http.client
+        code = self.norm_code(code)
+        if len(code) != 6:
+            return False, "A friend code has 6 letters and numbers."
+        self.start()
+        self.pr.ensure_running()
+        where = None
+        if host:
+            for port in PAIR_TCP_PORTS[:-1]:
+                if Paired._reachable(host, port):
+                    where = (socket.gethostbyname(host), port)
+                    break
+            if not where:
+                return False, (f"Couldn't reach {host}. Check the address, that Arckad-D is open there, and that "
+                               "both firewalls allow Arckad-D (🛡 Allow through firewall).")
+        else:
+            want = hashlib.sha256(f"arckad-friend-code|{code}".encode()).hexdigest()[:20]
+            end = time.time() + 8
+            while time.time() < end and not where:
+                hit = self.fcode_seen.get(want)
+                if hit and time.time() - hit[2] < 10:
+                    where = (hit[0], hit[1])
+                time.sleep(0.2)
+            if not where:
+                return False, ("Nobody showing that code was found on this network. If your friend is on another "
+                               "network or VLAN, also type their IP address (it's shown under their code).")
+        ip, port = where
+        x, offer = self._dh_offer("code")
+
+        def call(path, obj):
+            c = http.client.HTTPConnection(ip, port, timeout=20)
+            c.request("POST", path, json.dumps(obj).encode(), {"Content-Type": "application/json"})
+            r = c.getresponse()
+            data = json.loads(r.read() or b"{}")
+            c.close()
+            return data
+        try:
+            r1 = call("/f/codestart", offer)
+            if not r1.get("ok"):
+                return False, r1.get("reason", "refused")
+            pid, sigpub = str(r1["id"])[:40], str(r1["sigpub"])[:1100]
+            if not rsa_verify(sigpub, f"arckad-friend|{pid}|code|{r1['dh']}".encode(), str(r1.get("dhsig", ""))):
+                return False, "the other device's key didn't check out"
+            key = self._friend_key(x, r1["dh"], offer["dh"])
+            r2 = call("/f/codeconfirm", {"id": self.me, "proof": _hm(key, "fcode-guest", code).hex()})
+            if not r2.get("ok"):
+                return False, r2.get("reason", "not confirmed")
+            if not hmacmod.compare_digest(_hm(key, "fcode-host", code).hex(), str(r2.get("proof", ""))):
+                return False, "the other device couldn't prove it knows the code"
+        except (OSError, ValueError, KeyError) as ex:
+            return False, f"connection problem ({ex})"
+        self.people[pid] = {"name": str(r1.get("name", "?"))[:40], "ip": ip, "port": int(r1.get("port") or port),
+                            "ph": str(r1.get("ph", ""))[:16], "os": str(r1.get("os", ""))[:10], "seen": time.time(),
+                            "hidden": True}
+        self._become_friends(pid, str(r1.get("name", "?"))[:40], str(r1.get("os", ""))[:10], sigpub, key,
+                             str(r1.get("ph", ""))[:16])
+        return True, str(r1.get("name", "your friend"))
+
+    def _code_post(self, path, req, ip):
+        if path == "/f/codestart":
+            if not self.fcode_active():
+                return {"ok": False, "reason": "That code isn't shown any more. Ask for a new one."}
+            pid = str(req.get("id", ""))[:40]
+            dh, sigpub = str(req.get("dh", "")), str(req.get("sigpub", ""))[:1100]
+            if not rsa_verify(sigpub, f"arckad-friend|{pid}|code|{dh}".encode(), str(req.get("dhsig", ""))):
+                return {"ok": False, "reason": "bad signature"}
+            x, offer = self._dh_offer("code")
+            key = self._friend_key(x, dh, offer["dh"])
+            self.fcode["pending"][pid] = {"key": key, "req": req, "ip": ip}
+            return dict(offer, ok=True)
+        if path == "/f/codeconfirm":
+            pid = str(req.get("id", ""))[:40]
+            st = self.fcode["pending"].get(pid) if self.fcode_active() else None
+            if not st:
+                return {"ok": False, "reason": "That code isn't shown any more. Ask for a new one."}
+            code = self.fcode["code"]
+            if not hmacmod.compare_digest(_hm(st["key"], "fcode-guest", code).hex(), str(req.get("proof", ""))):
+                self.fcode["tries"] += 1
+                if self.fcode["tries"] >= 5:
+                    self.fcode = None
+                    self.ui("on_pair_event", "Too many wrong friend codes: the code was cancelled.")
+                return {"ok": False, "reason": "Wrong code."}
+            r = st["req"]
+            self.people[pid] = {"name": str(r.get("name", "?"))[:40], "ip": st["ip"], "port": r.get("port"),
+                                "ph": str(r.get("ph", ""))[:16], "os": str(r.get("os", ""))[:10], "seen": time.time(),
+                                "hidden": True}
+            self._become_friends(pid, str(r.get("name", "?"))[:40], str(r.get("os", ""))[:10],
+                                 str(r.get("sigpub", ""))[:1100], st["key"], str(r.get("ph", ""))[:16])
+            self.fcode = None
+            self.ui("on_pair_event", f"🤝 You're now friends with {r.get('name', 'someone')}")
+            return {"ok": True, "proof": _hm(st["key"], "fcode-host", code).hex()}
+        return {"ok": False, "reason": "unknown"}
+
+    # ---------- chat lock: a 4-digit PIN in front of the chat (on this computer)
+    def has_pin(self):
+        return bool(self.contacts.get("pin"))
+
+    def is_locked(self):
+        return self.has_pin() and self.lock_state["locked"]
+
+    def set_pin(self, pin, minutes=5):
+        salt = secrets.token_bytes(16)
+        self.contacts["pin"] = {"salt": salt.hex(), "hash": _backup_key(pin, salt).hex(), "minutes": minutes}
+        self.lock_state.update(locked=False, fails=0, wait_until=0, last_use=time.time())
+        self.save_contacts()
+
+    def remove_pin(self):
+        self.contacts.pop("pin", None)
+        self.lock_state["locked"] = False
+        self.save_contacts()
+
+    def lock_chat(self):
+        if self.has_pin():
+            self.lock_state["locked"] = True
+            self.ui("on_chat_lock_changed")
+
+    def touch(self):
+        self.lock_state["last_use"] = time.time()
+
+    def check_auto_lock(self):
+        p = self.contacts.get("pin")
+        if p and not self.lock_state["locked"] and p.get("minutes") and \
+                time.time() - self.lock_state["last_use"] > p["minutes"] * 60:
+            self.lock_chat()
+
+    def unlock(self, pin):
+        """Returns (ok, message). Wrong PINs make you wait longer each time."""
+        st = self.lock_state
+        if time.time() < st["wait_until"]:
+            return False, f"Too many wrong PINs. Try again in {int(st['wait_until'] - time.time()) + 1} s."
+        p = self.contacts.get("pin") or {}
+        if p and hmacmod.compare_digest(_backup_key(pin, bytes.fromhex(p["salt"])).hex(), p["hash"]):
+            st.update(locked=False, fails=0, wait_until=0, last_use=time.time())
+            self.ui("on_chat_lock_changed")
+            return True, ""
+        st["fails"] += 1
+        if st["fails"] >= 3:
+            st["wait_until"] = time.time() + min(30 * 2 ** (st["fails"] - 3), 15 * 60)
+            return False, f"Wrong PIN. Wait {int(st['wait_until'] - time.time())} s before trying again."
+        return False, "Wrong PIN."
+
+    def reset_lock_and_history(self):
+        """Forgot the PIN: remove it, but clear the chat history on this computer so it can't be misused."""
+        with self.lock:
+            for gid in list(self.msgs):
+                self.msgs[gid], self.ids[gid] = [], set()
+                try:
+                    (CHAT_DIR / f"{gid}.jsonl").unlink()
+                except OSError:
+                    pass
+            self.unread.clear()
+        self.remove_pin()
+        self.ui("on_chat_lock_changed")
+        self.ui("on_chat_changed", None)
 
     def remove_friend(self, pid):
         """Tell them (if they're online), then forget the friendship here. The chat history stays, read-only."""
@@ -7143,6 +7350,9 @@ class Chat:
         return gid, did, (key, pair)
 
     def handle_post(self, h, path):
+        if path in ("/f/codestart", "/f/codeconfirm"):
+            r = self._code_post(path, json.loads(h._body(200_000) or b"{}"), h.client_address[0])
+            return h._plain(200 if r.get("ok") else 403, r)
         if path.startswith("/f/"):
             r = self._friend_post(path, json.loads(h._body(200_000) or b"{}"), h.client_address[0])
             return h._plain(200 if r.get("ok") else 403, r)
@@ -7636,6 +7846,11 @@ class ChatPanel(Gtk.Box):
             it = Gtk.MenuItem(label=label)
             it.connect("activate", lambda _i, cb=cb: cb())
             lmenu.append(it)
+        lmenu.append(Gtk.SeparatorMenuItem())
+        for label, cb in (("Chat lock (PIN)…", self.pin_settings), ("Lock now", lambda: self.chat.lock_chat())):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            lmenu.append(it)
         snd = Gtk.CheckMenuItem(label="Message sounds")
         snd.set_active(win.cfg.get("chat_sound", True))
 
@@ -7809,9 +8024,29 @@ class ChatPanel(Gtk.Box):
         ppl.pack_start(psc, True, True, 0)
         self.pages.add_named(ppl, "people")
 
+        # ===== page 4: locked (4-digit PIN)
+        lk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+        li = Gtk.Label()
+        li.set_markup("<span size='xx-large'>🔒</span>\n<b>Chat is locked</b>")
+        li.set_justify(Gtk.Justification.CENTER)
+        lk.add(li)
+        self.pin_entry = Gtk.Entry(visibility=False, max_length=4, width_chars=8, xalign=0.5,
+                                   placeholder_text="PIN", input_purpose=Gtk.InputPurpose.PIN)
+        self.pin_entry.connect("activate", lambda *_: self.try_unlock())
+        self.pin_entry.connect("changed", lambda e: self.try_unlock() if len(e.get_text()) == 4 else None)
+        lk.add(self.pin_entry)
+        self.pin_msg = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=34)
+        lk.add(self.pin_msg)
+        forgot = Gtk.Button(label="Forgot PIN?")
+        forgot.set_relief(Gtk.ReliefStyle.NONE)
+        forgot.connect("clicked", lambda *_: self.forgot_pin())
+        lk.add(forgot)
+        self.pages.add_named(lk, "locked")
+
         self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
                            Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
         self.connect("drag-data-received", self.on_drop)
+        self.entry.connect("changed", lambda *_: self.chat.touch())
         self.pages.show_all()
         self.pages.set_visible_child_name("list")
         self.refresh()
@@ -7825,6 +8060,11 @@ class ChatPanel(Gtk.Box):
     def open_chat(self, gid):
         if gid not in self.chat.groups:
             return
+        self.chat.touch()
+        if self.chat.is_locked():
+            self.gid = gid                             # opens after unlocking
+            self.refresh()
+            return
         self.gid = gid
         self.pages.set_visible_child_name("conv")
         self.show_messages()
@@ -7834,6 +8074,9 @@ class ChatPanel(Gtk.Box):
         self.entry.grab_focus()
 
     def show_people(self):
+        if self.chat.is_locked():
+            self.refresh()
+            return
         if not self.chat.profile.get("setup"):
             self.edit_profile(then_people=True)
             return
@@ -7855,6 +8098,15 @@ class ChatPanel(Gtk.Box):
         return avatar_pixbuf(g.get("name", "?"), None, size, group=True)
 
     def refresh(self, gid=None):
+        if self.chat.is_locked():
+            if self.pages.get_visible_child_name() != "locked":
+                self.pages.set_visible_child_name("locked")
+                self.pin_entry.set_text("")
+                self.pin_msg.set_text("Type your 4-digit PIN")
+                self.pin_entry.grab_focus()
+            return
+        if self.pages.get_visible_child_name() == "locked":
+            self.pages.set_visible_child_name("conv" if self.gid in self.chat.groups else "list")
         self.me_btn.set_image(Gtk.Image.new_from_pixbuf(avatar_pixbuf(self.chat.my_name(),
                                                                       self.chat.avatar_file(self.chat.me), 30)))
         self.setup_bar.set_visible(not self.chat.profile.get("setup"))
@@ -7982,6 +8234,44 @@ class ChatPanel(Gtk.Box):
                 row.add(b)
             self.people_box.add(row)
 
+        section("Add a friend with a code (any network, other VLANs too)")
+        fc = Gtk.Box(spacing=6)
+        b1 = Gtk.Button(label="Show my friend code")
+        b1.connect("clicked", lambda *_: self.show_friend_code())
+        b2 = Gtk.Button(label="Enter a friend code")
+        b2.connect("clicked", lambda *_: self.enter_friend_code())
+        fc.add(b1)
+        fc.add(b2)
+        self.people_box.add(fc)
+        if ch.fcode_active():
+            code = ch.fcode["code"]
+            left = int(ch.fcode["until"] - time.time())
+            ips = [ip for ip in lan_addresses() if not ip.startswith("127.")]
+            cl = Gtk.Label(selectable=True, margin_top=6)
+            cl.set_markup(f"<span size='xx-large' weight='bold' letter_spacing='5000' font_family='monospace'>"
+                          f"{code[:3]}-{code[3:]}</span>")
+            self.people_box.add(cl)
+            hl = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER)
+            self._fc_hint, self._fc_ip = hl, ips[0] if ips else "?"
+            self._set_fc_hint(left)
+            self.people_box.add(hl)
+            stop = Gtk.Button(label="Stop showing the code", halign=Gtk.Align.CENTER)
+            stop.connect("clicked", lambda *_: (ch.stop_friend_code(), self.refresh_people()))
+            self.people_box.add(stop)
+        if getattr(self, "_code_form", False):
+            form = Gtk.Box(spacing=4, margin_top=4)
+            self.fc_code = Gtk.Entry(placeholder_text="ABC-123", max_length=7, width_chars=9)
+            self.fc_ip = Gtk.Entry(placeholder_text="their IP (only if on another network)", hexpand=True)
+            self.fc_btn = Gtk.Button(label="Add")
+            self.fc_btn.get_style_context().add_class("suggested-action")
+            self.fc_btn.connect("clicked", lambda *_: self.do_friend_code())
+            self.fc_code.connect("activate", lambda *_: self.do_friend_code())
+            form.add(self.fc_code)
+            form.pack_start(self.fc_ip, True, True, 0)
+            form.add(self.fc_btn)
+            self.people_box.add(form)
+            self.fc_status = Gtk.Label(xalign=0, wrap=True, label=getattr(self, "_code_status", ""))
+            self.people_box.add(self.fc_status)
         inc = ch.contacts["incoming"]
         if inc:
             section(f"Friend requests ({len(inc)})")
@@ -8025,6 +8315,130 @@ class ChatPanel(Gtk.Box):
             person(pid, f["name"], sub, [("Message", lambda pid=pid: self.open_chat(ch._direct_gid(pid)),
                                           "suggested-action")], online=ch.person_online(pid))
         self.people_box.show_all()
+
+    def show_friend_code(self):
+        self.chat.new_friend_code()
+        self._code_form = False
+        self.refresh_people()
+        GLib.timeout_add_seconds(1, self._tick_friend_code)
+
+    def _set_fc_hint(self, left):
+        self._fc_hint.set_markup(f"<small>Your friend clicks <b>Enter a friend code</b> and types this. From another "
+                                 f"network or VLAN they also type this computer's address: <b>{esc(self._fc_ip)}</b>\n"
+                                 f"Valid {left // 60}:{left % 60:02d} · anyone with the code becomes your friend, so "
+                                 f"share it only with them.</small>")
+
+    def _tick_friend_code(self):
+        """Only the countdown changes each second (typing elsewhere on the page isn't disturbed)."""
+        active = self.chat.fcode_active()
+        hint = getattr(self, "_fc_hint", None)
+        if active and hint is not None and hint.get_mapped():
+            self._set_fc_hint(int(self.chat.fcode["until"] - time.time()))
+        elif not active and self.pages.get_visible_child_name() == "people":
+            self.refresh_people()                    # the code expired or was used: tidy the page
+        return active
+
+    def enter_friend_code(self):
+        self._code_form, self._code_status = True, "Type the 6-character code your friend shows you."
+        self.refresh_people()
+        self.fc_code.grab_focus()
+
+    def do_friend_code(self):
+        code, host = self.fc_code.get_text(), self.fc_ip.get_text().strip() or None
+        self.fc_btn.set_sensitive(False)
+        self.fc_status.set_text("Connecting…")
+
+        def work():
+            ok, msg = self.chat.add_by_code(code, host)
+            GLib.idle_add(done, ok, msg)
+
+        def done(ok, msg):
+            if ok:
+                self._code_form, self._code_status = False, ""
+                self.win.flash_all(f"🤝 You're now friends with {msg}")
+                self.refresh_people()
+            else:
+                self._code_status = "✗ " + msg
+                self.fc_btn.set_sensitive(True)
+                self.fc_status.set_text(self._code_status)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- chat lock
+    def try_unlock(self):
+        pin = self.pin_entry.get_text()
+        if len(pin) != 4:
+            return
+        ok, msg = self.chat.unlock(pin)
+        self.pin_entry.set_text("")
+        if not ok:
+            self.pin_msg.set_markup(f"<span foreground='#e01b24'>{esc(msg)}</span>")
+
+    def forgot_pin(self):
+        if self.win.confirm("Reset the chat lock?\n\nThe PIN is removed and the chat history on this computer is "
+                            "deleted, so nobody can use “forgot PIN” to read your messages. Your friends and groups "
+                            "stay, and group messages come back from colleagues when they're online."):
+            self.chat.reset_lock_and_history()
+
+    def pin_settings(self):
+        has = self.chat.has_pin()
+        d = Gtk.Dialog(title="Chat lock", transient_for=self.get_toplevel(), modal=True)
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        if has:
+            d.add_button("Remove PIN", 2)
+        d.add_button("Save", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=46)
+        intro.set_markup("Protect your chats on this computer with a <b>4-digit PIN</b>: the chat opens locked, and "
+                         "locks again after the time you choose. While locked, pop-ups don't show names or messages.")
+        box.add(intro)
+        cur = Gtk.Entry(visibility=False, max_length=4, placeholder_text="Current PIN")
+        if has:
+            box.add(cur)
+        new1 = Gtk.Entry(visibility=False, max_length=4, placeholder_text="New 4-digit PIN")
+        new2 = Gtk.Entry(visibility=False, max_length=4, placeholder_text="Type it again")
+        box.add(new1)
+        box.add(new2)
+        row = Gtk.Box(spacing=8)
+        row.add(Gtk.Label(label="Lock again after"))
+        mins = Gtk.ComboBoxText()
+        for m, label in ((1, "1 minute"), (5, "5 minutes"), (15, "15 minutes"), (30, "30 minutes"),
+                         (0, "only when Arckad-D starts")):
+            mins.append(str(m), label)
+        mins.set_active_id(str((self.chat.contacts.get("pin") or {}).get("minutes", 5)))
+        row.add(mins)
+        row.add(Gtk.Label(label="without chat use"))
+        box.add(row)
+        err = Gtk.Label(xalign=0)
+        box.add(err)
+        d.show_all()
+        while True:
+            r = d.run()
+            if r not in (Gtk.ResponseType.OK, 2):
+                break
+            if has and not self._pin_ok(cur.get_text()):
+                err.set_markup("<span foreground='#e01b24'>The current PIN is wrong.</span>")
+                continue
+            if r == 2:
+                self.chat.remove_pin()
+                self.win.flash_all("Chat lock removed")
+                break
+            a, b = new1.get_text(), new2.get_text()
+            if not (a.isdigit() and len(a) == 4):
+                err.set_markup("<span foreground='#e01b24'>The PIN must be 4 digits.</span>")
+            elif a != b:
+                err.set_markup("<span foreground='#e01b24'>The two PINs are different.</span>")
+            else:
+                self.chat.set_pin(a, int(mins.get_active_id() or 5))
+                self.win.flash_all("🔒 Chat lock is on")
+                break
+        d.destroy()
+
+    def _pin_ok(self, pin):
+        p = self.chat.contacts.get("pin") or {}
+        return bool(p) and hmacmod.compare_digest(_backup_key(pin, bytes.fromhex(p["salt"])).hex(), p["hash"])
 
     def add_friend(self, pid):
         def work():
@@ -8231,6 +8645,7 @@ class ChatPanel(Gtk.Box):
 
     # ---------- actions
     def send(self):
+        self.chat.touch()
         text = self.entry.get_text().strip()
         if text and self.gid:
             self.entry.set_text("")
@@ -8755,6 +9170,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.paired = Paired(self)
         self.chat = Chat(self)
         self.chat_windows = []
+        GLib.timeout_add_seconds(30, self._chat_lock_tick)
         self.share_win = None
 
         provider = Gtk.CssProvider()
@@ -10832,6 +11248,16 @@ class MainWindow(Gtk.ApplicationWindow):
             self.show_right("chat")
         self.chat_panel.open_chat(gid)
 
+    def on_chat_lock_changed(self):
+        for p in self.chat_panels():
+            p.refresh()
+        self.update_chat_button()
+        return False
+
+    def _chat_lock_tick(self):
+        self.chat.check_auto_lock()
+        return True
+
     def on_people_changed(self):
         for p in self.chat_panels():
             p.refresh()
@@ -10875,13 +11301,15 @@ class MainWindow(Gtk.ApplicationWindow):
         direct = g.get("kind") == "direct"
         title = msg.get("name", "?") if direct else f"{msg.get('name', '?')} · {g.get('name', 'Chat')}"
         pix = avatar_pixbuf(msg.get("name", "?"), self.chat.avatar_file(msg.get("from")), 40)
+        if self.chat.is_locked():                            # nothing private on screen while locked
+            title, body, pix = "🔒 New message", "Unlock the chat to read it", avatar_pixbuf("🔒", None, 40)
         self.show_toast(title, body, pix, lambda: self.open_chat_from_toast(gid))
         if self.cfg.get("chat_sound", True):
             play_sound("message")
         if self.is_active() or any(w.is_active() for w in self.chat_windows):
             return False                                 # the pop-up is enough while you're in Arckad-D
         try:
-            n = Gio.Notification.new(f"{msg.get('name', '?')} · {g.get('name', 'Chat')}")
+            n = Gio.Notification.new(title)                    # already hidden if the chat is locked
             n.set_body(body[:200])
             self.get_application().send_notification(f"chat-{gid}", n)
         except Exception:
@@ -10898,6 +11326,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self.active.flash(text)
 
     def send_to_chat(self, paths):
+        if self.chat.is_locked():
+            self.show_right("chat")
+            self.info("Unlock the chat first (type your PIN), then send the files again.")
+            return
         if not self.chat.groups:
             self.toggle_chat() if not self.right_showing("chat") else None
             self.info("Create or join a chat group first (Chat → ＋).")
