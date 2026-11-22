@@ -90,7 +90,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.29.0"
+APP_VERSION = "3.30.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2602,7 +2602,14 @@ class FilePane(Gtk.Box):
                 add("Open in new tab", lambda: win.new_tab(location=first, switch=False))
                 add("Open in other pane", lambda: win.open_in_other(first), other is not None)
             else:
-                add("Open with…", lambda: win.open_with(first))
+                ow = Gtk.MenuItem(label="Open with")
+                ow.set_submenu(win.open_with_menu(first))
+                menu.append(ow)
+            audio = [p for p in paths if is_audio(p)] or [f for d in paths if os.path.isdir(d)
+                                                        for f in sorted_audio_in(d)]
+            if audio:
+                add(f"🎵 Play in widget ({len(audio)})", lambda: win.music_play(audio))
+                add("🎵 Add to widget queue", lambda: win.music_add(audio))
             if all(archive_kind(p) for p in paths) and self.mode == "folder":
                 add("Extract here", lambda: win.extract(self, paths, self.location))
                 add("Extract to…", lambda: win.extract_to(self, paths))
@@ -13644,6 +13651,788 @@ class ChatWindow(Gtk.Window):
         self.connect("destroy", lambda *_: win.chat_windows.remove(self) if self in win.chat_windows else None)
 
 
+# ---------------------------------------------------------------- Optional features (Ubuntu packages)
+# Installed automatically with in-app updates (apt installs "recommended" packages), but skipped when the .deb is
+# opened another way (App Center, dpkg -i). Arckad-D checks them and installs the missing ones with one password.
+OPTIONAL_FEATURES = [  # (packages, any one of them is enough), what it adds, group
+    (["gstreamer1.0-libav"], "Music widget: M4A, AAC and many more formats", "media"),
+    (["gstreamer1.0-plugins-good"], "Music widget: MP3 and FLAC · camera photos in chat", "media"),
+    (["gir1.2-gstreamer-1.0"], "Music widget and camera (GStreamer for Arckad-D)", "media"),
+    (["python3-gi-cairo"], "Rounded corners for the music widget", "media"),
+    (["ffmpegthumbnailer"], "Thumbnails for videos", "files"),
+    (["poppler-utils"], "Previews and thumbnails for PDFs", "files"),
+    (["7zip", "p7zip-full"], "Open and create 7z archives", "files"),
+    (["qrencode"], "QR codes for share links", "files"),
+    (["pulseaudio-utils", "pipewire-bin"], "Intercom calls and voice messages", "chat"),
+    (["gir1.2-ayatanaappindicator3-0.1"], "Icon in the top bar (keep running in the tray)", "chat"),
+]
+
+
+def package_installed(pkg):
+    try:
+        r = subprocess.run(["dpkg-query", "-W", "-f=${Status}", pkg], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and "install ok installed" in r.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def missing_features(group=None):
+    """[(package to install, what it adds)] for features that aren't installed (Ubuntu/Debian only)."""
+    if IS_WIN or not shutil.which("dpkg-query"):
+        return []
+    out = []
+    for pkgs, what, grp in OPTIONAL_FEATURES:
+        if group and grp != group:
+            continue
+        if not any(package_installed(p) for p in pkgs):
+            out.append((pkgs[0], what))
+    return out
+
+
+def install_packages(pkgs):
+    """Install packages with one password prompt. Returns (ok, message)."""
+    if not pkgs:
+        return True, "Nothing to install."
+    if not shutil.which("pkexec"):
+        return False, "Run this in a terminal:\n  sudo apt install " + " ".join(pkgs)
+    try:
+        r = subprocess.run(["pkexec", "apt-get", "install", "-y", *pkgs], capture_output=True, text=True, timeout=1800)
+    except (OSError, subprocess.SubprocessError) as ex:
+        return False, str(ex)
+    if r.returncode == 0:
+        return True, "Installed: " + ", ".join(pkgs)
+    if r.returncode in (126, 127):
+        return False, "Cancelled (the password window was closed)."
+    tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
+    return False, "apt couldn't install them:\n" + "\n".join(tail) + "\n\nYou can try in a terminal:\n  sudo apt install " + " ".join(pkgs)
+
+
+# ---------------------------------------------------------------- Music & clock widget
+# A small floating player for the desktop (Windows and Linux): the time, cover art, title and artist,
+# a progress bar you can click, and add / play-pause / previous / next. With auto-hide it shrinks to a slim
+# strip when the mouse leaves and comes back when the mouse is over it.
+PLAY_EXTS = {"mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma"}
+
+
+def sorted_audio_in(folder, limit=500):
+    """The songs in a folder (not its subfolders), in name order."""
+    try:
+        names = sorted(os.listdir(folder), key=str.lower)
+    except OSError:
+        return []
+    return [os.path.join(folder, n) for n in names if ext_of(n) in PLAY_EXTS][:limit]
+
+
+def is_audio(path):
+    return ext_of(os.path.basename(path)) in PLAY_EXTS and os.path.isfile(path)
+
+
+def _syncsafe(b):
+    return (b[0] << 21) | (b[1] << 14) | (b[2] << 7) | b[3]
+
+
+def _id3_text(data):
+    """An ID3 text frame: first byte says the encoding."""
+    if not data:
+        return ""
+    enc, body = data[0], data[1:]
+    try:
+        if enc == 0:
+            s = body.decode("latin-1")
+        elif enc == 1:
+            s = body.decode("utf-16")
+        elif enc == 2:
+            s = body.decode("utf-16-be")
+        else:
+            s = body.decode("utf-8")
+    except (UnicodeDecodeError, ValueError):
+        s = body.decode("latin-1", "replace")
+    return s.replace("\x00", " ").strip()
+
+
+def read_tags(path):
+    """{"title", "artist", "album", "cover": bytes or None} from MP3 (ID3v2) and FLAC files, plus a cover image
+    in the same folder (cover.jpg, folder.jpg…). Never raises; falls back to the file name."""
+    out = {"title": os.path.splitext(os.path.basename(path))[0], "artist": "", "album": "", "cover": None}
+    try:
+        with open(path, "rb") as f:
+            head = f.read(10)
+            if head[:3] == b"ID3" and len(head) == 10:
+                major, flags, size = head[3], head[5], _syncsafe(head[6:10])
+                data = f.read(min(size, 20_000_000))
+                pos = 0
+                if flags & 0x40 and len(data) > 4:                        # extended header
+                    pos = (_syncsafe(data[:4]) if major == 4 else int.from_bytes(data[:4], "big") + 4)
+                while pos + 10 <= len(data):
+                    fid = data[pos:pos + 4]
+                    if not fid.strip(b"\x00"):
+                        break
+                    fsize = _syncsafe(data[pos + 4:pos + 8]) if major == 4 else int.from_bytes(data[pos + 4:pos + 8], "big")
+                    body = data[pos + 10:pos + 10 + fsize]
+                    pos += 10 + fsize
+                    if fid == b"TIT2":
+                        out["title"] = _id3_text(body) or out["title"]
+                    elif fid == b"TPE1":
+                        out["artist"] = _id3_text(body)
+                    elif fid == b"TALB":
+                        out["album"] = _id3_text(body)
+                    elif fid == b"APIC" and out["cover"] is None and len(body) > 4:
+                        enc = body[0]
+                        i = body.index(b"\x00", 1) + 1                    # MIME type
+                        i += 1                                            # picture type
+                        if enc in (1, 2):                                 # description (UTF-16 ends with two zeros)
+                            while i + 1 < len(body) and body[i:i + 2] != b"\x00\x00":
+                                i += 2
+                            i += 2
+                        else:
+                            i = body.index(b"\x00", i) + 1
+                        out["cover"] = body[i:]
+            elif head[:4] == b"fLaC":
+                f.seek(4)
+                last = False
+                while not last:
+                    h = f.read(4)
+                    if len(h) < 4:
+                        break
+                    last, btype, blen = bool(h[0] & 0x80), h[0] & 0x7F, int.from_bytes(h[1:4], "big")
+                    block = f.read(blen)
+                    if btype == 4:                                        # Vorbis comments
+                        p = 4 + int.from_bytes(block[:4], "little")
+                        n = int.from_bytes(block[p:p + 4], "little")
+                        p += 4
+                        for _ in range(min(n, 200)):
+                            ln = int.from_bytes(block[p:p + 4], "little")
+                            k, _, v = block[p + 4:p + 4 + ln].decode("utf-8", "replace").partition("=")
+                            p += 4 + ln
+                            k = k.upper()
+                            if k == "TITLE":
+                                out["title"] = v
+                            elif k == "ARTIST":
+                                out["artist"] = v
+                            elif k == "ALBUM":
+                                out["album"] = v
+                    elif btype == 6 and out["cover"] is None:            # picture
+                        p = 4
+                        ml = int.from_bytes(block[p:p + 4], "big")
+                        p += 4 + ml
+                        dl = int.from_bytes(block[p:p + 4], "big")
+                        p += 4 + dl + 16
+                        n = int.from_bytes(block[p:p + 4], "big")
+                        out["cover"] = block[p + 4:p + 4 + n]
+    except (OSError, ValueError, IndexError):
+        pass
+    if out["cover"] is None:
+        folder = os.path.dirname(path)
+        for name in ("cover.jpg", "folder.jpg", "Cover.jpg", "Folder.jpg", "cover.png", "front.jpg", "AlbumArt.jpg"):
+            p = os.path.join(folder, name)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "rb") as f:
+                        out["cover"] = f.read(8_000_000)
+                except OSError:
+                    pass
+                break
+    return out
+
+
+def rounded_cover(data, size, radius=12, title="♪"):
+    """Cover art as a square pixbuf with rounded corners (a coloured note when there's no cover)."""
+    pb = None
+    if data:
+        try:
+            loader = GdkPixbuf.PixbufLoader()
+            loader.write(data)
+            loader.close()
+            src = loader.get_pixbuf()
+            w, h = src.get_width(), src.get_height()
+            side = min(w, h)
+            pb = src.new_subpixbuf((w - side) // 2, (h - side) // 2, side, side).scale_simple(
+                size, size, GdkPixbuf.InterpType.BILINEAR)
+        except (GLib.Error, TypeError):
+            pb = None
+    if pb is None:
+        hue = sum(map(ord, title)) % 6
+        colours = ["#ff7a1a", "#2f7fd8", "#26a269", "#9141ac", "#e01b24", "#c64600"]
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">'
+               f'<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="{colours[hue]}"/>'
+               f'<stop offset="1" stop-color="#1b1b20"/></linearGradient></defs>'
+               f'<rect width="{size}" height="{size}" rx="{radius}" fill="url(#g)"/>'
+               f'<text x="50%" y="62%" font-size="{size // 2.4}" text-anchor="middle" fill="white" '
+               f'font-family="sans-serif">♪</text></svg>')
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf()
+    pb = pb.add_alpha(False, 0, 0, 0)
+    n, stride = pb.get_n_channels(), pb.get_rowstride()
+    px = bytearray(pb.get_pixels())
+    r2 = radius * radius
+    for y in range(size):
+        dy = radius - y if y < radius else (y - (size - 1 - radius) if y > size - 1 - radius else 0)
+        if not dy:
+            continue
+        for x in list(range(radius)) + list(range(size - radius, size)):
+            dx = radius - x if x < radius else x - (size - 1 - radius)
+            if dx * dx + dy * dy > r2:
+                px[y * stride + x * n + 3] = 0
+    return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(px)), GdkPixbuf.Colorspace.RGB, True, 8,
+                                           size, size, stride)
+
+
+class GstPlayer:
+    """Linux: GStreamer's playbin (MP3, FLAC, OGG… with Ubuntu's standard plugins)."""
+
+    def __init__(self, on_end):
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        self.Gst = Gst
+        self.pb = Gst.ElementFactory.make("playbin", "arckad-music")
+        if self.pb is None:
+            raise OSError("GStreamer's playbin is missing (install gstreamer1.0-plugins-base)")
+        bus = self.pb.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::eos", lambda *_: on_end())
+        bus.connect("message::error", lambda _b, msg: self._error(msg))
+        self.error, self.playing, self.on_end = None, False, on_end
+
+    def _error(self, msg):
+        err, _dbg = msg.parse_error()
+        self.error = err.message
+        self.playing = False
+        self.pb.set_state(self.Gst.State.NULL)
+
+    def load(self, path):
+        self.error = None
+        self.pb.set_state(self.Gst.State.NULL)
+        self.pb.set_property("uri", Gio.File.new_for_path(path).get_uri())
+
+    def play(self):
+        self.pb.set_state(self.Gst.State.PLAYING)
+        self.playing = True
+
+    def pause(self):
+        self.pb.set_state(self.Gst.State.PAUSED)
+        self.playing = False
+
+    def stop(self):
+        self.pb.set_state(self.Gst.State.NULL)
+        self.playing = False
+
+    def position(self):
+        ok, pos = self.pb.query_position(self.Gst.Format.TIME)
+        return pos / 1e9 if ok else 0.0
+
+    def duration(self):
+        ok, dur = self.pb.query_duration(self.Gst.Format.TIME)
+        return dur / 1e9 if ok and dur > 0 else 0.0
+
+    def seek(self, secs):
+        self.pb.seek_simple(self.Gst.Format.TIME, self.Gst.SeekFlags.FLUSH | self.Gst.SeekFlags.KEY_UNIT,
+                            int(max(0, secs) * 1e9))
+
+    def set_volume(self, v):
+        self.pb.set_property("volume", max(0.0, min(1.0, v)))
+
+    def poll(self):
+        pass
+
+
+class MciPlayer:
+    """Windows: the built-in Media Control Interface (MP3, WAV, WMA, and more with installed codecs)."""
+
+    def __init__(self, on_end):
+        import ctypes
+        self.mci = ctypes.windll.winmm.mciSendStringW
+        self.buf = ctypes.create_unicode_buffer(256)
+        self.on_end, self.playing, self.error, self.loaded, self.vol = on_end, False, None, False, 0.8
+
+    def _cmd(self, s):
+        err = self.mci(s, self.buf, 255, 0)
+        return self.buf.value if err == 0 else None
+
+    def load(self, path):
+        self.stop()
+        self._cmd("close arckadmusic")
+        self.error = None
+        if self._cmd(f'open "{path}" type mpegvideo alias arckadmusic') is None:
+            self.error = "Windows can't play this file type (a codec may be missing)."
+            self.loaded = False
+            return
+        self._cmd("set arckadmusic time format milliseconds")
+        self.loaded = True
+        self.set_volume(self.vol)
+
+    def play(self):
+        if self.loaded:
+            self._cmd("play arckadmusic")
+            self.playing = True
+
+    def pause(self):
+        if self.loaded:
+            self._cmd("pause arckadmusic")
+            self.playing = False
+
+    def stop(self):
+        if getattr(self, "loaded", False):
+            self._cmd("stop arckadmusic")
+        self.playing = False
+
+    def position(self):
+        v = self._cmd("status arckadmusic position") if self.loaded else None
+        return int(v) / 1000 if v and v.isdigit() else 0.0
+
+    def duration(self):
+        v = self._cmd("status arckadmusic length") if self.loaded else None
+        return int(v) / 1000 if v and v.isdigit() else 0.0
+
+    def seek(self, secs):
+        if self.loaded:
+            self._cmd(f"seek arckadmusic to {int(max(0, secs) * 1000)}")
+            if self.playing:
+                self._cmd("play arckadmusic")
+
+    def set_volume(self, v):
+        self.vol = max(0.0, min(1.0, v))
+        if self.loaded:
+            self._cmd(f"setaudio arckadmusic volume to {int(self.vol * 1000)}")
+
+    def poll(self):
+        """MCI has no end signal: notice the end ourselves."""
+        if self.playing and self.loaded and self._cmd("status arckadmusic mode") == "stopped":
+            self.playing = False
+            self.on_end()
+
+
+def make_player(on_end):
+    return MciPlayer(on_end) if IS_WIN else GstPlayer(on_end)
+
+
+WIDGET_CSS = b"""
+.arckad-widget-bg { background-color: transparent; }
+.arckad-widget { border-radius: 24px; color: #f2f2f5;
+  background-image: linear-gradient(160deg, rgba(58,58,66,0.96), rgba(20,20,24,0.97));
+  box-shadow: inset 0 1px rgba(255,255,255,0.10), 0 10px 30px rgba(0,0,0,0.45); padding: 14px; }
+.arckad-widget label { color: #f2f2f5; }
+.arckad-widget .w-dim { color: rgba(242,242,245,0.60); }
+.arckad-widget .w-clock { font-size: 26px; font-weight: 800; letter-spacing: 1px; }
+.arckad-widget .w-title { font-size: 16px; font-weight: 700; }
+.arckad-widget button.w-btn { min-width: 52px; min-height: 52px; border-radius: 16px; padding: 0;
+  background-image: linear-gradient(to bottom, rgba(70,70,80,0.95), rgba(36,36,42,0.95));
+  border: 1px solid rgba(255,255,255,0.08); box-shadow: inset 0 1px rgba(255,255,255,0.10); color: #ffffff;
+  font-size: 18px; }
+.arckad-widget button.w-btn:hover { border-color: #ff7a1a; box-shadow: 0 0 12px rgba(255,122,26,0.35); }
+.arckad-widget button.w-cover { padding: 0; border: none; background: none; box-shadow: none; }
+.arckad-widget progressbar trough { min-height: 4px; border-radius: 3px; background-color: rgba(255,255,255,0.18); border: none; }
+.arckad-widget progressbar progress { min-height: 4px; border-radius: 3px; background-image: none;
+  background-color: #ffffff; border: none; }
+.arckad-widget-mini { border-radius: 10px; background-image: linear-gradient(to right, rgba(40,40,46,0.92),
+  rgba(24,24,28,0.92)); }
+"""
+
+
+class MusicWidget(Gtk.Window):
+    """The floating music & clock widget."""
+
+    def __init__(self, win):
+        super().__init__(title="Arckad-D music")
+        self.win = win
+        self.queue, self.index = [], -1
+        self.tags = {}
+        self.player, self.player_error = None, None
+        self.collapsed = False
+        self._leave_timer = None
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.set_resizable(False)
+        visual = self.get_screen().get_rgba_visual()
+        if visual is not None:                       # rounded corners need a see-through window
+            self.set_visual(visual)
+            self.set_app_paintable(True)
+        css = Gtk.CssProvider()
+        css.load_from_data(WIDGET_CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10)
+        self.get_style_context().add_class("arckad-widget-bg")
+        import importlib.util
+        if importlib.util.find_spec("cairo"):          # rounded corners need it; without it they're square
+            self.connect("draw", self._draw_clear)
+        self.ev = Gtk.EventBox()
+        self.ev.set_visible_window(False)
+        self.add(self.ev)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=180,
+                               hhomogeneous=False, vhomogeneous=False)       # the slim strip really is slim
+        self.ev.add(self.stack)
+        self.stack.add_named(self._build_full(), "full")
+        mini = Gtk.Box(spacing=8, margin=4)
+        mini.get_style_context().add_class("arckad-widget-mini")
+        mini.set_size_request(300, 30)
+        self.mini_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, margin_start=10, margin_end=10)
+        self.mini_label.set_markup("<small>♪</small>")
+        mini.pack_start(self.mini_label, True, True, 0)
+        self.stack.add_named(mini, "mini")
+        self.ev.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK |
+                           Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.ev.connect("enter-notify-event", self._enter)
+        self.ev.connect("leave-notify-event", self._leave)
+        self.ev.connect("scroll-event", self._scroll)
+        self.ev.connect("button-press-event", self._press)
+        self.connect("delete-event", lambda *_: self.close_widget() or True)
+        self.connect("configure-event", self._moved)
+        pos = win.cfg.get("widget_pos")
+        if pos:
+            self.move(*pos)
+        else:
+            self.set_position(Gtk.WindowPosition.CENTER)
+        self.show_all()
+        self.stack.set_visible_child_name("full")
+        self._tick_id = GLib.timeout_add(500, self._tick)
+        self._tick()
+
+    # ---------- layout
+    def _build_full(self):
+        card = Gtk.Box(spacing=12)
+        card.get_style_context().add_class("arckad-widget")
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        top = Gtk.Box(spacing=8)
+        self.clock = Gtk.Label(xalign=0)
+        self.clock.get_style_context().add_class("w-clock")
+        self.date = Gtk.Label(xalign=1, valign=Gtk.Align.CENTER, hexpand=True)
+        self.date.get_style_context().add_class("w-dim")
+        top.pack_start(self.clock, False, False, 0)
+        top.pack_start(self.date, True, True, 0)
+        left.add(top)
+        self.covers = Gtk.Box(spacing=8)
+        left.add(self.covers)
+        self.fix_btn = Gtk.Button(label="⬇ Install media support")
+        self.fix_btn.set_tooltip_text("Adds the Ubuntu packages that play more music formats (asks for your password)")
+        self.fix_btn.connect("clicked", lambda *_: self.install_media())
+        self.fix_btn.set_no_show_all(True)
+        left.add(self.fix_btn)
+        self.artist = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=26)
+        self.artist.get_style_context().add_class("w-dim")
+        self.title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=26)
+        self.title.get_style_context().add_class("w-title")
+        left.add(self.artist)
+        left.add(self.title)
+        pev = Gtk.EventBox()                          # click the bar to jump
+        self.bar = Gtk.ProgressBar()
+        pev.add(self.bar)
+        pev.connect("button-press-event", self._seek_click)
+        left.add(pev)
+        times = Gtk.Box()
+        self.t_pos = Gtk.Label(xalign=0)
+        self.t_dur = Gtk.Label(xalign=1, hexpand=True)
+        for t in (self.t_pos, self.t_dur):
+            t.get_style_context().add_class("w-dim")
+        times.pack_start(self.t_pos, False, False, 0)
+        times.pack_start(self.t_dur, True, True, 0)
+        left.add(times)
+        card.pack_start(left, True, True, 0)
+        grid = Gtk.Grid(row_spacing=10, column_spacing=10, valign=Gtk.Align.CENTER)
+
+        def btn(label, tip, cb):
+            b = Gtk.Button(label=label)
+            b.get_style_context().add_class("w-btn")
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda *_: cb())
+            return b
+        self.play_btn = btn("▶", "Play / pause (Space)", self.toggle)
+        grid.attach(btn("＋", "Add songs", self.add_dialog), 0, 0, 1, 1)
+        grid.attach(self.play_btn, 1, 0, 1, 1)
+        grid.attach(btn("⏮", "Previous", self.prev), 0, 1, 1, 1)
+        grid.attach(btn("⏭", "Next", self.next), 1, 1, 1, 1)
+        card.pack_start(grid, False, False, 0)
+        card.set_size_request(470, -1)
+        self._refresh_track()
+        return card
+
+    @staticmethod
+    def _draw_clear(widget, cr):
+        cr.set_source_rgba(0, 0, 0, 0)
+        import cairo
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        return False
+
+    # ---------- the queue
+    def _ensure_player(self):
+        if self.player is None and self.player_error is None:
+            try:
+                self.player = make_player(lambda: GLib.idle_add(self._ended))
+                self.player.set_volume(self.win.cfg.get("widget_volume", 0.8))
+            except Exception as ex:
+                self.player_error = f"Music can't play here: {ex}"
+                if not IS_WIN and missing_features("media"):
+                    self.fix_btn.show()
+        return self.player
+
+    def add_songs(self, paths, play=False):
+        paths = [p for p in paths if is_audio(p)]
+        if not paths:
+            return 0
+        start = len(self.queue)
+        self.queue += paths
+        if play or self.index < 0:
+            self.play_index(start)
+        else:
+            self._refresh_track()
+        self.present()
+        return len(paths)
+
+    def replace(self, paths):
+        self.queue, self.index = [], -1
+        return self.add_songs(paths, play=True)
+
+    def play_index(self, i):
+        if not (0 <= i < len(self.queue)):
+            return
+        p = self._ensure_player()
+        self.index = i
+        if p:
+            p.load(self.queue[i])
+            p.play()
+        self._refresh_track()
+
+    def toggle(self):
+        p = self._ensure_player()
+        if not p or self.index < 0:
+            if self.queue:
+                self.play_index(0)
+            else:
+                self.add_dialog()
+            return
+        p.pause() if p.playing else p.play()
+        self._refresh_buttons()
+
+    def next(self):
+        if self.index + 1 < len(self.queue):
+            self.play_index(self.index + 1)
+
+    def prev(self):
+        p = self.player
+        if p and p.position() > 3:
+            p.seek(0)
+        elif self.index > 0:
+            self.play_index(self.index - 1)
+
+    def _ended(self):
+        if self.index + 1 < len(self.queue):
+            self.play_index(self.index + 1)
+        else:
+            self._refresh_buttons()
+        return False
+
+    def add_dialog(self):
+        dlg = Gtk.FileChooserNative(title="Add songs", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.set_select_multiple(True)
+        flt = Gtk.FileFilter()
+        flt.set_name("Music")
+        for e in sorted(PLAY_EXTS):
+            flt.add_pattern(f"*.{e}")
+            flt.add_pattern(f"*.{e.upper()}")
+        dlg.add_filter(flt)
+        music = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
+        if music and os.path.isdir(music):
+            dlg.set_current_folder(music)
+        if dlg.run() == Gtk.ResponseType.ACCEPT:
+            self.add_songs(dlg.get_filenames())
+        dlg.destroy()
+
+    # ---------- showing it
+    def _tags(self, path):
+        if path not in self.tags:
+            self.tags[path] = read_tags(path)
+        return self.tags[path]
+
+    def _refresh_track(self):
+        for c in self.covers.get_children():
+            self.covers.remove(c)
+        if self.index < 0 or not self.queue:
+            self.artist.set_text("Arckad-D")
+            self.title.set_text("Add songs with ＋")
+            self.covers.add(Gtk.Image.new_from_pixbuf(rounded_cover(None, 84, 14)))
+            self.covers.show_all()
+            self._refresh_buttons()
+            return
+        for k, i in enumerate(range(self.index, min(len(self.queue), self.index + 3))):
+            t = self._tags(self.queue[i])
+            size = 84 if k == 0 else 60
+            img = Gtk.Image.new_from_pixbuf(rounded_cover(t["cover"], size, 14 if k == 0 else 10, t["title"]))
+            if k == 0:
+                self.covers.add(img)
+            else:
+                b = Gtk.Button()
+                b.get_style_context().add_class("w-cover")
+                b.add(img)
+                b.set_opacity(0.55)
+                b.set_valign(Gtk.Align.CENTER)
+                b.set_tooltip_text(f"Play “{t['title']}”")
+                b.connect("clicked", lambda _b, i=i: self.play_index(i))
+                self.covers.add(b)
+        t = self._tags(self.queue[self.index])
+        self.artist.set_text(t["artist"] or t["album"] or os.path.basename(os.path.dirname(self.queue[self.index])))
+        self.title.set_text(t["title"])
+        self.covers.show_all()
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        playing = bool(self.player and self.player.playing)
+        self.play_btn.set_label("⏸" if playing else "▶")
+
+    @staticmethod
+    def _fmt(s):
+        s = int(s)
+        return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+    def _tick(self):
+        now = time.localtime()
+        self.clock.set_text(time.strftime("%H:%M", now))
+        self.date.set_text(time.strftime("%a %d %b", now))
+        p = self.player
+        if p:
+            p.poll()
+            pos, dur = p.position(), p.duration()
+            self.bar.set_fraction(min(1.0, pos / dur) if dur else 0.0)
+            self.t_pos.set_text(self._fmt(pos))
+            self.t_dur.set_text(self._fmt(dur) if dur else "")
+            if p.error:
+                self.artist.set_text("Can't play this file")
+                self.title.set_text(p.error[:60])
+                self.title.set_tooltip_text(p.error)
+                if not IS_WIN and not self.fix_btn.get_visible() and missing_features("media"):
+                    self.fix_btn.show()
+        elif self.player_error:
+            self.artist.set_text("No audio player")
+            self.title.set_text(self.player_error[:60])
+            self.title.set_tooltip_text(self.player_error)
+        t = self._tags(self.queue[self.index]) if 0 <= self.index < len(self.queue) else None
+        state = "⏸" if p and p.playing else "▶"
+        self.mini_label.set_markup(f"<small><b>{time.strftime('%H:%M', now)}</b>  {state}  "
+                                   f"{esc(t['title']) if t else 'Music'}</small>")
+        self._refresh_buttons()
+        return True
+
+    def install_media(self):
+        pkgs = [p for p, _w in missing_features("media")]
+        if not pkgs:
+            self.fix_btn.hide()
+            return
+        self.fix_btn.set_sensitive(False)
+        self.fix_btn.set_label("Installing… (enter your password)")
+
+        def work():
+            ok, msg = install_packages(pkgs)
+
+            def done():
+                self.fix_btn.set_sensitive(True)
+                self.fix_btn.set_label("⬇ Install media support")
+                if ok:
+                    self.fix_btn.hide()
+                    self.player, self.player_error = None, None   # a fresh player sees the new decoders
+                    if 0 <= self.index < len(self.queue):
+                        self.play_index(self.index)
+                self.win.info(("✓ " if ok else "✗ ") + msg)
+                return False
+            GLib.idle_add(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- mouse: auto-hide, drag, seek, volume
+    def autohide(self):
+        return self.win.cfg.get("widget_autohide", True)
+
+    def _enter(self, *_):
+        if self._leave_timer:
+            GLib.source_remove(self._leave_timer)
+            self._leave_timer = None
+        if self.collapsed:
+            self.collapsed = False
+            self.stack.set_visible_child_name("full")
+            self.resize(1, 1)
+        return False
+
+    def _leave(self, w, event):
+        if event.detail == Gdk.NotifyType.INFERIOR or not self.autohide():
+            return False
+        if self._leave_timer:
+            GLib.source_remove(self._leave_timer)
+
+        def collapse():
+            self._leave_timer = None
+            self.collapsed = True
+            self.stack.set_visible_child_name("mini")
+            self.resize(1, 1)
+            return False
+        self._leave_timer = GLib.timeout_add(1500, collapse)
+        return False
+
+    def _press(self, w, event):
+        if event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS:
+            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+            return True
+        if event.button == 3:
+            menu = Gtk.Menu()
+            ah = Gtk.CheckMenuItem(label="Auto-hide (shrink when the mouse leaves)")
+            ah.set_active(self.autohide())
+            ah.connect("toggled", lambda i: (self.win.cfg.__setitem__("widget_autohide", i.get_active()),
+                                             write_json(CONFIG_FILE, self.win.cfg)))
+            menu.append(ah)
+            st = Gtk.CheckMenuItem(label="Show when Arckad-D starts")
+            st.set_active(self.win.cfg.get("widget_autostart", False))
+            st.connect("toggled", lambda i: (self.win.cfg.__setitem__("widget_autostart", i.get_active()),
+                                             write_json(CONFIG_FILE, self.win.cfg)))
+            menu.append(st)
+            menu.append(Gtk.SeparatorMenuItem())
+            cl = Gtk.MenuItem(label="Clear the queue")
+            cl.connect("activate", lambda *_: (self.player and self.player.stop(), setattr(self, "queue", []),
+                                               setattr(self, "index", -1), self._refresh_track()))
+            menu.append(cl)
+            close = Gtk.MenuItem(label="Close the widget (stops the music)")
+            close.connect("activate", lambda *_: self.close_widget())
+            menu.append(close)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        return False
+
+    def _seek_click(self, w, event):
+        p = self.player
+        if p and p.duration():
+            p.seek(p.duration() * max(0.0, min(1.0, event.x / max(1, w.get_allocated_width()))))
+        return True
+
+    def _scroll(self, w, event):
+        p = self._ensure_player()
+        if not p:
+            return False
+        up = event.direction == Gdk.ScrollDirection.UP or (event.direction == Gdk.ScrollDirection.SMOOTH and
+                                                            event.get_scroll_deltas()[2] < 0)
+        v = max(0.0, min(1.0, self.win.cfg.get("widget_volume", 0.8) + (0.05 if up else -0.05)))
+        self.win.cfg["widget_volume"] = v
+        p.set_volume(v)
+        self.artist.set_text(f"🔊 Volume {int(v * 100)}%")
+        GLib.timeout_add(1200, lambda: self._refresh_track() or False)
+        return True
+
+    def _moved(self, *_):
+        if self.get_visible() and not self.collapsed:
+            self.win.cfg["widget_pos"] = list(self.get_position())
+        return False
+
+    def close_widget(self):
+        if self.player:
+            self.player.stop()
+        if self._tick_id:
+            GLib.source_remove(self._tick_id)
+            self._tick_id = None
+        write_json(CONFIG_FILE, self.win.cfg)
+        self.win.music = None
+        self.destroy()
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -13826,6 +14615,9 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
         self.start_freeze_watch()
+        GLib.timeout_add_seconds(20, self._features_hint)
+        if self.cfg.get("widget_autostart"):
+            GLib.timeout_add_seconds(2, lambda: self.music_widget() and False)
         if not IS_WIN:
             GLib.timeout_add_seconds(120, self._tracker_guard_tick)
             GLib.timeout_add_seconds(300, self._tracker_activity_tick)
@@ -13972,6 +14764,8 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Receive files…", lambda: self.open_share(None, "receive")),
             None,
             ("Update search index now", INDEX.rebuild),
+            ("🎵 Music & clock widget", self.music_widget),
+        ] + ([("Install optional features…", self.features_dialog)] if not IS_WIN else []) + [
             ("Search index settings…", self.index_settings),
             ("Freeze report…", self.freeze_report),
         ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else [])))
@@ -14972,6 +15766,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self.open_file(path)
 
     def open_file(self, path):
+        default = (self.cfg.get("default_apps") or {}).get(ext_of(os.path.basename(path)))
+        if default and os.path.isfile(path):
+            self.launch_entry(path, default, remember=False)
+            return
         gfile = Gio.File.new_for_path(path)
         try:
             open_default(path)
@@ -14984,6 +15782,249 @@ class MainWindow(Gtk.ApplicationWindow):
             pass
         if self.active:
             self.active.flash(f"Opened {os.path.basename(path)}")
+
+    # ---------- Open with: remembered apps first, then everything the system knows, then any program
+    def _remembered_apps(self, path):
+        return (self.cfg.get("open_with") or {}).get(ext_of(os.path.basename(path)) or "*", [])
+
+    def _remember_app(self, path, entry):
+        key = ext_of(os.path.basename(path)) or "*"
+        lst = [e for e in (self.cfg.setdefault("open_with", {}).get(key) or []) if e != entry]
+        self.cfg["open_with"][key] = ([entry] + lst)[:5]
+        write_json(CONFIG_FILE, self.cfg)
+
+    @staticmethod
+    def _app_by_id(app_id):
+        for a in Gio.AppInfo.get_all():
+            if a.get_id() == app_id:
+                return a
+        return None
+
+    def launch_entry(self, path, entry, remember=True):
+        """Open a file with a remembered or chosen app ({"id": app id} or {"exe": program path})."""
+        try:
+            if entry.get("exe"):
+                subprocess.Popen([entry["exe"], path], cwd=os.path.dirname(path) or None)
+            else:
+                app = self._app_by_id(entry["id"])
+                if not app:
+                    self.error(f"“{entry.get('name', 'That app')}” isn't installed any more.")
+                    return
+                app.launch([Gio.File.new_for_path(path)], None)
+        except (OSError, GLib.Error) as ex:
+            self.error(f"Couldn't open it with {entry.get('name', 'that app')}:\n\n{ex}")
+            return
+        if remember:
+            self._remember_app(path, entry)
+        Gtk.RecentManager.get_default().add_item(Gio.File.new_for_path(path).get_uri())
+        self.active.flash(f"Opened {os.path.basename(path)} with {entry.get('name', 'the app')}")
+
+    def open_with_menu(self, path):
+        menu = Gtk.Menu()
+        seen = set()
+
+        def item(label, cb):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda *_: cb())
+            menu.append(it)
+        for e in self._remembered_apps(path):                     # what you used last for this type
+            key = e.get("id") or e.get("exe")
+            if key in seen:
+                continue
+            seen.add(key)
+            item(f"⭐ {e.get('name', key)}", lambda e=e: self.launch_entry(path, e))
+        apps = self.apps_for_type(path)
+        for a in apps[:12]:
+            if a.get_id() in seen or not a.should_show():
+                continue
+            seen.add(a.get_id())
+            item(a.get_display_name(), lambda a=a: self.launch_entry(path, {"id": a.get_id(), "name": a.get_display_name()}))
+        if len(menu.get_children()):
+            menu.append(Gtk.SeparatorMenuItem())
+        item("Other application… (all installed apps)", lambda: self.other_app(path))
+        item("Choose a program file…", lambda: self.choose_program(path))
+        if IS_WIN:
+            item("Windows' Open with…", lambda: subprocess.Popen(["rundll32.exe", "shell32.dll,OpenAs_RunDLL", path]))
+        ext = ext_of(os.path.basename(path))
+        if ext:
+            default = (self.cfg.get("default_apps") or {}).get(ext)
+            menu.append(Gtk.SeparatorMenuItem())
+            if default:
+                item(f"Stop always using {default.get('name', 'that app')} for .{ext}",
+                     lambda: (self.cfg["default_apps"].pop(ext, None), write_json(CONFIG_FILE, self.cfg)))
+            item(f"Always open .{ext} files with…", lambda: self.other_app(path, make_default=True))
+        menu.show_all()
+        return menu
+
+    @staticmethod
+    def apps_for_type(path):
+        """Apps that can open this kind of file: the system's list, plus every installed app whose own entry says
+        it handles the type (or a broader one, e.g. all text). The system's list misses apps added outside the
+        package manager (AppImages, hand-made launchers), because its index isn't updated for them."""
+        ctype, _unc = Gio.content_type_guess(path, None)
+        out, seen = [], set()
+        try:
+            for a in (Gio.AppInfo.get_all_for_type(ctype) if ctype else []):
+                if a.get_id() not in seen:
+                    seen.add(a.get_id())
+                    out.append(a)
+        except Exception:
+            pass
+        if ctype and not IS_WIN:
+            for a in Gio.AppInfo.get_all():
+                if a.get_id() in seen or not a.should_show():
+                    continue
+                try:
+                    types = a.get_supported_types() or []
+                except Exception:
+                    types = []
+                if any(t == ctype or Gio.content_type_is_a(ctype, t) for t in types):
+                    seen.add(a.get_id())
+                    out.append(a)
+        return out
+
+    def other_app(self, path, make_default=False):
+        """Every installed app (not only the ones registered for this type), with a search box."""
+        d = Gtk.Dialog(title=("Always open with…" if make_default else "Open with…"), transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Open", Gtk.ResponseType.OK)
+        d.set_default_size(420, 520)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(10)
+        search = Gtk.SearchEntry(placeholder_text="Search apps")
+        box.add(search)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        lb = Gtk.ListBox()
+        apps = sorted((a for a in Gio.AppInfo.get_all() if a.should_show()), key=lambda a: a.get_display_name().lower())
+        for a in apps:
+            r = Gtk.ListBoxRow()
+            r.app = a
+            hb = Gtk.Box(spacing=8, margin=4)
+            icon = a.get_icon()
+            hb.add(Gtk.Image.new_from_gicon(icon, Gtk.IconSize.LARGE_TOOLBAR) if icon else Gtk.Image())
+            hb.add(Gtk.Label(label=a.get_display_name(), xalign=0))
+            r.add(hb)
+            lb.add(r)
+        lb.set_filter_func(lambda r: search.get_text().lower() in r.app.get_display_name().lower())
+        search.connect("search-changed", lambda *_: lb.invalidate_filter())
+        lb.connect("row-activated", lambda *_: d.response(Gtk.ResponseType.OK))
+        sw.add(lb)
+        box.pack_start(sw, True, True, 0)
+        prog = Gtk.Button(label="Not in the list? Choose a program file…")
+        prog.connect("clicked", lambda *_: (d.response(Gtk.ResponseType.CANCEL), self.choose_program(path, make_default)))
+        box.add(prog)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK and lb.get_selected_row():
+            a = lb.get_selected_row().app
+            entry = {"id": a.get_id(), "name": a.get_display_name()}
+            if make_default:
+                self.cfg.setdefault("default_apps", {})[ext_of(os.path.basename(path))] = entry
+            self.launch_entry(path, entry)
+        d.destroy()
+
+    def choose_program(self, path, make_default=False):
+        fc = Gtk.FileChooserNative(title="Choose the program to open it with", transient_for=self,
+                                   action=Gtk.FileChooserAction.OPEN)
+        if IS_WIN:
+            flt = Gtk.FileFilter()
+            flt.set_name("Programs")
+            flt.add_pattern("*.exe")
+            fc.add_filter(flt)
+            fc.set_current_folder(os.environ.get("ProgramFiles", "C:\\Program Files"))
+        else:
+            fc.set_current_folder("/usr/bin")
+        if fc.run() == Gtk.ResponseType.ACCEPT:
+            exe = fc.get_filename()
+            if not IS_WIN and not os.access(exe, os.X_OK):
+                self.error("That file isn't a program (it can't be run).")
+            else:
+                entry = {"exe": exe, "name": os.path.splitext(os.path.basename(exe))[0]}
+                if make_default:
+                    self.cfg.setdefault("default_apps", {})[ext_of(os.path.basename(path))] = entry
+                self.launch_entry(path, entry)
+        fc.destroy()
+
+    def features_dialog(self):
+        d = Gtk.Dialog(title="Optional features", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(560, -1)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
+        intro.set_markup("Arckad-D works without these, but each one adds something. Updates from inside Arckad-D "
+                         "install them automatically; if Arckad-D was installed another way, add the missing ones here "
+                         "(one password prompt).")
+        box.add(intro)
+        grid = Gtk.Grid(column_spacing=12, row_spacing=6)
+        missing = []
+        for i, (pkgs, what, _grp) in enumerate(OPTIONAL_FEATURES):
+            have = any(package_installed(p) for p in pkgs)
+            if not have:
+                missing.append(pkgs[0])
+            mark = Gtk.Label()
+            mark.set_markup(f"<span foreground='{skin_color('ok') if have else '#e01b24'}'><b>{'✓' if have else '✗'}</b></span>")
+            grid.attach(mark, 0, i, 1, 1)
+            grid.attach(Gtk.Label(label=what, xalign=0), 1, i, 1, 1)
+            pl = Gtk.Label(xalign=0)
+            pl.set_markup(f"<small><tt>{esc(' or '.join(pkgs))}</tt></small>")
+            pl.get_style_context().add_class("dim-label")
+            grid.attach(pl, 2, i, 1, 1)
+        box.add(grid)
+        status = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
+        box.add(status)
+        btn = Gtk.Button(label=f"⬇ Install the {len(missing)} missing" if missing else "✓ Everything is installed")
+        btn.set_sensitive(bool(missing))
+        if missing:
+            btn.get_style_context().add_class("suggested-action")
+
+        def install(*_):
+            btn.set_sensitive(False)
+            btn.set_label("Installing… (enter your password)")
+
+            def work():
+                ok, msg = install_packages(missing)
+                GLib.idle_add(lambda: (status.set_markup(("✓ " if ok else "✗ ") + esc(msg)),
+                                       btn.set_label("✓ Done — restart Arckad-D to use everything" if ok else "Try again"),
+                                       btn.set_sensitive(not ok)) and False)
+            threading.Thread(target=work, daemon=True).start()
+        btn.connect("clicked", install)
+        box.add(btn)
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    def _features_hint(self):
+        """Once per version: mention useful features that aren't installed (Ubuntu)."""
+        if IS_WIN or self.cfg.get("features_hint_for") == APP_VERSION:
+            return False
+
+        def work():
+            missing = missing_features()
+            if missing:
+                GLib.idle_add(lambda: self.show_toast(
+                    "Some optional features aren't installed",
+                    f"{len(missing)} extras (e.g. {missing[0][1].split(':')[0]}). Click to see and install them.",
+                    None, self.features_dialog) or False)
+            self.cfg["features_hint_for"] = APP_VERSION
+            write_json(CONFIG_FILE, self.cfg)
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    # ---------- the music & clock widget
+    def music_widget(self):
+        if not getattr(self, "music", None):
+            self.music = MusicWidget(self)
+        self.music.present()
+        return self.music
+
+    def music_play(self, paths):
+        n = self.music_widget().replace(paths)
+        self.active.flash(f"🎵 Playing {n} song{'s' if n != 1 else ''} in the widget")
+
+    def music_add(self, paths):
+        n = self.music_widget().add_songs(paths)
+        self.active.flash(f"🎵 Added {n} song{'s' if n != 1 else ''} to the widget")
 
     def open_with(self, path):
         if IS_WIN:
