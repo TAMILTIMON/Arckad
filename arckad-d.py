@@ -90,7 +90,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.30.1"
+APP_VERSION = "3.31.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2608,8 +2608,8 @@ class FilePane(Gtk.Box):
             audio = [p for p in paths if is_audio(p)] or [f for d in paths if os.path.isdir(d)
                                                         for f in sorted_audio_in(d)]
             if audio:
-                add(f"🎵 Play in widget ({len(audio)})", lambda: win.music_play(audio))
-                add("🎵 Add to widget queue", lambda: win.music_add(audio))
+                add(f"🎵 Play in music player ({len(audio)})", lambda: win.music_play(audio))
+                add("🎵 Add to the music player's queue", lambda: win.music_add(audio))
             if all(archive_kind(p) for p in paths) and self.mode == "folder":
                 add("Extract here", lambda: win.extract(self, paths, self.location))
                 add("Extract to…", lambda: win.extract_to(self, paths))
@@ -13951,12 +13951,37 @@ class MciPlayer:
         err = self.mci(s, self.buf, 255, 0)
         return self.buf.value if err == 0 else None
 
+    def _err_text(self, code):
+        import ctypes
+        b = ctypes.create_unicode_buffer(256)
+        ctypes.windll.winmm.mciGetErrorStringW(code, b, 255)
+        return b.value or f"error {code}"
+
+    @staticmethod
+    def _short(path):
+        """The old 8.3 form of a path (Windows' player engine copes better with it: no spaces or long names)."""
+        import ctypes
+        b = ctypes.create_unicode_buffer(1024)
+        n = ctypes.windll.kernel32.GetShortPathNameW(path, b, 1024)
+        return b.value if 0 < n < 1024 else path
+
     def load(self, path):
         self.stop()
         self._cmd("close arckadmusic")
         self.error = None
-        if self._cmd(f'open "{path}" type mpegvideo alias arckadmusic') is None:
-            self.error = "Windows can't play this file type (a codec may be missing)."
+        last = 0
+        for p in (path, self._short(path)):
+            for how in ("type mpegvideo ", ""):           # the media player engine, or let Windows choose
+                last = self.mci(f'open "{p}" {how}alias arckadmusic', self.buf, 255, 0)
+                if last == 0:
+                    break
+            if last == 0:
+                break
+        if last != 0:
+            ext = ext_of(os.path.basename(path)).upper() or "this"
+            self.error = (f"Windows can't play {ext} files here: {self._err_text(last)}"
+                          + (" (Windows' built-in player doesn't handle FLAC/OGG/OPUS; MP3, WAV and WMA work)"
+                             if ext in ("FLAC", "OGG", "OGA", "OPUS") else ""))
             self.loaded = False
             return
         self._cmd("set arckadmusic time format milliseconds")
@@ -14009,119 +14034,91 @@ def make_player(on_end):
 
 
 WIDGET_CSS = b"""
-.arckad-widget-bg { background-color: transparent; }
-.arckad-widget { border-radius: 24px; color: #f2f2f5;
-  background-image: linear-gradient(160deg, rgba(58,58,66,0.96), rgba(20,20,24,0.97));
-  box-shadow: inset 0 1px rgba(255,255,255,0.10), 0 10px 30px rgba(0,0,0,0.45); padding: 14px; }
-.arckad-widget label { color: #f2f2f5; }
-.arckad-widget .w-dim { color: rgba(242,242,245,0.60); }
-.arckad-widget .w-clock { font-size: 26px; font-weight: 800; letter-spacing: 1px; }
-.arckad-widget .w-title { font-size: 16px; font-weight: 700; }
-.arckad-widget button.w-btn { min-width: 52px; min-height: 52px; border-radius: 16px; padding: 0;
-  background-image: linear-gradient(to bottom, rgba(70,70,80,0.95), rgba(36,36,42,0.95));
-  border: 1px solid rgba(255,255,255,0.08); box-shadow: inset 0 1px rgba(255,255,255,0.10); color: #ffffff;
-  font-size: 18px; }
-.arckad-widget button.w-btn:hover { border-color: #ff7a1a; box-shadow: 0 0 12px rgba(255,122,26,0.35); }
-.arckad-widget button.w-cover { padding: 0; border: none; background: none; box-shadow: none; }
-.arckad-widget progressbar trough { min-height: 4px; border-radius: 3px; background-color: rgba(255,255,255,0.18); border: none; }
-.arckad-widget progressbar progress { min-height: 4px; border-radius: 3px; background-image: none;
-  background-color: #ffffff; border: none; }
-.arckad-widget-mini { border-radius: 10px; background-image: linear-gradient(to right, rgba(40,40,46,0.92),
-  rgba(24,24,28,0.92)); }
+.arckad-player { color: #f2f2f5; border-top: 1px solid rgba(255,255,255,0.08);
+  background-image: linear-gradient(to bottom, rgba(46,46,54,0.98), rgba(22,22,26,0.98)); padding: 8px 12px; }
+.arckad-player label { color: #f2f2f5; }
+.arckad-player .w-dim { color: rgba(242,242,245,0.62); }
+.arckad-player .w-clock { font-size: 22px; font-weight: 800; letter-spacing: 1px; }
+.arckad-player .w-title { font-size: 14px; font-weight: 700; }
+.arckad-player button.w-btn { min-width: 40px; min-height: 40px; border-radius: 13px; padding: 0;
+  background-image: linear-gradient(to bottom, rgba(70,70,80,0.95), rgba(36,36,42,0.95)); background-color: #2a2a31;
+  border: 1px solid rgba(255,255,255,0.08); box-shadow: inset 0 1px rgba(255,255,255,0.10); color: #ffffff; }
+.arckad-player button.w-btn label { color: #ffffff; }
+.arckad-player button.w-btn:hover { border-color: #ff7a1a; box-shadow: 0 0 10px rgba(255,122,26,0.35); }
+.arckad-player button.w-close { min-width: 26px; min-height: 26px; padding: 0; border-radius: 13px;
+  background-image: none; background-color: rgba(255,255,255,0.08); border: none; box-shadow: none; }
+.arckad-player button.w-close label { color: #ffffff; }
+.arckad-player button.w-close:hover { background-color: #e01b24; }
+.arckad-player button.w-cover { padding: 0; border: none; background: none; box-shadow: none; }
+.arckad-player progressbar trough { min-height: 4px; border-radius: 3px; background-color: rgba(255,255,255,0.18); border: none; }
+.arckad-player progressbar progress { min-height: 4px; border-radius: 3px; background-image: none;
+  background-color: #ff7a1a; border: none; }
+.arckad-player-mini { padding: 3px 12px; }
 """
 
 
-class MusicWidget(Gtk.Window):
-    """The floating music & clock widget."""
+class MusicBar(Gtk.EventBox):
+    """The music player with a clock, as a bar INSIDE Arckad-D's window (bottom). Auto-hide: when the mouse leaves
+    it shrinks to a thin line with the time and song; over the line it opens again. Off = hidden and silent."""
 
     def __init__(self, win):
-        super().__init__(title="Arckad-D music")
+        super().__init__()
         self.win = win
         self.queue, self.index = [], -1
         self.tags = {}
         self.player, self.player_error = None, None
-        self.collapsed = False
-        self._leave_timer = None
-        self.set_decorated(False)
-        self.set_keep_above(True)
-        self.set_skip_taskbar_hint(True)
-        self.set_skip_pager_hint(True)
-        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
-        self.set_resizable(False)
-        visual = self.get_screen().get_rgba_visual()
-        if visual is not None:                       # rounded corners need a see-through window
-            self.set_visual(visual)
-            self.set_app_paintable(True)
+        self.collapsed, self._leave_timer = False, None
         css = Gtk.CssProvider()
         css.load_from_data(WIDGET_CSS)
-        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10)
-        self.get_style_context().add_class("arckad-widget-bg")
-        import importlib.util
-        if importlib.util.find_spec("cairo"):          # rounded corners need it; without it they're square
-            self.connect("draw", self._draw_clear)
-        self.ev = Gtk.EventBox()
-        self.ev.set_visible_window(False)
-        self.add(self.ev)
-        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=180,
-                               hhomogeneous=False, vhomogeneous=False)       # the slim strip really is slim
-        self.ev.add(self.stack)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 10)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_UP_DOWN, transition_duration=160,
+                               hhomogeneous=False, vhomogeneous=False)
+        self.add(self.stack)
         self.stack.add_named(self._build_full(), "full")
-        mini = Gtk.Box(spacing=8, margin=4)
-        mini.get_style_context().add_class("arckad-widget-mini")
-        mini.set_size_request(300, 30)
-        self.mini_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, margin_start=10, margin_end=10)
-        self.mini_label.set_markup("<small>♪</small>")
-        mini.pack_start(self.mini_label, True, True, 0)
+        mini = Gtk.Box(spacing=10)
+        mini.get_style_context().add_class("arckad-player")
+        mini.get_style_context().add_class("arckad-player-mini")
+        self.mini_label = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        mini.pack_start(self.mini_label, False, False, 0)
+        self.mini_bar = Gtk.ProgressBar(valign=Gtk.Align.CENTER, hexpand=True)
+        mini.pack_start(self.mini_bar, True, True, 0)
         self.stack.add_named(mini, "mini")
-        self.ev.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK |
-                           Gdk.EventMask.SCROLL_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
-        self.ev.connect("enter-notify-event", self._enter)
-        self.ev.connect("leave-notify-event", self._leave)
-        self.ev.connect("scroll-event", self._scroll)
-        self.ev.connect("button-press-event", self._press)
-        self.connect("delete-event", lambda *_: self.close_widget() or True)
-        self.connect("configure-event", self._moved)
-        pos = win.cfg.get("widget_pos")
-        if pos:
-            self.move(*pos)
-        else:
-            self.set_position(Gtk.WindowPosition.CENTER)
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK | Gdk.EventMask.SCROLL_MASK)
+        self.connect("enter-notify-event", self._enter)
+        self.connect("leave-notify-event", self._leave)
+        self.connect("scroll-event", self._scroll)
         self.show_all()
         self.stack.set_visible_child_name("full")
         self._tick_id = GLib.timeout_add(500, self._tick)
         self._tick()
 
-    # ---------- layout
+    # ---------- layout: [clock] [covers] [title, progress] [⏮ ▶ ⏭ ＋] [✕]
     def _build_full(self):
-        card = Gtk.Box(spacing=12)
-        card.get_style_context().add_class("arckad-widget")
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        top = Gtk.Box(spacing=8)
+        bar = Gtk.Box(spacing=14)
+        bar.get_style_context().add_class("arckad-player")
+        clock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
         self.clock = Gtk.Label(xalign=0)
         self.clock.get_style_context().add_class("w-clock")
-        self.date = Gtk.Label(xalign=1, valign=Gtk.Align.CENTER, hexpand=True)
+        self.date = Gtk.Label(xalign=0)
         self.date.get_style_context().add_class("w-dim")
-        top.pack_start(self.clock, False, False, 0)
-        top.pack_start(self.date, True, True, 0)
-        left.add(top)
-        self.covers = Gtk.Box(spacing=8)
-        left.add(self.covers)
-        self.fix_btn = Gtk.Button(label="⬇ Install media support")
-        self.fix_btn.set_tooltip_text("Adds the Ubuntu packages that play more music formats (asks for your password)")
-        self.fix_btn.connect("clicked", lambda *_: self.install_media())
-        self.fix_btn.set_no_show_all(True)
-        left.add(self.fix_btn)
-        self.artist = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=26)
+        clock.add(self.clock)
+        clock.add(self.date)
+        bar.pack_start(clock, False, False, 0)
+        self.covers = Gtk.Box(spacing=6, valign=Gtk.Align.CENTER)
+        bar.pack_start(self.covers, False, False, 0)
+        mid = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, valign=Gtk.Align.CENTER)
+        self.artist = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
         self.artist.get_style_context().add_class("w-dim")
-        self.title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=26)
+        self.title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
         self.title.get_style_context().add_class("w-title")
-        left.add(self.artist)
-        left.add(self.title)
-        pev = Gtk.EventBox()                          # click the bar to jump
+        mid.add(self.artist)
+        mid.add(self.title)
+        pev = Gtk.EventBox()
         self.bar = Gtk.ProgressBar()
         pev.add(self.bar)
         pev.connect("button-press-event", self._seek_click)
-        left.add(pev)
+        mid.add(pev)
         times = Gtk.Box()
         self.t_pos = Gtk.Label(xalign=0)
         self.t_dur = Gtk.Label(xalign=1, hexpand=True)
@@ -14129,36 +14126,32 @@ class MusicWidget(Gtk.Window):
             t.get_style_context().add_class("w-dim")
         times.pack_start(self.t_pos, False, False, 0)
         times.pack_start(self.t_dur, True, True, 0)
-        left.add(times)
-        card.pack_start(left, True, True, 0)
-        grid = Gtk.Grid(row_spacing=10, column_spacing=10, valign=Gtk.Align.CENTER)
+        mid.add(times)
+        self.fix_btn = Gtk.Button(label="⬇ Install media support")
+        self.fix_btn.set_tooltip_text("Adds the Ubuntu packages that play more music formats (asks for your password)")
+        self.fix_btn.connect("clicked", lambda *_: self.install_media())
+        self.fix_btn.set_no_show_all(True)
+        mid.add(self.fix_btn)
+        bar.pack_start(mid, True, True, 0)
 
-        def btn(label, tip, cb):
-            b = Gtk.Button(label=label)
-            b.get_style_context().add_class("w-btn")
+        def btn(label, tip, cb, cls="w-btn"):
+            b = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+            b.get_style_context().add_class(cls)
             b.set_tooltip_text(tip)
             b.connect("clicked", lambda *_: cb())
             return b
-        self.play_btn = btn("▶", "Play / pause (Space)", self.toggle)
-        grid.attach(btn("＋", "Add songs", self.add_dialog), 0, 0, 1, 1)
-        grid.attach(self.play_btn, 1, 0, 1, 1)
-        grid.attach(btn("⏮", "Previous", self.prev), 0, 1, 1, 1)
-        grid.attach(btn("⏭", "Next", self.next), 1, 1, 1, 1)
-        card.pack_start(grid, False, False, 0)
-        card.set_size_request(470, -1)
+        self.play_btn = btn("▶", "Play / pause", self.toggle)
+        for b in (btn("⏮", "Previous", self.prev), self.play_btn, btn("⏭", "Next", self.next),
+                  btn("＋", "Add songs", self.add_dialog)):
+            bar.pack_start(b, False, False, 0)
+        opts = btn("⋯", "Options", self.options_menu, "w-close")
+        bar.pack_start(opts, False, False, 0)
+        bar.pack_start(btn("✕", "Turn the music player off (stops the music)", self.close_widget, "w-close"), False, False, 0)
+        self._opts_btn = opts
         self._refresh_track()
-        return card
+        return bar
 
-    @staticmethod
-    def _draw_clear(widget, cr):
-        cr.set_source_rgba(0, 0, 0, 0)
-        import cairo
-        cr.set_operator(cairo.OPERATOR_SOURCE)
-        cr.paint()
-        cr.set_operator(cairo.OPERATOR_OVER)
-        return False
-
-    # ---------- the queue
+    # ---------- the queue (same as before)
     def _ensure_player(self):
         if self.player is None and self.player_error is None:
             try:
@@ -14180,10 +14173,11 @@ class MusicWidget(Gtk.Window):
             self.play_index(start)
         else:
             self._refresh_track()
-        self.present()
         return len(paths)
 
     def replace(self, paths):
+        if self.player:
+            self.player.stop()
         self.queue, self.index = [], -1
         return self.add_songs(paths, play=True)
 
@@ -14192,6 +14186,7 @@ class MusicWidget(Gtk.Window):
             return
         p = self._ensure_player()
         self.index = i
+        self.fix_btn.hide()
         if p:
             p.load(self.queue[i])
             p.play()
@@ -14227,7 +14222,7 @@ class MusicWidget(Gtk.Window):
         return False
 
     def add_dialog(self):
-        dlg = Gtk.FileChooserNative(title="Add songs", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dlg = Gtk.FileChooserNative(title="Add songs", transient_for=self.win, action=Gtk.FileChooserAction.OPEN)
         dlg.set_select_multiple(True)
         flt = Gtk.FileFilter()
         flt.set_name("Music")
@@ -14241,80 +14236,6 @@ class MusicWidget(Gtk.Window):
         if dlg.run() == Gtk.ResponseType.ACCEPT:
             self.add_songs(dlg.get_filenames())
         dlg.destroy()
-
-    # ---------- showing it
-    def _tags(self, path):
-        if path not in self.tags:
-            self.tags[path] = read_tags(path)
-        return self.tags[path]
-
-    def _refresh_track(self):
-        for c in self.covers.get_children():
-            self.covers.remove(c)
-        if self.index < 0 or not self.queue:
-            self.artist.set_text("Arckad-D")
-            self.title.set_text("Add songs with ＋")
-            self.covers.add(Gtk.Image.new_from_pixbuf(rounded_cover(None, 84, 14)))
-            self.covers.show_all()
-            self._refresh_buttons()
-            return
-        for k, i in enumerate(range(self.index, min(len(self.queue), self.index + 3))):
-            t = self._tags(self.queue[i])
-            size = 84 if k == 0 else 60
-            img = Gtk.Image.new_from_pixbuf(rounded_cover(t["cover"], size, 14 if k == 0 else 10, t["title"]))
-            if k == 0:
-                self.covers.add(img)
-            else:
-                b = Gtk.Button()
-                b.get_style_context().add_class("w-cover")
-                b.add(img)
-                b.set_opacity(0.55)
-                b.set_valign(Gtk.Align.CENTER)
-                b.set_tooltip_text(f"Play “{t['title']}”")
-                b.connect("clicked", lambda _b, i=i: self.play_index(i))
-                self.covers.add(b)
-        t = self._tags(self.queue[self.index])
-        self.artist.set_text(t["artist"] or t["album"] or os.path.basename(os.path.dirname(self.queue[self.index])))
-        self.title.set_text(t["title"])
-        self.covers.show_all()
-        self._refresh_buttons()
-
-    def _refresh_buttons(self):
-        playing = bool(self.player and self.player.playing)
-        self.play_btn.set_label("⏸" if playing else "▶")
-
-    @staticmethod
-    def _fmt(s):
-        s = int(s)
-        return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
-
-    def _tick(self):
-        now = time.localtime()
-        self.clock.set_text(time.strftime("%H:%M", now))
-        self.date.set_text(time.strftime("%a %d %b", now))
-        p = self.player
-        if p:
-            p.poll()
-            pos, dur = p.position(), p.duration()
-            self.bar.set_fraction(min(1.0, pos / dur) if dur else 0.0)
-            self.t_pos.set_text(self._fmt(pos))
-            self.t_dur.set_text(self._fmt(dur) if dur else "")
-            if p.error:
-                self.artist.set_text("Can't play this file")
-                self.title.set_text(p.error[:60])
-                self.title.set_tooltip_text(p.error)
-                if not IS_WIN and not self.fix_btn.get_visible() and missing_features("media"):
-                    self.fix_btn.show()
-        elif self.player_error:
-            self.artist.set_text("No audio player")
-            self.title.set_text(self.player_error[:60])
-            self.title.set_tooltip_text(self.player_error)
-        t = self._tags(self.queue[self.index]) if 0 <= self.index < len(self.queue) else None
-        state = "⏸" if p and p.playing else "▶"
-        self.mini_label.set_markup(f"<small><b>{time.strftime('%H:%M', now)}</b>  {state}  "
-                                   f"{esc(t['title']) if t else 'Music'}</small>")
-        self._refresh_buttons()
-        return True
 
     def install_media(self):
         pkgs = [p for p, _w in missing_features("media")]
@@ -14332,7 +14253,7 @@ class MusicWidget(Gtk.Window):
                 self.fix_btn.set_label("⬇ Install media support")
                 if ok:
                     self.fix_btn.hide()
-                    self.player, self.player_error = None, None   # a fresh player sees the new decoders
+                    self.player, self.player_error = None, None
                     if 0 <= self.index < len(self.queue):
                         self.play_index(self.index)
                 self.win.info(("✓ " if ok else "✗ ") + msg)
@@ -14340,7 +14261,83 @@ class MusicWidget(Gtk.Window):
             GLib.idle_add(done)
         threading.Thread(target=work, daemon=True).start()
 
-    # ---------- mouse: auto-hide, drag, seek, volume
+    # ---------- showing it
+    def _tags(self, path):
+        if path not in self.tags:
+            self.tags[path] = read_tags(path)
+        return self.tags[path]
+
+    def _refresh_track(self):
+        for c in self.covers.get_children():
+            self.covers.remove(c)
+        if self.index < 0 or not self.queue:
+            self.artist.set_text("Music player")
+            self.title.set_text("Right-click songs → Play in music player, or press ＋")
+            self.covers.add(Gtk.Image.new_from_pixbuf(rounded_cover(None, 56, 12)))
+            self.covers.show_all()
+            self._refresh_buttons()
+            return
+        for k, i in enumerate(range(self.index, min(len(self.queue), self.index + 3))):
+            t = self._tags(self.queue[i])
+            size = 56 if k == 0 else 38
+            img = Gtk.Image.new_from_pixbuf(rounded_cover(t["cover"], size, 12 if k == 0 else 8, t["title"]))
+            if k == 0:
+                self.covers.add(img)
+            else:
+                b = Gtk.Button(valign=Gtk.Align.CENTER)
+                b.get_style_context().add_class("w-cover")
+                b.add(img)
+                b.set_opacity(0.55)
+                b.set_tooltip_text(f"Play “{t['title']}”")
+                b.connect("clicked", lambda _b, i=i: self.play_index(i))
+                self.covers.add(b)
+        t = self._tags(self.queue[self.index])
+        self.artist.set_text(t["artist"] or t["album"] or os.path.basename(os.path.dirname(self.queue[self.index])))
+        self.title.set_text(t["title"])
+        self.title.set_tooltip_text(None)
+        self.covers.show_all()
+        self._refresh_buttons()
+
+    def _refresh_buttons(self):
+        self.play_btn.set_label("⏸" if (self.player and self.player.playing) else "▶")
+
+    @staticmethod
+    def _fmt(s):
+        s = int(s)
+        return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+    def _tick(self):
+        now = time.localtime()
+        self.clock.set_text(time.strftime("%H:%M", now))
+        self.date.set_text(time.strftime("%a %d %b", now))
+        p = self.player
+        frac = 0.0
+        if p:
+            p.poll()
+            pos, dur = p.position(), p.duration()
+            frac = min(1.0, pos / dur) if dur else 0.0
+            self.bar.set_fraction(frac)
+            self.t_pos.set_text(self._fmt(pos))
+            self.t_dur.set_text(self._fmt(dur) if dur else "")
+            if p.error:
+                self.artist.set_text("Can't play this file")
+                self.title.set_text(p.error)
+                self.title.set_tooltip_text(p.error)
+                if not IS_WIN and not self.fix_btn.get_visible() and missing_features("media"):
+                    self.fix_btn.show()
+        elif self.player_error:
+            self.artist.set_text("No audio player")
+            self.title.set_text(self.player_error)
+            self.title.set_tooltip_text(self.player_error)
+        self.mini_bar.set_fraction(frac)
+        t = self._tags(self.queue[self.index]) if 0 <= self.index < len(self.queue) else None
+        state = "⏸" if p and p.playing else "▶"
+        self.mini_label.set_markup(f"<small>🎵 <b>{time.strftime('%H:%M', now)}</b>  {state}  "
+                                   f"{esc(t['title']) if t else 'Music player'}</small>")
+        self._refresh_buttons()
+        return True
+
+    # ---------- mouse: auto-hide inside the window, seek, volume
     def autohide(self):
         return self.win.cfg.get("widget_autohide", True)
 
@@ -14351,7 +14348,6 @@ class MusicWidget(Gtk.Window):
         if self.collapsed:
             self.collapsed = False
             self.stack.set_visible_child_name("full")
-            self.resize(1, 1)
         return False
 
     def _leave(self, w, event):
@@ -14364,39 +14360,26 @@ class MusicWidget(Gtk.Window):
             self._leave_timer = None
             self.collapsed = True
             self.stack.set_visible_child_name("mini")
-            self.resize(1, 1)
             return False
         self._leave_timer = GLib.timeout_add(1500, collapse)
         return False
 
-    def _press(self, w, event):
-        if event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS:
-            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
-            return True
-        if event.button == 3:
-            menu = Gtk.Menu()
-            ah = Gtk.CheckMenuItem(label="Auto-hide (shrink when the mouse leaves)")
-            ah.set_active(self.autohide())
-            ah.connect("toggled", lambda i: (self.win.cfg.__setitem__("widget_autohide", i.get_active()),
-                                             write_json(CONFIG_FILE, self.win.cfg)))
-            menu.append(ah)
-            st = Gtk.CheckMenuItem(label="Show when Arckad-D starts")
-            st.set_active(self.win.cfg.get("widget_autostart", False))
-            st.connect("toggled", lambda i: (self.win.cfg.__setitem__("widget_autostart", i.get_active()),
-                                             write_json(CONFIG_FILE, self.win.cfg)))
-            menu.append(st)
-            menu.append(Gtk.SeparatorMenuItem())
-            cl = Gtk.MenuItem(label="Clear the queue")
-            cl.connect("activate", lambda *_: (self.player and self.player.stop(), setattr(self, "queue", []),
-                                               setattr(self, "index", -1), self._refresh_track()))
-            menu.append(cl)
-            close = Gtk.MenuItem(label="Close the widget (stops the music)")
-            close.connect("activate", lambda *_: self.close_widget())
-            menu.append(close)
-            menu.show_all()
-            menu.popup_at_pointer(event)
-            return True
-        return False
+    def options_menu(self):
+        menu = Gtk.Menu()
+        ah = Gtk.CheckMenuItem(label="Auto-hide (shrink to a thin line when the mouse leaves)")
+        ah.set_active(self.autohide())
+        ah.connect("toggled", lambda i: (self.win.cfg.__setitem__("widget_autohide", i.get_active()),
+                                         write_json(CONFIG_FILE, self.win.cfg)))
+        menu.append(ah)
+        cl = Gtk.MenuItem(label="Clear the queue")
+        cl.connect("activate", lambda *_: (self.player and self.player.stop(), setattr(self, "queue", []),
+                                           setattr(self, "index", -1), self._refresh_track()))
+        menu.append(cl)
+        off = Gtk.MenuItem(label="Turn the music player off")
+        off.connect("activate", lambda *_: self.close_widget())
+        menu.append(off)
+        menu.show_all()
+        menu.popup_at_widget(self._opts_btn, Gdk.Gravity.NORTH_WEST, Gdk.Gravity.SOUTH_WEST, None)
 
     def _seek_click(self, w, event):
         p = self.player
@@ -14417,20 +14400,25 @@ class MusicWidget(Gtk.Window):
         GLib.timeout_add(1200, lambda: self._refresh_track() or False)
         return True
 
-    def _moved(self, *_):
-        if self.get_visible() and not self.collapsed:
-            self.win.cfg["widget_pos"] = list(self.get_position())
-        return False
-
     def close_widget(self):
+        """Off: the music stops and the bar goes away (the 🎵 button in the toolbar turns it back on)."""
         if self.player:
             self.player.stop()
         if self._tick_id:
             GLib.source_remove(self._tick_id)
             self._tick_id = None
+        self.win.cfg["player_on"] = False
         write_json(CONFIG_FILE, self.win.cfg)
         self.win.music = None
+        parent = self.get_parent()
+        if parent:
+            parent.remove(self)
         self.destroy()
+        btn = getattr(self.win, "music_btn", None)
+        if btn and btn.get_active():
+            self.win._music_guard = True
+            btn.set_active(False)
+            self.win._music_guard = False
 
 
 # ---------------------------------------------------------------- main window
@@ -14616,8 +14604,8 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
         self.start_freeze_watch()
         GLib.timeout_add_seconds(20, self._features_hint)
-        if self.cfg.get("widget_autostart"):
-            GLib.timeout_add_seconds(2, lambda: self.music_widget() and False)
+        if self.cfg.get("player_on"):
+            GLib.idle_add(lambda: self.music_on() and False)
         if not IS_WIN:
             GLib.timeout_add_seconds(120, self._tracker_guard_tick)
             GLib.timeout_add_seconds(300, self._tracker_activity_tick)
@@ -14764,7 +14752,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Receive files…", lambda: self.open_share(None, "receive")),
             None,
             ("Update search index now", INDEX.rebuild),
-            ("🎵 Music & clock widget", self.music_widget),
+            ("🎵 Music player (on / off)", self.music_toggle),
         ] + ([("Install optional features…", self.features_dialog)] if not IS_WIN else []) + [
             ("Search index settings…", self.index_settings),
             ("Freeze report…", self.freeze_report),
@@ -14806,6 +14794,12 @@ class MainWindow(Gtk.ApplicationWindow):
         self.chat_btn.connect("toggled", lambda b: None if self._right_guard else
                               self.show_right("chat" if b.get_active() else None))
         hb.pack_end(self.chat_btn)
+        self.music_btn = Gtk.ToggleButton(label="🎵")
+        self.music_btn.set_tooltip_text("Music player with clock: on / off (it sits at the bottom of this window)")
+        self._music_guard = False
+        self.music_btn.connect("toggled", lambda b: None if self._music_guard else
+                               (self.music_on() if b.get_active() else self.music_off()))
+        hb.pack_end(self.music_btn)
         self.dual_btn = Gtk.ToggleButton(label="Dual")
         self.dual_btn.set_tooltip_text("Two folders side by side (F3)")
         self.dual_btn.connect("toggled", self.on_dual_toggled)
@@ -14886,6 +14880,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.overlay.add(main)
         self.overlay.add_overlay(self._build_toast())
         outer.pack_start(self.overlay, True, True, 0)
+        self.music_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)     # the music bar lives here, inside
+        outer.pack_end(self.music_slot, False, False, 0)
         self.build_sidebar()
 
     def _notebook(self):
@@ -16011,20 +16007,40 @@ class MainWindow(Gtk.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
         return False
 
-    # ---------- the music & clock widget
-    def music_widget(self):
+    # ---------- the music player bar (inside this window)
+    def music_on(self):
         if not getattr(self, "music", None):
-            self.music = MusicWidget(self)
-        self.music.present()
+            self.music = MusicBar(self)
+            self.music_slot.add(self.music)
+            self.music_slot.show_all()
+        self.cfg["player_on"] = True
+        if not self.music_btn.get_active():
+            self._music_guard = True
+            self.music_btn.set_active(True)
+            self._music_guard = False
         return self.music
+
+    def music_off(self):
+        if getattr(self, "music", None):
+            self.music.close_widget()
+
+    def music_widget(self):
+        return self.music_on()
+
+    def music_toggle(self):
+        if getattr(self, "music", None):
+            self.music_off()
+            self.active.flash("Music player turned off")
+        else:
+            self.music_on()
 
     def music_play(self, paths):
         n = self.music_widget().replace(paths)
-        self.active.flash(f"🎵 Playing {n} song{'s' if n != 1 else ''} in the widget")
+        self.active.flash(f"🎵 Playing {n} song{'s' if n != 1 else ''} in the music player")
 
     def music_add(self, paths):
         n = self.music_widget().add_songs(paths)
-        self.active.flash(f"🎵 Added {n} song{'s' if n != 1 else ''} to the widget")
+        self.active.flash(f"🎵 Added {n} song{'s' if n != 1 else ''} to the music player")
 
     def open_with(self, path):
         if IS_WIN:
