@@ -728,7 +728,7 @@ final class ChatLink {
                 JSONObject m = req.optJSONObject("msg");
                 if (e.groups.containsKey(gid) && m != null && !m.optString("id").isEmpty() && e.append(gid, m)) {
                     String kind = m.optString("kind");
-                    if (!e.me.equals(m.optString("from")) && !kind.equals("system") && !kind.equals("delete")) {
+                    if (!e.me.equals(m.optString("from")) && !kind.equals("system") && !ChatEngine.ACTIONS.contains(kind)) {
                         e.unread.merge(gid, 1, Integer::sum);
                         e.ui.message(gid, m);
                     } else e.ui.changed(gid);

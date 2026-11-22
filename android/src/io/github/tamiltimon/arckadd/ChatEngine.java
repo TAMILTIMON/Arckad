@@ -283,6 +283,11 @@ final class ChatEngine {
         ui.people();
     }
 
+    double lastSeen(String pid) {
+        JSONObject f = friends().optJSONObject(pid), o = online.get(pid), p = people.get(pid);
+        return Math.max(f == null ? 0 : f.optDouble("last_seen", 0), Math.max(o == null ? 0 : o.optDouble("seen", 0), p == null ? 0 : p.optDouble("seen", 0)));
+    }
+
     JSONObject cardOf(String pid) {
         if (pid.equals(me)) return myCard();
         JSONObject f = friends().optJSONObject(pid), p = people.get(pid);
@@ -361,6 +366,10 @@ final class ChatEngine {
             parts.add(Math.round(m.optDouble("voice", 0) * 10) / 10.0);
             parts.add(m.optBoolean("once"));
         }
+        if (!m.optString("reply").isEmpty() || !m.optString("fwd").isEmpty()) {     // replies and forwards are signed
+            parts.add(m.optString("reply"));
+            parts.add(m.optString("fwd"));
+        }
         return utf8(pyJson(parts.toArray()));
     }
 
@@ -385,7 +394,8 @@ final class ChatEngine {
         String id = m.optString("id");
         if (id.isEmpty() || id.length() > 40) return null;
         String kind = m.optString("kind");
-        if (!kind.equals("text") && !kind.equals("file") && !kind.equals("system") && !kind.equals("sticker") && !kind.equals("delete"))
+        if (!kind.equals("text") && !kind.equals("file") && !kind.equals("system") && !kind.equals("sticker") && !kind.equals("delete")
+                && !kind.equals("react") && !kind.equals("edit") && !kind.equals("pin"))
             return null;
         JSONObject out = new JSONObject();
         put(out, "id", id);
@@ -406,6 +416,8 @@ final class ChatEngine {
         }
         if (m.optDouble("voice", 0) != 0) put(out, "voice", Math.round(m.optDouble("voice") * 10) / 10.0);
         if (m.optBoolean("once")) put(out, "once", true);
+        if (!m.optString("reply").isEmpty()) put(out, "reply", cut(m.optString("reply"), 40));
+        if (!m.optString("fwd").isEmpty()) put(out, "fwd", cut(m.optString("fwd"), 40));
         if (kind.equals("sticker")) put(out, "sticker", cut(m.optString("sticker"), 40));
         String pub = pubOf(gid, out.optString("from"));
         if (pub != null) {
@@ -824,6 +836,7 @@ final class ChatEngine {
         String pv = cut(who.optString("pv"), 16);
         put(p, "pv", pv);
         JSONObject fr = friends().optJSONObject(pid);
+        if (fr != null) put(fr, "last_seen", now());              // for "last seen today at 10:42"
         JSONObject keep = old != null && old.optJSONObject("card") != null ? old.optJSONObject("card")
                 : fr != null ? fr.optJSONObject("card") : null;
         if (keep != null) put(p, "card", keep);
@@ -1476,7 +1489,7 @@ final class ChatEngine {
         if (list != null) for (int i = 0; i < Math.min(list.length(), 2000); i++) {
             JSONObject m = clean(list.opt(i), gid);
             if (m != null && append(gid, m)) {
-                if ("system".equals(m.optString("kind")) || "delete".equals(m.optString("kind"))) continue;
+                if ("system".equals(m.optString("kind")) || ACTIONS.contains(m.optString("kind"))) continue;
                 added++;
                 queueReceipt(gid, m.optString("from"), m.optString("id"), false);
                 if (m.optJSONObject("file") != null) maybeDownload(gid, m);
@@ -1765,7 +1778,7 @@ final class ChatEngine {
         boolean changed = false;
         for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) {
             String k = m.optString("kind");
-            if (!me.equals(m.optString("from")) && !k.equals("system") && !k.equals("delete") && !m.optBoolean("r_sent") && !m.has("deleted")) {
+            if (!me.equals(m.optString("from")) && !k.equals("system") && !ACTIONS.contains(k) && !m.optBoolean("r_sent") && !m.has("deleted")) {
                 put(m, "r_sent", true);
                 changed = true;
                 queueReceipt(gid, m.optString("from"), m.optString("id"), true);
@@ -1860,14 +1873,177 @@ final class ChatEngine {
 
     // ================================================================= sending
     void sendText(String gid, String text) {
+        sendText(gid, text, null, null);
+    }
+
+    void sendText(String gid, String text, String reply, String fwd) {
         text = text.trim();
         if (text.isEmpty() || !canPost(gid)) return;
         JSONObject m = msg("text");
         put(m, "text", cut(text, 8000));
+        if (reply != null && !reply.isEmpty()) put(m, "reply", reply);
+        if (fwd != null && !fwd.isEmpty()) put(m, "fwd", cut(fwd, 40));
         sign(gid, m);
         append(gid, m);
         ui.changed(gid);
         deliver(gid, m);
+    }
+
+    // ================================================================= Telegram-style extras
+    static final String[] REACTIONS = {"👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "👏"};
+    static final Set<String> ACTIONS = new HashSet<>(java.util.Arrays.asList("react", "edit", "pin", "delete"));
+
+    private JSONObject action(String gid, String kind, String text) {
+        if (!canPost(gid) && !kind.equals("react")) return null;
+        JSONObject m = msg(kind);
+        put(m, "text", text);
+        sign(gid, m);
+        append(gid, m);
+        ui.changed(gid);
+        deliver(gid, m);
+        return m;
+    }
+
+    void react(String gid, String target, String emoji) {
+        Map<String, List<String>> mine = derived(gid).reacts.get(target);
+        String current = "";
+        if (mine != null) for (Map.Entry<String, List<String>> en : mine.entrySet()) if (en.getValue().contains(me)) current = en.getKey();
+        action(gid, "react", target + "|" + (current.equals(emoji) ? "" : emoji));
+    }
+
+    void editMessage(String gid, String target, String text) {
+        text = text.trim();
+        JSONObject m = find(gid, target);
+        if (text.isEmpty() || m == null || !me.equals(m.optString("from")) || !"text".equals(m.optString("kind"))) return;
+        action(gid, "edit", target + "\n" + cut(text, 8000));
+    }
+
+    void pinMessage(String gid, String target) {
+        action(gid, "pin", target == null ? "" : target);
+    }
+
+    JSONObject find(String gid, String id) {
+        for (JSONObject m : new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()))) if (id.equals(m.optString("id"))) return m;
+        return null;
+    }
+
+    boolean forward(String from, String mid, String to) {
+        JSONObject m = find(from, mid);
+        if (m == null || m.has("deleted") || !canPost(to)) return false;
+        String origin = !m.optString("fwd").isEmpty() ? m.optString("fwd") : me.equals(m.optString("from")) ? myName() : m.optString("name", "?");
+        String kind = m.optString("kind");
+        if (kind.equals("text")) {
+            String t = derived(from).edits.get(mid);
+            sendText(to, t != null ? t : m.optString("text"), null, origin);
+            return true;
+        }
+        JSONObject f = m.optJSONObject("file");
+        if (kind.equals("file") && f != null) {
+            JSONObject g = groups.get(from);
+            String path = g != null && g.optJSONObject("files") != null ? g.optJSONObject("files").optString(f.optString("id")) : "";
+            if (path.isEmpty() || !new File(path).isFile()) return false;
+            JSONObject tg = groups.get(to);
+            String fid = token(8);
+            if (tg.optJSONObject("files") == null) put(tg, "files", new JSONObject());
+            Obj.put(tg.optJSONObject("files"), fid, path);
+            JSONObject nm = msg("file");
+            put(nm, "text", m.optString("text"));
+            put(nm, "file", new Obj().putOpt("id", fid).putOpt("name", f.optString("name")).putOpt("size", new File(path).length()));
+            put(nm, "fwd", cut(origin, 40));
+            sign(to, nm);
+            append(to, nm);
+            save();
+            ui.changed(to);
+            deliver(to, nm);
+            return true;
+        }
+        return false;
+    }
+
+    static final class Derived {
+        final Map<String, Map<String, List<String>>> reacts = new HashMap<>();
+        final Map<String, String> edits = new HashMap<>();
+        String pinned;
+    }
+
+    /** What reactions, edits and pins add up to (same rules as the desktop). */
+    Derived derived(String gid) {
+        Derived d = new Derived();
+        List<JSONObject> lst = new ArrayList<>(msgs.getOrDefault(gid, new ArrayList<>()));
+        Map<String, JSONObject> byId = new HashMap<>();
+        for (JSONObject m : lst) byId.put(m.optString("id"), m);
+        Map<String, String> perPerson = new java.util.LinkedHashMap<>();
+        for (JSONObject m : lst) {
+            String k = m.optString("kind"), t = m.optString("text");
+            if (k.equals("react")) {
+                int bar = t.indexOf('|');
+                if (bar > 0) perPerson.put(t.substring(0, bar) + "\u0000" + m.optString("from"), t.substring(bar + 1));
+            } else if (k.equals("edit")) {
+                int nl = t.indexOf('\n');
+                if (nl > 0) {
+                    JSONObject target = byId.get(t.substring(0, nl));
+                    if (target != null && target.optString("from").equals(m.optString("from")) && !target.has("deleted"))
+                        d.edits.put(t.substring(0, nl), t.substring(nl + 1));
+                }
+            } else if (k.equals("pin")) d.pinned = t.isEmpty() ? null : t;
+        }
+        for (Map.Entry<String, String> en : perPerson.entrySet()) {
+            String[] tw = en.getKey().split("\u0000", 2);
+            if (en.getValue().isEmpty() || !byId.containsKey(tw[0])) continue;
+            d.reacts.computeIfAbsent(tw[0], x -> new java.util.LinkedHashMap<>()).computeIfAbsent(en.getValue(), x -> new ArrayList<>()).add(tw[1]);
+        }
+        if (d.pinned != null && (!byId.containsKey(d.pinned) || byId.get(d.pinned).has("deleted"))) d.pinned = null;
+        return d;
+    }
+
+    // typing… (never stored)
+    private final Map<String, Map<String, Long>> typing = new ConcurrentHashMap<>();
+    private final Map<String, Long> typingSent = new ConcurrentHashMap<>();
+
+    void sendTyping(String gid) {
+        JSONObject g = groups.get(gid);
+        if (g == null || "saved".equals(g.optString("kind")) || System.currentTimeMillis() - typingSent.getOrDefault(gid, 0L) < 3000) return;
+        typingSent.put(gid, System.currentTimeMillis());
+        Set<String> to = new HashSet<>(onlineMembers(gid));
+        if ("direct".equals(g.optString("kind")) && !g.optString("peer").isEmpty()) to.add(g.optString("peer"));   // a friend
+        for (String did : to) {
+            if (did.equals(me)) continue;
+            bg(() -> {
+                try {
+                    request(gid, did, "POST", "/c/typing", new JSONObject(), null, 3000);
+                } catch (Exception ignored) {
+                }
+            });
+        }
+    }
+
+    List<String> typingNames(String gid) {
+        List<String> out = new ArrayList<>();
+        Map<String, Long> t = typing.get(gid);
+        JSONObject g = groups.get(gid);
+        if (t == null || g == null) return out;
+        for (Map.Entry<String, Long> en : t.entrySet())
+            if (System.currentTimeMillis() - en.getValue() < 6000) {
+                JSONObject mm = g.optJSONObject("members") == null ? null : g.optJSONObject("members").optJSONObject(en.getKey());
+                out.add(mm == null ? "Someone" : mm.optString("name", "Someone"));
+            }
+        return out;
+    }
+
+    // Saved Messages: a private chat with yourself (same id as on your linked devices)
+    String savedGid() {
+        String gid = "saved-" + sha256hex(me).substring(0, 12);
+        if (!groups.containsKey(gid)) synchronized (lock) {
+            JSONObject g = new Obj().putOpt("id", gid).putOpt("kind", "saved").putOpt("name", "Saved Messages").putOpt("owner", me)
+                    .putOpt("key", hex(random(32))).putOpt("version", 1).putOpt("created", now())
+                    .putOpt("members", new Obj().putOpt(me, new Obj().putOpt("name", myName()).putOpt("role", "owner")
+                            .putOpt("pub", myPub()).putOpt("os", osName))).putOpt("files", new JSONObject());
+            groups.put(gid, g);
+            msgs.putIfAbsent(gid, Collections.synchronizedList(new ArrayList<>()));
+            ids.putIfAbsent(gid, Collections.synchronizedSet(new HashSet<>()));
+            save();
+        }
+        return gid;
     }
 
     int sendFiles(String gid, List<File> files) {
@@ -2291,7 +2467,10 @@ final class ChatEngine {
                 code = 403;
             } else {
                 if (append(gid, m)) {
-                    if (!"system".equals(m.optString("kind")) && !"delete".equals(m.optString("kind"))) {
+                    Map<String, Long> tp = typing.get(gid);
+                    String mk = m.optString("kind");
+                    if (tp != null && (mk.equals("text") || mk.equals("file") || mk.equals("sticker"))) tp.remove(did);
+                    if (!"system".equals(m.optString("kind")) && !ACTIONS.contains(m.optString("kind"))) {
                         unread.merge(gid, 1, Integer::sum);
                         queueReceipt(gid, did, m.optString("id"), false);
                     }
@@ -2353,6 +2532,10 @@ final class ChatEngine {
             code = 403;
         } else if (path.equals("/c/groupadd") && !pair && "direct".equals(g.optString("kind")) && did.equals(g.optString("peer"))) {
             res = addedToGroup(did, req);
+        } else if (path.equals("/c/typing") && !pair) {
+            typing.computeIfAbsent(gid, k -> new ConcurrentHashMap<>()).put(did, System.currentTimeMillis());
+            ui.changed(gid);
+            res = new Obj().putOpt("ok", true);
         } else if (path.equals("/c/ping") && !pair) {
             res = new Obj().putOpt("ok", true).putOpt("ver", version).putOpt("os", osName).putOpt("calls", false);
         } else if (path.equals("/c/receipt") && !pair) {

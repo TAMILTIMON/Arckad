@@ -46,7 +46,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Iterator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 
 /** The Chat tab: chats (friends and groups), a conversation, People, your profile. The same chats as the
@@ -198,8 +200,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             card.addView(Ui.button(a, "Set up", true, v -> editProfile(null)));
             box.addView(card, Ui.matchWrap(a, 8));
         }
-        List<String> order = new ArrayList<>(e.groups.keySet());
-        Collections.sort(order, (x, y) -> Double.compare(lastTs(y), lastTs(x)));
+        List<String> order = orderChats();
         if (order.isEmpty()) {
             TextView t = Ui.text(a, "💬\n\nChat with your colleagues\n\nAdd friends with 👥 People, or create a group with ＋.\n\n"
                     + "Private and encrypted: everything stays inside your network. Your chats from the PC appear here "
@@ -212,12 +213,6 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         root.addView(sc);
     }
 
-    private double lastTs(String g) {
-        List<JSONObject> l = e.msgs.get(g);
-        if (l != null && !l.isEmpty()) return l.get(l.size() - 1).optDouble("ts", 0);
-        JSONObject grp = e.groups.get(g);
-        return grp == null ? 0 : grp.optDouble("created", 0);
-    }
 
     private View chatRow(String g) {
         JSONObject grp = e.groups.get(g);
@@ -226,6 +221,15 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         row.setPadding(Ui.dp(a, 12), Ui.dp(a, 10), Ui.dp(a, 12), Ui.dp(a, 10));
         row.setBackground(Ui.ripple(a));
         row.setOnClickListener(v -> show("conv", g));
+        row.setOnLongClickListener(v -> {                     // pin to top, mute
+            boolean pinned = Ui.prefs(a).getBoolean("chat_pin_" + g, false), muted = Ui.prefs(a).getBoolean("chat_mute_" + g, false);
+            String[] items = {pinned ? "📌 Unpin chat" : "📌 Pin to top", muted ? "🔔 Unmute" : "🔕 Mute notifications"};
+            Ui.dialog(a).setTitle(title(g)).setItems(items, (d, w) -> {
+                Ui.prefs(a).edit().putBoolean(w == 0 ? "chat_pin_" + g : "chat_mute_" + g, w == 0 ? !pinned : !muted).apply();
+                render();
+            }).show();
+            return true;
+        });
         ImageView av = new ImageView(a);
         av.setImageBitmap(chatAvatar(g, 46));
         row.addView(av, new LinearLayout.LayoutParams(Ui.dp(a, 46), Ui.dp(a, 46)));
@@ -233,14 +237,17 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         t.setOrientation(LinearLayout.VERTICAL);
         t.setPadding(Ui.dp(a, 12), 0, 0, 0);
         LinearLayout top = new LinearLayout(a);
-        TextView name = Ui.text(a, ("direct".equals(grp.optString("kind")) ? "" : "👥 ") + title(g)
-                + (grp.optBoolean("removed") ? " (left)" : ""), 16, Ui.TEXT, true);
+        String kindIcon = "direct".equals(grp.optString("kind")) ? "" : "saved".equals(grp.optString("kind")) ? "⭐ " : "👥 ";
+        String flags = (Ui.prefs(a).getBoolean("chat_pin_" + g, false) ? " 📌" : "") + (Ui.prefs(a).getBoolean("chat_mute_" + g, false) ? " 🔕" : "");
+        TextView name = Ui.text(a, kindIcon + title(g) + (grp.optBoolean("removed") ? " (left)" : "") + flags, 16, Ui.TEXT, true);
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
         top.addView(name, MainActivity.grow());
         List<JSONObject> l = new ArrayList<>();
-        for (JSONObject x : e.msgs.getOrDefault(g, new ArrayList<>()))
-            if (!"delete".equals(x.optString("kind")) && !"me".equals(x.optString("deleted"))) l.add(x);
+        for (JSONObject x : e.msgs.getOrDefault(g, new ArrayList<>())) {
+            String k = x.optString("kind");
+            if (!"delete".equals(k) && !"react".equals(k) && !"edit".equals(k) && !"me".equals(x.optString("deleted"))) l.add(x);
+        }
         JSONObject last = l.isEmpty() ? null : l.get(l.size() - 1);
         if (last != null) top.addView(Ui.text(a, when(last.optDouble("ts")), 12, Ui.DIM, false));
         t.addView(top);
@@ -250,8 +257,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         else {
             String who = e.me.equals(last.optString("from")) && !"system".equals(last.optString("kind")) ? "You: "
                     : "direct".equals(grp.optString("kind")) || "system".equals(last.optString("kind")) ? "" : last.optString("name") + ": ";
-            prev = who + preview(last);
+            prev = "pin".equals(last.optString("kind")) ? "📌 " + (last.optString("text").isEmpty() ? "unpinned a message" : "pinned a message")
+                    : who + (last.optString("fwd").isEmpty() ? "" : "➡ ") + preview(last);
         }
+        if (!e.typingNames(g).isEmpty()) prev = ("direct".equals(grp.optString("kind")) ? "" : e.typingNames(g).get(0) + " ") + "typing…";
         TextView p = new TextView(a);
         p.setText(EmojiText.span(a, prev.replace('\n', ' '), Ui.dp(a, 15)));
         p.setTextColor(Ui.DIM);
@@ -302,8 +311,12 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             if (grp.optBoolean("removed") || f == null) return "not friends any more";
             if (f.optJSONObject("pending_accept") != null) return "finishing… (they need to come online)";
             String cl = ChatEngine.cardLine(e.cardOf(pid));
-            return (e.personOnline(pid) ? "online" : "offline") + (cl.isEmpty() ? "" : " · " + cl);
+            String state = !e.typingNames(g).isEmpty() ? "typing…" : e.personOnline(pid) ? "online" : lastSeen(e.lastSeen(pid));
+            return state + (cl.isEmpty() ? "" : " · " + cl);
         }
+        if ("saved".equals(grp.optString("kind"))) return "your notes and files · on your linked devices too";
+        List<String> typ = e.typingNames(g);
+        if (!typ.isEmpty()) return typ.get(0) + " typing…";
         JSONObject members = grp.optJSONObject("members");
         int n = members == null ? 0 : members.length();
         return n + " member" + (n == 1 ? "" : "s") + " · " + e.onlineMembers(g).size() + " online"
@@ -325,11 +338,44 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         col.addView(wall, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
         String lastDay = "";
         List<JSONObject> list = new ArrayList<>(e.msgs.getOrDefault(gid, new ArrayList<>()));
+        der = e.derived(gid);
+        rowsById.clear();
+        int unreadN = e.unread.getOrDefault(gid, 0);
+        String firstUnread = null;
+        if (unreadN > 0) {
+            List<JSONObject> real = new ArrayList<>();
+            for (JSONObject m : list) if (!e.me.equals(m.optString("from")) && !"system".equals(m.optString("kind")) && !ChatEngine.ACTIONS.contains(m.optString("kind"))) real.add(m);
+            if (!real.isEmpty()) firstUnread = real.get(Math.max(0, real.size() - unreadN)).optString("id");
+        }
         e.markRead(gid);
+        JSONObject pm = der.pinned == null ? null : e.find(gid, der.pinned);
+        if (pm != null) {
+            LinearLayout pb = new LinearLayout(a);
+            pb.setGravity(Gravity.CENTER_VERTICAL);
+            pb.setPadding(Ui.dp(a, 12), Ui.dp(a, 6), Ui.dp(a, 6), Ui.dp(a, 6));
+            pb.setBackgroundColor(0x26ff7a1a);
+            pb.addView(Ui.text(a, "📌 " + pm.optString("name") + ": " + snippet(pm), 13, Ui.TEXT, false), MainActivity.grow());
+            if (e.canPost(gid)) pb.addView(Ui.icon(a, "✕", "Unpin", v -> e.pinMessage(gid, "")));
+            final String pid0 = der.pinned;
+            pb.setOnClickListener(v -> jumpTo(pid0));
+            col.addView(pb, 0);
+        }
         List<JSONObject> vis = new ArrayList<>();
-        for (JSONObject m : list) if (!"delete".equals(m.optString("kind")) && !"me".equals(m.optString("deleted"))) vis.add(m);
+        for (JSONObject m : list) {
+            String k = m.optString("kind");
+            if (!"delete".equals(k) && !"react".equals(k) && !"edit".equals(k) && !"me".equals(m.optString("deleted"))) vis.add(m);
+        }
         list = vis;
+        View unreadView = null;
         for (JSONObject m : list.subList(Math.max(0, list.size() - 250), list.size())) {
+            if (m.optString("id").equals(firstUnread)) {
+                TextView u = Ui.text(a, "⬇ Unread messages", 12, Ui.TEXT, true);
+                u.setGravity(Gravity.CENTER);
+                u.setBackgroundColor(0x26ff7a1a);
+                u.setPadding(0, Ui.dp(a, 4), 0, Ui.dp(a, 4));
+                msgBox.addView(u);
+                unreadView = u;
+            }
             String day = new SimpleDateFormat("EEEE d MMMM yyyy", Locale.getDefault()).format(new Date((long) (m.optDouble("ts") * 1000)));
             if (!day.equals(lastDay)) {
                 lastDay = day;
@@ -338,7 +384,9 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 d.setPadding(0, Ui.dp(a, 10), 0, Ui.dp(a, 4));
                 msgBox.addView(d);
             }
-            msgBox.addView(bubble(m));
+            View bv = bubble(m);
+            rowsById.put(m.optString("id"), bv);
+            msgBox.addView(bv);
         }
         if (e.canPost(gid)) col.addView(composer());
         else {
@@ -350,12 +398,71 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             col.addView(ro);
         }
         root.addView(col);
-        msgScroll.post(() -> msgScroll.fullScroll(View.FOCUS_DOWN));
+        final View uv = unreadView;
+        msgScroll.post(() -> {
+            if (uv != null) msgScroll.scrollTo(0, Math.max(0, uv.getTop() - Ui.dp(a, 40)));
+            else msgScroll.fullScroll(View.FOCUS_DOWN);
+        });
+    }
+
+    private String replyTo, editing;              // composer state: replying to / editing a message
+    private ChatEngine.Derived der;
+    private final Map<String, View> rowsById = new HashMap<>();
+
+    static String lastSeen(double ts) {
+        if (ts <= 0) return "offline";
+        long ms = (long) (ts * 1000);
+        java.util.Calendar c = java.util.Calendar.getInstance(), now = java.util.Calendar.getInstance();
+        c.setTimeInMillis(ms);
+        String hm = new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date(ms));
+        if (System.currentTimeMillis() - ms < 60_000) return "last seen just now";
+        if (c.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR) && c.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR))
+            return "last seen today at " + hm;
+        now.add(java.util.Calendar.DAY_OF_YEAR, -1);
+        if (c.get(java.util.Calendar.DAY_OF_YEAR) == now.get(java.util.Calendar.DAY_OF_YEAR) && c.get(java.util.Calendar.YEAR) == now.get(java.util.Calendar.YEAR))
+            return "last seen yesterday at " + hm;
+        return "last seen " + new SimpleDateFormat("d MMM 'at' HH:mm", Locale.getDefault()).format(new Date(ms));
+    }
+
+    static String cut40(JSONObject m) {
+        if (m == null) return "a message";
+        if (m.has("deleted")) return "deleted message";
+        if (m.optJSONObject("file") != null) return (m.optDouble("voice", 0) > 0 ? "🎤 Voice message" : "📎 " + m.optJSONObject("file").optString("name"));
+        if ("sticker".equals(m.optString("kind"))) return "🏷 Sticker";
+        String t = m.optString("text").replace('\n', ' ');
+        return t.length() > 60 ? t.substring(0, 60) + "…" : t;
+    }
+
+    private String snippet(JSONObject m) {
+        if (m != null && "text".equals(m.optString("kind")) && der != null && der.edits.containsKey(m.optString("id"))) {
+            String t = der.edits.get(m.optString("id")).replace('\n', ' ');
+            return t.length() > 60 ? t.substring(0, 60) + "…" : t;
+        }
+        return cut40(m);
+    }
+
+    private void jumpTo(String mid) {
+        View v = mid == null ? null : rowsById.get(mid);
+        if (v == null) {
+            Ui.toast(a, "That message is further back");
+            return;
+        }
+        msgScroll.smoothScrollTo(0, Math.max(0, v.getTop() - Ui.dp(a, 60)));
+        v.setBackgroundColor(0x40ff7a1a);
+        v.postDelayed(() -> v.setBackgroundColor(0), 1400);
     }
 
     private View bubble(JSONObject m) {
         String kind = m.optString("kind");
         String time = new SimpleDateFormat("HH:mm", Locale.getDefault()).format(new Date((long) (m.optDouble("ts") * 1000)));
+        if ("pin".equals(kind)) {
+            String who = e.me.equals(m.optString("from")) ? "You" : m.optString("name");
+            String s = m.optString("text").isEmpty() ? "📌 " + who + " unpinned a message" : "📌 " + who + " pinned “" + snippet(e.find(gid, m.optString("text"))) + "”";
+            TextView t = Ui.text(a, s + " · " + time, 12, Ui.DIM, false);
+            t.setGravity(Gravity.CENTER);
+            t.setPadding(Ui.dp(a, 12), Ui.dp(a, 4), Ui.dp(a, 12), Ui.dp(a, 4));
+            return t;
+        }
         if ("system".equals(kind)) {
             TextView t = Ui.text(a, m.optString("text") + " · " + time, 12, Ui.DIM, false);
             t.setGravity(Gravity.CENTER);
@@ -373,7 +480,25 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         boolean sticker = "sticker".equals(kind);
         if (!sticker) b.setBackground(Ui.round(mine ? 0xff2f7fd8 : Ui.CARD, Ui.dp(a, 16)));
         int fg = mine && !sticker ? Color.WHITE : Ui.TEXT;
-        if (!mine && !"direct".equals(g.optString("kind"))) b.addView(Ui.text(a, m.optString("name"), 12, fg, true));
+        if (!mine && !"direct".equals(g.optString("kind")) && !"saved".equals(g.optString("kind"))) b.addView(Ui.text(a, m.optString("name"), 12, fg, true));
+        if (!m.optString("fwd").isEmpty() && !m.has("deleted")) {
+            TextView fw = Ui.text(a, "➡ Forwarded from " + m.optString("fwd"), 12, fg, false);
+            fw.setTypeface(null, Typeface.ITALIC);
+            b.addView(fw);
+        }
+        if (!m.optString("reply").isEmpty() && !m.has("deleted")) {
+            JSONObject target = e.find(gid, m.optString("reply"));
+            String who = target == null ? "Message" : e.me.equals(target.optString("from")) ? "You" : target.optString("name");
+            LinearLayout q = new LinearLayout(a);
+            q.setOrientation(LinearLayout.VERTICAL);
+            q.setPadding(Ui.dp(a, 8), Ui.dp(a, 3), Ui.dp(a, 8), Ui.dp(a, 3));
+            q.setBackground(Ui.round(mine ? 0x33ffffff : 0x14000000, Ui.dp(a, 8)));
+            q.addView(Ui.text(a, who, 12, fg, true));
+            q.addView(Ui.text(a, snippet(target), 12, fg, false));
+            final String rid = m.optString("reply");
+            q.setOnClickListener(v -> jumpTo(rid));
+            b.addView(q, Ui.matchWrap(a, 2));
+        }
         if ("everyone".equals(m.optString("deleted"))) {
             TextView t = Ui.text(a, mine ? "🚫 You deleted this message" : "🚫 This message was deleted", 14, fg, false);
             t.setTypeface(null, Typeface.ITALIC);
@@ -383,12 +508,14 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                     + "(phones can show these in the next update)", 14, fg, false));
         } else if ("text".equals(kind)) {
             TextView t = new TextView(a);
-            String text = m.optString("text");
+            String text = der != null && der.edits.containsKey(m.optString("id")) ? der.edits.get(m.optString("id")) : m.optString("text");
             int only = EmojiText.onlyEmojiCount(text);
             t.setText(EmojiText.span(a, text, Ui.dp(a, only > 0 && only <= 3 ? 40 : 20)));
             t.setTextColor(fg);
             t.setTextSize(15);
             t.setTextIsSelectable(true);
+            android.text.util.Linkify.addLinks(t, android.text.util.Linkify.WEB_URLS);     // web addresses open in the browser
+            t.setLinkTextColor(mine ? Color.WHITE : Ui.ACCENT);
             b.addView(t);
         } else if (sticker) {
             b.addView(stickerView(m));
@@ -396,7 +523,23 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             b.addView(fileView(m, fg));
         }
         if (m.optBoolean("unverified")) b.addView(Ui.text(a, "⚠ not signed (sent before signatures)", 11, fg, false));
-        TextView tm = Ui.text(a, time + (mine && !m.has("deleted") ? "  " + ticks(m) : ""), 11, mine && !sticker ? 0xddffffff : Ui.DIM, false);
+        Map<String, List<String>> rx = der == null || m.has("deleted") ? null : der.reacts.get(m.optString("id"));
+        if (rx != null && !rx.isEmpty()) {
+            LinearLayout rr = new LinearLayout(a);
+            for (Map.Entry<String, List<String>> en : rx.entrySet()) {
+                TextView chip = Ui.text(a, en.getKey() + " " + en.getValue().size(), 13, fg, false);
+                chip.setPadding(Ui.dp(a, 7), Ui.dp(a, 2), Ui.dp(a, 7), Ui.dp(a, 2));
+                chip.setBackground(Ui.round(en.getValue().contains(e.me) ? 0x55ff7a1a : (mine ? 0x33ffffff : 0x14000000), Ui.dp(a, 12)));
+                final String emo = en.getKey(), mid = m.optString("id");
+                chip.setOnClickListener(v -> e.react(gid, mid, emo));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                lp.setMargins(0, Ui.dp(a, 3), Ui.dp(a, 4), 0);
+                rr.addView(chip, lp);
+            }
+            b.addView(rr);
+        }
+        boolean edited = der != null && der.edits.containsKey(m.optString("id")) && !m.has("deleted");
+        TextView tm = Ui.text(a, time + (edited ? " edited" : "") + (mine && !m.has("deleted") ? "  " + ticks(m) : ""), 11, mine && !sticker ? 0xddffffff : Ui.DIM, false);
         if (mine && read(m)) {
             android.text.SpannableString ss = new android.text.SpannableString(tm.getText());
             ss.setSpan(new android.text.style.ForegroundColorSpan(0xff4fc3f7), ss.length() - 2, ss.length(), 0);
@@ -410,6 +553,51 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         b.addView(tm, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         outer.addView(b);
         return outer;
+    }
+
+    private void startReply(JSONObject m) {
+        editing = null;
+        replyTo = m.optString("id");
+        render();
+    }
+
+    private void startEdit(JSONObject m) {
+        replyTo = null;
+        editing = m.optString("id");
+        render();
+    }
+
+    private void forwardDialog(JSONObject m) {
+        List<String> targets = new ArrayList<>();
+        targets.add(e.savedGid());
+        for (String g : orderChats()) if (!g.equals(e.savedGid()) && e.canPost(g) && !e.groups.get(g).optBoolean("removed")) targets.add(g);
+        String[] names = new String[targets.size()];
+        for (int i = 0; i < names.length; i++) names[i] = title(targets.get(i));
+        Ui.dialog(a).setTitle("Forward to…").setItems(names, (d, w) -> {
+            e.forward(gid, m.optString("id"), targets.get(w));
+            Ui.toast(a, "Forwarded to " + names[w]);
+        }).show();
+    }
+
+    /** Pinned chats first, then newest activity. */
+    List<String> orderChats() {
+        List<String> all = new ArrayList<>(e.groups.keySet());
+        java.util.Collections.sort(all, (x, y) -> {
+            boolean px = Ui.prefs(a).getBoolean("chat_pin_" + x, false), py = Ui.prefs(a).getBoolean("chat_pin_" + y, false);
+            if (px != py) return px ? -1 : 1;
+            return Double.compare(lastTs(y), lastTs(x));
+        });
+        return all;
+    }
+
+    private double lastTs(String g) {
+        List<JSONObject> l = e.msgs.getOrDefault(g, new ArrayList<>());
+        for (int i = l.size() - 1; i >= 0; i--) {
+            String k = l.get(i).optString("kind");
+            if (!"react".equals(k) && !"edit".equals(k) && !"delete".equals(k)) return l.get(i).optDouble("ts");
+        }
+        JSONObject gr = e.groups.get(g);
+        return gr == null ? 0 : gr.optDouble("created", 0);
     }
 
     private List<String> others() {
@@ -446,6 +634,33 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     private void messageMenu(JSONObject m) {
         List<String> labels = new ArrayList<>();
         List<Runnable> acts = new ArrayList<>();
+        boolean ok = !m.has("deleted") && !"system".equals(m.optString("kind")) && !"pin".equals(m.optString("kind"));
+        if (ok && e.canPost(gid)) {
+            labels.add("↩ Reply");
+            acts.add(() -> startReply(m));
+        }
+        if (ok) {
+            labels.add("😀 React");
+            acts.add(() -> Ui.dialog(a).setItems(ChatEngine.REACTIONS, (d, w) -> e.react(gid, m.optString("id"), ChatEngine.REACTIONS[w])).show());
+        }
+        if (ok && e.me.equals(m.optString("from")) && "text".equals(m.optString("kind")) && !m.optBoolean("once") && e.canPost(gid)) {
+            labels.add("✏ Edit");
+            acts.add(() -> startEdit(m));
+        }
+        if (ok && !m.optBoolean("once")) {
+            labels.add("➡ Forward");
+            acts.add(() -> forwardDialog(m));
+            labels.add("⭐ Save to Saved Messages");
+            acts.add(() -> {
+                e.forward(gid, m.optString("id"), e.savedGid());
+                Ui.toast(a, "Saved to ⭐ Saved Messages");
+            });
+        }
+        if (ok && e.canPost(gid)) {
+            boolean pinned = m.optString("id").equals(e.derived(gid).pinned);
+            labels.add(pinned ? "📌 Unpin" : "📌 Pin for everyone");
+            acts.add(() -> e.pinMessage(gid, pinned ? "" : m.optString("id")));
+        }
         if ("text".equals(m.optString("kind")) && !m.has("deleted") && !m.optBoolean("once")) {
             labels.add("Copy text");
             acts.add(() -> {
@@ -536,16 +751,52 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         input.setHintTextColor(Ui.DIM);
         input.setMaxLines(4);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        if (editing != null) {
+            String cur = der != null && der.edits.containsKey(editing) ? der.edits.get(editing) : (e.find(gid, editing) == null ? "" : e.find(gid, editing).optString("text"));
+            input.setText(cur);
+            input.setSelection(input.getText().length());
+        }
+        input.addTextChangedListener(new android.text.TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int st, int co, int af) {
+            }
+
+            public void onTextChanged(CharSequence s, int st, int be, int co) {
+            }
+
+            public void afterTextChanged(android.text.Editable s) {
+                if (s.length() > 0 && editing == null) e.sendTyping(gid);
+            }
+        });
         c.addView(input, MainActivity.grow());
         TextView send = Ui.icon(a, "➤", "Send", v -> {
             String t = input.getText().toString();
             if (t.trim().isEmpty()) return;
             input.setText("");
-            e.sendText(gid, t);
+            if (editing != null) e.editMessage(gid, editing, t);
+            else e.sendText(gid, t, replyTo, null);
+            replyTo = null;
+            editing = null;
         });
         send.setTextColor(Ui.ACCENT);
         c.addView(send);
-        return c;
+        if (replyTo == null && editing == null) return c;
+        LinearLayout wrap = new LinearLayout(a);
+        wrap.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout bar = new LinearLayout(a);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        bar.setPadding(Ui.dp(a, 12), Ui.dp(a, 4), Ui.dp(a, 4), 0);
+        bar.setBackgroundColor(0x1aff7a1a);
+        JSONObject rm = replyTo == null ? null : e.find(gid, replyTo);
+        String label = editing != null ? "✏ Editing your message" : "↩ Replying to " + (rm == null ? "a message" : e.me.equals(rm.optString("from")) ? "yourself" : rm.optString("name")) + ": " + snippet(rm);
+        bar.addView(Ui.text(a, label, 13, Ui.TEXT, false), MainActivity.grow());
+        bar.addView(Ui.icon(a, "✕", "Cancel", v -> {
+            replyTo = null;
+            editing = null;
+            render();
+        }));
+        wrap.addView(bar);
+        wrap.addView(c);
+        return wrap;
     }
 
     private void emojiPicker() {
@@ -969,10 +1220,18 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     }
 
     private void listMenu() {
-        String[] items = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
+        String[] items0 = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
                 "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)",
                 "Restore my profile from before a link", "☁ Back up chats (Google Drive or anywhere)", "Restore from a backup"};
-        Ui.dialog(a).setItems(items, (d, w) -> {
+        String[] items = new String[items0.length + 1];
+        items[0] = "⭐ Saved Messages";
+        System.arraycopy(items0, 0, items, 1, items0.length);
+        Ui.dialog(a).setItems(items, (d, w0) -> {
+            if (w0 == 0) {
+                show("conv", e.savedGid());
+                return;
+            }
+            int w = w0 - 1;
             if (w == 7) {
                 backupChats();
                 return;

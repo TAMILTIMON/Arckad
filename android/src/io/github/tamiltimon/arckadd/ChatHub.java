@@ -158,7 +158,17 @@ final class ChatHub implements ChatEngine.Ui {
             engine.unread.put(gid, 0);
             return;
         }
-        if ("system".equals(m.optString("kind"))) return;
+        String kind = m.optString("kind");
+        if ("system".equals(kind) || "edit".equals(kind) || "pin".equals(kind) || "delete".equals(kind)) return;
+        if (Ui.prefs(app).getBoolean("chat_mute_" + gid, false)) return;           // muted chat: just the unread count
+        if ("react".equals(kind)) {                                                 // only reactions to MY messages
+            String t = m.optString("text");
+            int bar = t.indexOf('|');
+            JSONObject target = bar > 0 ? engine.find(gid, t.substring(0, bar)) : null;
+            if (bar < 0 || t.substring(bar + 1).isEmpty() || target == null || !engine.me.equals(target.optString("from")) || engine.isLocked()) return;
+            notify(gid.hashCode(), m.optString("name") + " reacted " + t.substring(bar + 1), "to “" + ChatScreen.cut40(target) + "”", gid, null);
+            return;
+        }
         JSONObject g = engine.groups.get(gid);
         boolean direct = g != null && "direct".equals(g.optString("kind"));
         String title = direct ? m.optString("name") : m.optString("name") + " · " + (g == null ? "Chat" : g.optString("name"));

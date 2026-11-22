@@ -90,7 +90,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.28.1"
+APP_VERSION = "3.29.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -6169,6 +6169,8 @@ class Chat:
                  m.get("text", ""), [f.get("id"), f.get("name"), f.get("size")] if f else None, m.get("sticker")]
         if m.get("voice") or m.get("once"):
             parts += [round(float(m.get("voice") or 0), 1), bool(m.get("once"))]
+        if m.get("reply") or m.get("fwd"):                 # replies and forwards are signed too
+            parts += [m.get("reply") or "", m.get("fwd") or ""]
         return json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     def _sign(self, gid, m):
@@ -6673,7 +6675,7 @@ class Chat:
         for m in reply.get("msgs", [])[:2000]:
             m = self._clean(m, gid)
             if m and self._append(gid, m):
-                if m["kind"] not in ("system", "delete"):
+                if m["kind"] not in ("system", "delete", "react", "edit", "pin"):
                     new += 1
                     if m["from"] != self.me:
                         self.queue_receipt(gid, m["from"], m["id"], "d")
@@ -6688,7 +6690,7 @@ class Chat:
         if not isinstance(m, dict) or not isinstance(m.get("id"), str) or len(m["id"]) > 40:
             return None
         kind = m.get("kind")
-        if kind not in ("text", "file", "system", "sticker", "delete"):
+        if kind not in ("text", "file", "system", "sticker", "delete", "react", "edit", "pin"):
             return None
         out = {"id": m["id"], "from": str(m.get("from", ""))[:40], "name": str(m.get("name", "?"))[:40],
                "ts": float(m.get("ts", 0) or 0), "kind": kind, "text": str(m.get("text", ""))[:8000]}
@@ -6703,6 +6705,10 @@ class Chat:
             out["voice"] = round(float(m["voice"]), 1)
         if m.get("once"):
             out["once"] = True
+        if m.get("reply"):
+            out["reply"] = str(m["reply"])[:40]
+        if m.get("fwd"):
+            out["fwd"] = str(m["fwd"])[:40]
         if kind == "sticker":
             out["sticker"] = str(m.get("sticker", ""))[:40]
             if out["sticker"] != "custom" and not sticker_svg(out["sticker"]):
@@ -6718,7 +6724,7 @@ class Chat:
         return out
 
     # ---------- sending
-    def send_text(self, gid, text, once=False):
+    def send_text(self, gid, text, once=False, reply=None, fwd=None):
         text = text.strip()
         if not text or not self.can_post(gid):
             return
@@ -6726,10 +6732,141 @@ class Chat:
                "kind": "text", "text": text[:8000]}
         if once:
             msg["once"] = True
+        if reply:
+            msg["reply"] = reply
+        if fwd:
+            msg["fwd"] = fwd[:40]
         msg = self._sign(gid, msg)
         self._append(gid, msg)
         self.ui("on_chat_changed", gid)
         self._deliver(gid, msg)
+
+    # ---------- Telegram-style extras: reactions, edits, pins, forwards, typing, Saved Messages
+    REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🔥", "👏"]
+
+    def _action(self, gid, kind, text):
+        """A small signed message that changes another one (reaction, edit, pin)."""
+        if not self.can_post(gid) and kind != "react":
+            return None
+        msg = self._sign(gid, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(), "ts": time.time(),
+                               "kind": kind, "text": text})
+        self._append(gid, msg)
+        self.ui("on_chat_changed", gid)
+        self._deliver(gid, msg)
+        return msg
+
+    def react(self, gid, target, emoji):
+        """Your reaction to a message ('' removes it). One reaction per person, like Telegram's default."""
+        mine = self.derived(gid)["reacts"].get(target, {})
+        current = next((e for e, who in mine.items() if self.me in who), "")
+        return self._action(gid, "react", f"{target}|{'' if current == emoji else emoji}")
+
+    def edit_message(self, gid, target, text):
+        text = text.strip()
+        m = next((x for x in self.msgs.get(gid, []) if x["id"] == target), None)
+        if not text or not m or m.get("from") != self.me or m.get("kind") != "text":
+            return None
+        return self._action(gid, "edit", f"{target}\n{text[:8000]}")
+
+    def pin_message(self, gid, target):
+        """Pin a message for everyone in the chat ('' unpins)."""
+        return self._action(gid, "pin", target or "")
+
+    def forward(self, gid_from, mid, gid_to):
+        m = next((x for x in self.msgs.get(gid_from, []) if x["id"] == mid), None)
+        if not m or m.get("deleted") or not self.can_post(gid_to):
+            return False
+        origin = m.get("fwd") or (self.my_name() if m.get("from") == self.me else m.get("name", "?"))
+        if m.get("kind") == "text":
+            text = self.derived(gid_from)["edits"].get(mid, m.get("text", ""))
+            self.send_text(gid_to, text, fwd=origin)
+            return True
+        if m.get("kind") == "file":
+            path = self.local_file(gid_from, m["file"]["id"]) if m.get("from") != self.me else \
+                (self.groups[gid_from].get("files") or {}).get(m["file"]["id"])
+            if path and os.path.isfile(path):
+                g = self.groups[gid_to]
+                fid = secrets.token_hex(8)
+                g.setdefault("files", {})[fid] = path
+                msg = self._sign(gid_to, {"id": secrets.token_hex(8), "from": self.me, "name": self.my_name(),
+                                          "ts": time.time(), "kind": "file", "text": m.get("text", ""),
+                                          "file": {"id": fid, "name": m["file"]["name"], "size": os.path.getsize(path)},
+                                          "fwd": origin[:40]})
+                self._append(gid_to, msg)
+                self.save()
+                self.ui("on_chat_changed", gid_to)
+                self._deliver(gid_to, msg)
+                return True
+        if m.get("kind") == "sticker" and m.get("sticker") != "custom":
+            self.send_sticker(gid_to, m["sticker"])
+            return True
+        return False
+
+    def derived(self, gid):
+        """What reactions, edits and pins add up to (worked out from the messages, so order doesn't matter)."""
+        lst = self.msgs.get(gid, [])
+        cache = self.__dict__.setdefault("_derived", {})
+        key = (len(lst), lst[-1]["id"] if lst else "")
+        hit = cache.get(gid)
+        if hit and hit[0] == key:
+            return hit[1]
+        by_id = {m["id"]: m for m in lst}
+        reacts, edits, pinned = {}, {}, None
+        per_person = {}
+        for m in lst:
+            k = m.get("kind")
+            if k == "react":
+                target, _, emoji = (m.get("text") or "").partition("|")
+                per_person[(target, m["from"])] = emoji
+            elif k == "edit":
+                target, _, text = (m.get("text") or "").partition("\n")
+                t = by_id.get(target)
+                if t and t.get("from") == m.get("from") and not t.get("deleted"):
+                    edits[target] = text
+            elif k == "pin":
+                pinned = m.get("text") or None
+        for (target, who), emoji in per_person.items():
+            if emoji and target in by_id:
+                reacts.setdefault(target, {}).setdefault(emoji, []).append(who)
+        if pinned and (pinned not in by_id or by_id[pinned].get("deleted")):
+            pinned = None
+        out = {"reacts": reacts, "edits": edits, "pinned": pinned}
+        cache[gid] = (key, out)
+        return out
+
+    # typing… (a tiny signal, never stored)
+    def send_typing(self, gid):
+        last = self.__dict__.setdefault("_typing_sent", {})
+        if time.time() - last.get(gid, 0) < 3 or gid not in self.groups or self.groups[gid].get("kind") == "saved":
+            return
+        last[gid] = time.time()
+        targets = [d for d in self.online_members(gid) if d != self.me]
+        peer = self.groups[gid].get("peer")
+        if self.groups[gid].get("kind") == "direct" and peer and peer not in targets:
+            targets.append(peer)                          # a friend: their known address works even before "online"
+        for did in targets:
+            threading.Thread(target=lambda d=did: self._try(
+                lambda: self._request(gid, d, "POST", "/c/typing", {}, timeout=3)), daemon=True).start()
+
+    def typing_names(self, gid):
+        now = time.time()
+        t = (self.__dict__.get("_typing") or {}).get(gid, {})
+        g = self.groups.get(gid) or {}
+        return [(g.get("members", {}).get(d) or {}).get("name", "Someone") for d, ts in t.items() if now - ts < 6]
+
+    # Saved Messages: a private chat with yourself (it follows you to your linked devices)
+    def saved_gid(self):
+        gid = "saved-" + hashlib.sha256(self.me.encode()).hexdigest()[:12]
+        if gid not in self.groups:
+            with self.lock:
+                self.groups[gid] = {"id": gid, "kind": "saved", "name": "Saved Messages", "owner": self.me,
+                                    "key": secrets.token_bytes(32).hex(), "version": 1, "created": time.time(),
+                                    "members": {self.me: {"name": self.my_name(), "role": "owner", "pub": self.my_pub(),
+                                                          "os": OS_NAME}}, "files": {}}
+                self.msgs.setdefault(gid, [])
+                self.ids.setdefault(gid, set())
+                self.save()
+        return gid
 
     def send_files(self, gid, paths, voice=None, once=False):
         if not self.can_post(gid):
@@ -6874,6 +7011,11 @@ class Chat:
             self.people[pid]["card_busy"] = True
             threading.Thread(target=self._fetch_card, args=(pid, ip, port, pv), daemon=True).start()
         f = self.contacts["friends"].get(pid)
+        if f is not None:
+            f["last_seen"] = time.time()
+            if time.time() - self.__dict__.get("_ls_saved", 0) > 300:      # write at most every 5 minutes
+                self._ls_saved = time.time()
+                self.save_contacts()
         if f and (f.get("ip") != ip or f.get("port") != port):
             f["ip"], f["port"] = ip, port
             self.save_contacts()
@@ -6920,6 +7062,11 @@ class Chat:
         self.save_contacts()
         self.pr.last_beacon = 0                           # tell everyone soon
         self.ui("on_people_changed")
+
+    def last_seen(self, pid):
+        f = self.contacts["friends"].get(pid) or {}
+        o = self.online.get(pid) or {}
+        return max(f.get("last_seen", 0), o.get("seen", 0), (self.people.get(pid) or {}).get("seen", 0))
 
     def card_of(self, pid):
         if pid == self.me:
@@ -7307,7 +7454,8 @@ class Chat:
         self.unread[gid] = 0
         changed = False
         for m in self.msgs.get(gid, []):
-            if m.get("from") != self.me and m.get("kind") not in ("system", "delete") and not m.get("r_sent") \
+            if m.get("from") != self.me and m.get("kind") not in ("system", "delete", "react", "edit", "pin") \
+                    and not m.get("r_sent") \
                     and not m.get("deleted"):
                 m["r_sent"] = True
                 changed = True
@@ -8303,7 +8451,9 @@ class Chat:
             if g.get("owner_only") and did != g.get("owner"):
                 return reply({"ok": False, "reason": "only the owner can post in this group"}, 403)
             if self._append(gid, m):
-                if m["kind"] not in ("system", "delete"):
+                if m["kind"] in ("text", "file", "sticker"):          # they sent it: not typing any more
+                    (self.__dict__.get("_typing") or {}).get(gid, {}).pop(m["from"], None)
+                if m["kind"] not in ("system", "delete", "react", "edit", "pin"):
                     self.unread[gid] = self.unread.get(gid, 0) + 1
                     self.queue_receipt(gid, m["from"], m["id"], "d")
                 self.linked.push(gid, m)
@@ -8330,6 +8480,10 @@ class Chat:
             return reply(self._meta_for_members(g))
         if path == "/c/groupadd" and not pair and g.get("kind") == "direct" and did == g.get("peer"):
             return reply(self._added_to_group(did, req))
+        if path == "/c/typing" and not pair:
+            self.__dict__.setdefault("_typing", {}).setdefault(gid, {})[did] = time.time()
+            self.ui("on_chat_typing", gid)
+            return reply({"ok": True})
         if path == "/c/ping" and not pair:
             return reply({"ok": True, "ver": APP_VERSION, "os": OS_NAME, "calls": audio_supported()[0]})
         if path == "/c/receipt" and not pair:
@@ -9545,7 +9699,7 @@ class LinkedDevices:
         if path == "/t/push":
             gid, m = req.get("gid"), req.get("msg") or {}
             if gid in c.groups and isinstance(m, dict) and m.get("id") and c._append(gid, m):
-                if m.get("from") != c.me and m.get("kind") not in ("system", "delete"):
+                if m.get("from") != c.me and m.get("kind") not in ("system", "delete", "react", "edit", "pin"):
                     c.unread[gid] = c.unread.get(gid, 0) + 1
                     c.ui("on_chat_message", gid, m)
                 else:
@@ -9798,6 +9952,14 @@ CHAT_CSS = b"""
 .chat-mine .chat-text text { color: #ffffff; }
 .chat-system { opacity: 0.65; }
 .chat-code { font-size: 22px; font-weight: bold; letter-spacing: 4px; }
+.chat-quote { border-left: 3px solid alpha(currentColor, 0.6); background-color: alpha(currentColor, 0.08);
+  border-radius: 6px; padding: 3px 6px; }
+.chat-react { padding: 1px 6px; min-height: 0; border-radius: 12px; font-size: smaller; }
+.chat-react-mine { border: 1px solid #ff7a1a; }
+.chat-pinbar { background-color: alpha(#ff7a1a, 0.12); border-radius: 8px; }
+.chat-replybar { background-color: alpha(#ff7a1a, 0.10); border-radius: 8px; padding: 2px 4px; }
+.chat-unread { background-color: alpha(#ff7a1a, 0.15); border-radius: 10px; padding: 2px 12px; }
+.chat-flash { background-color: alpha(#ff7a1a, 0.25); border-radius: 12px; }
 @keyframes arckad-stripes { from { background-position: 0px 0px; } to { background-position: 28px 0px; } }
 @keyframes arckad-pulse { 0% { opacity: 1.0; } 50% { opacity: 0.3; } 100% { opacity: 1.0; } }
 progressbar.arckad-transfer trough { min-height: 8px; border-radius: 5px; }
@@ -10038,6 +10200,19 @@ class CropDialog(Gtk.Dialog):
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         self.cropped().savev(str(path), "jpeg", ["quality"], ["92"])
         return str(path)
+
+
+def last_seen_text(ts):
+    if not ts:
+        return "offline"
+    t, now = time.localtime(ts), time.localtime()
+    if time.time() - ts < 60:
+        return "last seen just now"
+    if t.tm_yday == now.tm_yday and t.tm_year == now.tm_year:
+        return time.strftime("last seen today at %H:%M", t)
+    if time.time() - ts < 2 * 86400 and (now.tm_yday - t.tm_yday) % 366 == 1:
+        return time.strftime("last seen yesterday at %H:%M", t)
+    return time.strftime("last seen %d %b at %H:%M", t)
 
 
 class ProfileDialog(Gtk.Dialog):
@@ -10322,7 +10497,8 @@ class ChatPanel(Gtk.Box):
         pb.set_tooltip_text("Add friends, new group, join a group")
         top.add(pb)
         lmenu = Gtk.Menu()
-        for label, cb in (("Profile…", self.edit_profile), ("Chat wallpaper…", lambda: self.choose_wallpaper(None)),
+        for label, cb in (("⭐ Saved Messages", self.open_saved), ("Profile…", self.edit_profile),
+                          ("Chat wallpaper…", lambda: self.choose_wallpaper(None)),
                           ("Back up chats…", self.backup), ("Restore chats from a backup…", self.restore),
                           ("Automatic backups (also to Google Drive)…", self.auto_backup_settings),
                           ("Linked devices (phone + PC, one account)…", self.linked_devices),
@@ -10486,6 +10662,21 @@ class ChatPanel(Gtk.Box):
         conv.add(self.find_bar)
         self.select_mode, self.selected = False, set()
 
+        self.pin_bar = Gtk.EventBox()                  # 📌 pinned message (click: jump to it)
+        pb = Gtk.Box(spacing=8, margin=6)
+        self.pin_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        pb.pack_start(self.pin_label, True, True, 0)
+        self.unpin_btn = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        self.unpin_btn.set_relief(Gtk.ReliefStyle.NONE)
+        self.unpin_btn.set_tooltip_text("Unpin")
+        self.unpin_btn.connect("clicked", lambda *_: self.chat.pin_message(self.gid, ""))
+        pb.add(self.unpin_btn)
+        self.pin_bar.add(pb)
+        self.pin_bar.get_style_context().add_class("chat-pinbar")
+        self.pin_bar.connect("button-press-event", lambda *_: self.jump_to(self.chat.derived(self.gid)["pinned"]) or True)
+        self.pin_bar.set_no_show_all(True)
+        conv.add(self.pin_bar)
+        self.reply_to, self.editing = None, None
         self.stack = Gtk.Stack()
         self.stack.add_named(Gtk.Label(), "empty")
         self.scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
@@ -10541,6 +10732,16 @@ class ChatPanel(Gtk.Box):
             comp.add(w)
         comp.pack_start(self.entry, True, True, 0)
         comp.add(self.send_btn)
+        self.reply_bar = Gtk.Box(spacing=8, margin_start=6, margin_end=6)
+        self.reply_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        self.reply_bar.pack_start(self.reply_label, True, True, 0)
+        rx = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        rx.set_relief(Gtk.ReliefStyle.NONE)
+        rx.connect("clicked", lambda *_: self.cancel_reply())
+        self.reply_bar.add(rx)
+        self.reply_bar.get_style_context().add_class("chat-replybar")
+        self.reply_bar.set_no_show_all(True)
+        conv.add(self.reply_bar)
         self.composer = comp
         conv.add(comp)
         self.rec_bar = Gtk.Box(spacing=8)
@@ -10616,7 +10817,10 @@ class ChatPanel(Gtk.Box):
         self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
                            Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
         self.connect("drag-data-received", self.on_drop)
-        self.entry.connect("changed", lambda *_: self.chat.touch())
+        self.entry.connect("changed", lambda *_: (self.chat.touch(), self.gid and self.entry.get_text()
+                                                  and not self.editing and self.chat.send_typing(self.gid)))
+        self.entry.connect("key-press-event", lambda w, ev: (self.cancel_reply(), True)[1]
+                           if ev.keyval == Gdk.KEY_Escape and (self.reply_to or self.editing) else False)
         self.pages.show_all()
         self.pages.set_visible_child_name("list")
         self.refresh()
@@ -10642,6 +10846,13 @@ class ChatPanel(Gtk.Box):
             self.code_box.hide()                      # another group's join code doesn't belong here
         self.pages.set_visible_child_name("conv")
         self.apply_wallpaper()
+        n = self.chat.unread.get(gid, 0)
+        if n:
+            real = [m for m in self.chat.msgs.get(gid, []) if m.get("from") != self.chat.me
+                    and m.get("kind") not in ("system", "delete", "react", "edit", "pin")]
+            if real:
+                self._first_unread = real[-min(n, len(real))]["id"]
+        self.cancel_reply()
         self.show_messages()
         self.update_info()
         self.chat.mark_read(gid)
@@ -10691,8 +10902,7 @@ class ChatPanel(Gtk.Box):
         # chats, newest activity first
         for r in self.chat_list.get_children():
             self.chat_list.remove(r)
-        order = sorted(self.chat.groups, key=lambda g: -((self.chat.msgs.get(g) or [{}])[-1].get("ts", 0)
-                                                          or self.chat.groups[g].get("created", 0)))
+        order = self.order_chats()
         for g in order:
             if self.chat.groups[g].get("hidden"):
                 continue
@@ -10708,6 +10918,28 @@ class ChatPanel(Gtk.Box):
         if self.pages.get_visible_child_name() == "people":
             self.refresh_people()
 
+    def order_chats(self):
+        """Pinned chats first (in the order you pinned them), then newest activity."""
+        pins = [g for g in self.win.cfg.get("chat_pins", []) if g in self.chat.groups]
+
+        def last(g):
+            real = [m for m in self.chat.msgs.get(g, []) if m.get("kind") not in ("react", "edit", "delete")]
+            return (real[-1].get("ts", 0) if real else 0) or self.chat.groups[g].get("created", 0)
+        rest = sorted((g for g in self.chat.groups if g not in pins), key=lambda g: -last(g))
+        return pins + rest
+
+    def toggle_chat_flag(self, gid, key):
+        lst = self.win.cfg.setdefault(key, [])
+        if gid in lst:
+            lst.remove(gid)
+        else:
+            lst.insert(0, gid) if key == "chat_pins" else lst.append(gid)
+        write_json(CONFIG_FILE, self.win.cfg)
+        self.refresh()
+
+    def open_saved(self):
+        self.open_chat(self.chat.saved_gid())
+
     def _chat_row(self, gid):
         g = self.chat.groups[gid]
         row = Gtk.ListBoxRow()
@@ -10717,14 +10949,21 @@ class ChatPanel(Gtk.Box):
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         top = Gtk.Box(spacing=6)
         name = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
-        icon = "" if g.get("kind") == "direct" else "👥 "
+        icon = {"direct": "", "saved": "⭐ "}.get(g.get("kind"), "👥 ")
         unread = self.chat.unread.get(gid, 0)
         weight = "heavy" if unread else "bold"
         name.set_markup(f"<span weight='{weight}'>{esc(icon + self.chat_title(gid))}</span>"
                         + (" <small>(left)</small>" if g.get("removed") else ""))
         ev_box = Gtk.EventBox()
         top.pack_start(name, True, True, 0)
-        visible = [m for m in self.chat.msgs.get(gid, []) if m.get("kind") != "delete" and m.get("deleted") != "me"]
+        flags = ("📌 " if gid in self.win.cfg.get("chat_pins", []) else "") + \
+                ("🔕" if gid in self.win.cfg.get("chat_mute", []) else "")
+        if flags:
+            fl = Gtk.Label()
+            fl.set_markup(f"<small>{flags.strip()}</small>")
+            top.add(fl)
+        visible = [m for m in self.chat.msgs.get(gid, []) if m.get("kind") not in ("delete", "react", "edit")
+                   and m.get("deleted") != "me"]
         last = visible[-1] if visible else None
         if last:
             when = last.get("ts", 0)
@@ -10747,16 +10986,29 @@ class ChatPanel(Gtk.Box):
                 what = "👁 One-time message"
             if last.get("deleted") == "everyone":
                 what = "🚫 Message deleted"
+            if last["kind"] == "text":
+                what = self.chat.derived(gid)["edits"].get(last["id"], what)
+            if last["kind"] == "pin":
+                who, what = "", "📌 " + ("pinned a message" if last.get("text") else "unpinned a message")
+            if last.get("fwd"):
+                what = "➡ " + what
             prev = (who + what).replace("\n", " ")
         else:
             prev = "Say hello 👋" if g.get("kind") == "direct" else "No messages yet"
-        pl = Gtk.Label(label=prev[:80], xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
-        pl.get_style_context().add_class("dim-label")
+        typing = self.chat.typing_names(gid)
+        pl = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
+        if typing:
+            pl.set_markup(f"<i>{esc(typing[0] if g.get('kind') != 'direct' else '')}{' ' if g.get('kind') != 'direct' else ''}"
+                          f"typing…</i>")
+        else:
+            pl.set_text(prev[:80])
+            pl.get_style_context().add_class("dim-label")
         bottom.pack_start(pl, True, True, 0)
         n = self.chat.unread.get(gid, 0)
         if n:
             badge = Gtk.Label()
-            badge.set_markup(f"<span background='#2f7fd8' foreground='#ffffff'><b> {n} </b></span>")
+            badge.set_markup(f"<span background='{'#77767b' if gid in self.win.cfg.get('chat_mute', []) else '#2f7fd8'}' "
+                             f"foreground='#ffffff'><b> {n} </b></span>")
             bottom.add(badge)
         texts.add(bottom)
         box.pack_start(texts, True, True, 0)
@@ -10774,6 +11026,10 @@ class ChatPanel(Gtk.Box):
             it = Gtk.MenuItem(label=label)
             it.connect("activate", lambda *_: cb())
             menu.append(it)
+        add("📌 Unpin chat" if gid in self.win.cfg.get("chat_pins", []) else "📌 Pin to top",
+            lambda: self.toggle_chat_flag(gid, "chat_pins"))
+        add("🔔 Unmute" if gid in self.win.cfg.get("chat_mute", []) else "🔕 Mute notifications",
+            lambda: self.toggle_chat_flag(gid, "chat_mute"))
         if self.chat.unread.get(gid):
             add("Mark as read", lambda: (self.chat.mark_read(gid), self.refresh()))
         else:
@@ -10878,15 +11134,28 @@ class ChatPanel(Gtk.Box):
                 self.info.set_text("waiting for them to come online to finish the friendship")
             else:
                 cl = self.chat.card_line(self.chat.card_of(pid))
-                self.info.set_text(("online" if self.chat.person_online(pid) else "offline") + (f" · {cl}" if cl else ""))
+                if self.chat.typing_names(self.gid):
+                    state = "typing…"
+                elif self.chat.person_online(pid):
+                    state = "online"
+                else:
+                    state = last_seen_text(self.chat.last_seen(pid))
+                self.info.set_text(state + (f" · {cl}" if cl else ""))
+        elif g.get("kind") == "saved":
+            self.call_btn.set_visible(False)
+            self.info.set_text("your notes and files · on your linked devices too")
         else:
             self.call_btn.set_visible(False)
             members = g.get("members", {})
             online = len(self.chat.online_members(self.gid))
             owner = members.get(g.get("owner"), {}).get("name", "?")
             you = " (you)" if g.get("owner") == self.chat.me else ""
-            self.info.set_text(f"{len(members)} member{'s' if len(members) != 1 else ''} · {online} online · "
-                               f"owner: {owner}{you}" + (" · announcements only" if g.get("owner_only") else ""))
+            typing = self.chat.typing_names(self.gid)
+            if typing:
+                self.info.set_text(f"{', '.join(typing[:2])} typing…")
+            else:
+                self.info.set_text(f"{len(members)} member{'s' if len(members) != 1 else ''} · {online} online · "
+                                   f"owner: {owner}{you}" + (" · announcements only" if g.get("owner_only") else ""))
         can = self.chat.can_post(self.gid)
         self.composer.set_visible(can)
         self.composer.set_sensitive(can)
@@ -11671,8 +11940,21 @@ class ChatPanel(Gtk.Box):
         if self.pages.get_visible_child_name() == "conv" and self.get_mapped():
             self.chat.mark_read(self.gid)
         self._live = {}
+        self._rows_by_id = {}
         last_day = None
-        shown = [m for m in self.chat.msgs.get(self.gid, []) if m.get("kind") != "delete" and m.get("deleted") != "me"]
+        self._der = self.chat.derived(self.gid)
+        first_unread = self.__dict__.pop("_first_unread", None)
+        pinned = self._der["pinned"]
+        pm = next((x for x in self.chat.msgs.get(self.gid, []) if x["id"] == pinned), None) if pinned else None
+        if pm:
+            self.pin_label.set_markup(f"<small><b>📌 Pinned</b> · {esc(pm.get('name', '?'))}: {esc(self._snippet(pm))}</small>")
+            self.unpin_btn.set_visible(self.chat.can_post(self.gid))
+            self.pin_bar.set_no_show_all(False)
+            self.pin_bar.show_all()
+        else:
+            self.pin_bar.hide()
+        shown = [m for m in self.chat.msgs.get(self.gid, []) if m.get("kind") not in ("delete", "react", "edit")
+                 and m.get("deleted") != "me"]
         shown = [m for m in shown if self._matches(m)]
         if self.find_bar.get_visible() and not shown:
             e = Gtk.Label(label="No messages match the search or filters.", margin=20)
@@ -11690,9 +11972,23 @@ class ChatPanel(Gtk.Box):
                 row = Gtk.ListBoxRow(activatable=False)
                 row.add(d)
                 self.list.add(row)
-            self.list.add(self._row(m))
+            if first_unread and m["id"] == first_unread:
+                ur = Gtk.ListBoxRow(activatable=False)
+                ul = Gtk.Label(margin=4)
+                ul.set_markup("<small><b>⬇ Unread messages</b></small>")
+                ul.get_style_context().add_class("chat-unread")
+                ur.add(ul)
+                self.list.add(ur)
+                self._unread_row = ur
+            r = self._row(m)
+            self._rows_by_id[m["id"]] = r
+            self.list.add(r)
         self.list.show_all()
-        GLib.idle_add(self._scroll_bottom)
+        if first_unread and getattr(self, "_unread_row", None):
+            GLib.idle_add(lambda: self.scroll.get_vadjustment().set_value(
+                max(0, self._unread_row.get_allocation().y - 40)) or False)
+        else:
+            GLib.idle_add(self._scroll_bottom)
         self.win.update_chat_button()
 
     # ---------- search and filters
@@ -11813,8 +12109,30 @@ class ChatPanel(Gtk.Box):
             it.set_sensitive(ok)
             it.connect("activate", lambda *_: cb())
             menu.append(it)
+        ok_msg = not m.get("deleted") and m.get("kind") not in ("system", "pin")
+        if ok_msg and self.chat.can_post(self.gid):
+            add("↩ Reply", lambda: self.start_reply(m))
+        if ok_msg:
+            rx = Gtk.MenuItem(label="😀 React")
+            sub = Gtk.Menu()
+            for e in Chat.REACTIONS:
+                it = Gtk.MenuItem(label=e)
+                it.connect("activate", lambda _i, e=e: self.chat.react(self.gid, m["id"], e))
+                sub.append(it)
+            rx.set_submenu(sub)
+            menu.append(rx)
+        if mine and m.get("kind") == "text" and ok_msg and not m.get("once") and self.chat.can_post(self.gid):
+            add("✏ Edit", lambda: self.start_edit(m))
+        if ok_msg and not m.get("once"):
+            add("➡ Forward…", lambda: self.forward_dialog(m))
+            add("⭐ Save to Saved Messages", lambda: (self.chat.forward(self.gid, m["id"], self.chat.saved_gid()),
+                                                     self.win.flash_all("Saved to ⭐ Saved Messages")))
+        if ok_msg and self.chat.can_post(self.gid):
+            pinned = self.chat.derived(self.gid)["pinned"] == m["id"]
+            add("📌 Unpin" if pinned else "📌 Pin for everyone", lambda: self.chat.pin_message(self.gid, "" if pinned else m["id"]))
+        menu.append(Gtk.SeparatorMenuItem())
         if m.get("kind") == "text" and not m.get("once") and not m.get("deleted"):
-            add("Copy text", lambda: self.win.copy_text(m.get("text", "")))
+            add("Copy text", lambda: self.win.copy_text(self.chat.derived(self.gid)["edits"].get(m["id"], m.get("text", ""))))
         add("Select…", lambda: (self.set_select(True), self.toggle_selected(m["id"], True), self.show_messages()))
         add("Info (time, delivered, read)", lambda: self.message_info(m))
         menu.append(Gtk.SeparatorMenuItem())
@@ -11825,6 +12143,31 @@ class ChatPanel(Gtk.Box):
                 and self.chat.delete_for_everyone(self.gid, [m["id"]]), self.chat.can_post(self.gid))
         menu.show_all()
         menu.popup_at_pointer(event)
+
+    def forward_dialog(self, m):
+        d = Gtk.Dialog(title="Forward to…", transient_for=self.get_toplevel(), modal=True)
+        d.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        d.set_default_size(360, 420)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        lb = Gtk.ListBox()
+        targets = [self.chat.saved_gid()] + [g for g in self.order_chats() if g != self.chat.saved_gid()
+                                             and self.chat.can_post(g) and not self.chat.groups[g].get("removed")]
+        for g in targets:
+            r = Gtk.ListBoxRow()
+            r.gid = g
+            box = Gtk.Box(spacing=8, margin=6)
+            box.add(Gtk.Image.new_from_pixbuf(self.chat_avatar(g, 28)))
+            box.add(Gtk.Label(label=self.chat_title(g), xalign=0))
+            r.add(box)
+            lb.add(r)
+        lb.connect("row-activated", lambda _l, r: (self.chat.forward(self.gid, m["id"], r.gid),
+                                                   self.win.flash_all(f"Forwarded to {self.chat_title(r.gid)}"),
+                                                   d.response(Gtk.ResponseType.OK)))
+        sw.add(lb)
+        d.get_content_area().pack_start(sw, True, True, 0)
+        d.show_all()
+        d.run()
+        d.destroy()
 
     def message_info(self, m):
         g = self.chat.groups.get(self.gid) or {}
@@ -11847,6 +12190,15 @@ class ChatPanel(Gtk.Box):
         row = Gtk.ListBoxRow(activatable=False)
         mine = m.get("from") == self.chat.me
         when = time.strftime("%H:%M", time.localtime(m.get("ts", 0)))
+        if m["kind"] == "pin":
+            target = next((x for x in self.chat.msgs.get(self.gid, []) if x["id"] == m.get("text")), None)
+            who = "You" if mine else m.get("name", "?")
+            text = (f"📌 {who} pinned “{self._snippet(target, 40)}”" if m.get("text") else f"📌 {who} unpinned a message")
+            lbl = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, margin=4)
+            lbl.set_markup(f"<small>{esc(text)} · {when}</small>")
+            lbl.get_style_context().add_class("chat-system")
+            row.add(lbl)
+            return row
         if m["kind"] == "system":
             lbl = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, margin=4)
             lbl.set_markup(f"<small>{esc(m.get('text', ''))} · {when}</small>")
@@ -11863,10 +12215,31 @@ class ChatPanel(Gtk.Box):
         ctx = bubble.get_style_context()
         ctx.add_class("chat-bubble")
         ctx.add_class("chat-mine" if mine else "chat-theirs")
-        if not mine and (self.chat.groups.get(self.gid) or {}).get("kind") != "direct":
+        if not mine and (self.chat.groups.get(self.gid) or {}).get("kind") not in ("direct", "saved"):
             nm = Gtk.Label(xalign=0)
             nm.set_markup(f"<small><b>{esc(m.get('name', '?'))}</b></small>")
             bubble.add(nm)
+        der = getattr(self, "_der", None) or self.chat.derived(self.gid)
+        if m.get("fwd") and not m.get("deleted"):
+            fl = Gtk.Label(xalign=0)
+            fl.set_markup(f"<small><i>➡ Forwarded from <b>{esc(m['fwd'])}</b></i></small>")
+            bubble.add(fl)
+        if m.get("reply") and not m.get("deleted"):
+            target = next((x for x in self.chat.msgs.get(self.gid, []) if x["id"] == m["reply"]), None)
+            q = Gtk.EventBox()
+            qb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=6)
+            qn = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            who = ("You" if target and target.get("from") == self.chat.me else (target or {}).get("name", "Message"))
+            qn.set_markup(f"<small><b>{esc(who)}</b></small>")
+            qt = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=34)
+            qt.set_markup(f"<small>{esc(self._snippet(target, 70))}</small>")
+            qb.add(qn)
+            qb.add(qt)
+            q.add(qb)
+            q.get_style_context().add_class("chat-quote")
+            q.set_tooltip_text("Show the original message")
+            q.connect("button-press-event", lambda *_a, t=m["reply"]: self.jump_to(t) or True)
+            bubble.add(q)
         if m.get("deleted") == "everyone":
             dl = Gtk.Label(xalign=0)
             dl.set_markup("<i>🚫 " + ("You deleted this message" if mine else "This message was deleted") + "</i>")
@@ -11877,7 +12250,7 @@ class ChatPanel(Gtk.Box):
         elif m.get("voice") and m.get("file"):
             bubble.add(self._voice_widget(m))
         elif m["kind"] == "text":
-            bubble.add(self._text_widget(m.get("text", "")))
+            bubble.add(self._text_widget(der["edits"].get(m["id"], m.get("text", ""))))
         elif m["kind"] == "sticker":
             ctx.remove_class("chat-mine")
             ctx.remove_class("chat-theirs")
@@ -11890,9 +12263,25 @@ class ChatPanel(Gtk.Box):
             warn.set_tooltip_text("Arckad-D can't confirm who sent this message: it came from a version without "
                                   "per-person signatures.")
             bubble.add(warn)
+        reacts = der["reacts"].get(m["id"]) if not m.get("deleted") else None
+        if reacts:
+            rb = Gtk.Box(spacing=4, halign=Gtk.Align.START)          # side by side, like Telegram
+            g = self.chat.groups.get(self.gid) or {}
+            for emoji, who in sorted(reacts.items(), key=lambda kv: -len(kv[1])):
+                b = Gtk.Button(label=f"{emoji} {len(who)}")
+                b.get_style_context().add_class("chat-react")
+                if self.chat.me in who:
+                    b.get_style_context().add_class("chat-react-mine")
+                names = ", ".join("You" if d == self.chat.me else (g.get("members", {}).get(d) or {}).get("name", "?")
+                                  for d in who)
+                b.set_tooltip_text(names)
+                b.connect("clicked", lambda _b, e=emoji, mid=m["id"]: self.chat.react(self.gid, mid, e))
+                rb.add(b)
+            bubble.add(rb)
         tl = Gtk.Label(xalign=1)
         ticks = self._ticks(m) if mine and m.get("deleted") != "everyone" else ""
-        tl.set_markup(f"<small>{when}</small>{ticks}")
+        edited = " <i>edited</i>" if m["id"] in der["edits"] and not m.get("deleted") else ""
+        tl.set_markup(f"<small>{when}{edited}</small>{ticks}")
         tl.set_opacity(0.9)
         tl.set_tooltip_text(time.strftime("%A %d %B %Y, %H:%M:%S", time.localtime(m.get("ts", 0)))
                             + (("\n" + self._tick_text(m)) if mine else ""))
@@ -12122,7 +12511,18 @@ class ChatPanel(Gtk.Box):
         """Message text with Arckad-D's emoji images (same look on every computer). Selectable and copyable."""
         parts = split_emoji(text)
         if not any(is_e for is_e, _ in parts):
-            t = Gtk.Label(label=text, xalign=0, wrap=True, selectable=True, max_width_chars=38)
+            t = Gtk.Label(xalign=0, wrap=True, selectable=True, max_width_chars=38)
+            urls = list(re.finditer(r"https?://[^\s<>\"']+", text))
+            if urls:                              # web addresses open in the browser
+                out, pos = [], 0
+                for u in urls:
+                    out.append(esc(text[pos:u.start()]))
+                    out.append(f"<a href=\"{esc(u.group(0))}\">{esc(u.group(0))}</a>")
+                    pos = u.end()
+                out.append(esc(text[pos:]))
+                t.set_markup("".join(out))
+            else:
+                t.set_text(text)
             t.set_can_focus(False)                # no automatic select-all when the chat opens
             t.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
             return t
@@ -12283,9 +12683,67 @@ class ChatPanel(Gtk.Box):
         text = self.entry.get_text().strip()
         if text and self.gid:
             self.entry.set_text("")
-            self.chat.send_text(self.gid, text, once=self.once_btn.get_active())
+            if self.editing:
+                self.chat.edit_message(self.gid, self.editing, text)
+            else:
+                self.chat.send_text(self.gid, text, once=self.once_btn.get_active(), reply=self.reply_to)
+            self.cancel_reply()
             self.once_btn.set_active(False)
             self.chat.start()
+
+    def start_reply(self, m):
+        self.editing = None
+        self.reply_to = m["id"]
+        who = "yourself" if m.get("from") == self.chat.me else m.get("name", "?")
+        self.reply_label.set_markup(f"<small>↩ Replying to <b>{esc(who)}</b>: {esc(self._snippet(m))}</small>")
+        self.reply_bar.set_no_show_all(False)
+        self.reply_bar.show_all()
+        self.entry.grab_focus()
+
+    def start_edit(self, m):
+        self.reply_to = None
+        self.editing = m["id"]
+        self.reply_label.set_markup("<small>✏ <b>Editing</b> your message · Esc to cancel</small>")
+        self.reply_bar.set_no_show_all(False)
+        self.reply_bar.show_all()
+        self.entry.set_text(self.chat.derived(self.gid)["edits"].get(m["id"], m.get("text", "")))
+        self.entry.grab_focus()
+        self.entry.set_position(-1)
+
+    def cancel_reply(self):
+        was_editing = self.editing
+        self.reply_to, self.editing = None, None
+        self.reply_bar.hide()
+        if was_editing:
+            self.entry.set_text("")
+
+    def _snippet(self, m, n=60):
+        if not m:
+            return "a message"
+        if m.get("deleted"):
+            return "deleted message"
+        if m.get("kind") == "text":
+            return self.chat.derived(self.gid)["edits"].get(m["id"], m.get("text", ""))[:n].replace("\n", " ")
+        if m.get("voice"):
+            return "🎤 Voice message"
+        if m.get("kind") == "sticker":
+            return "🏷 Sticker"
+        if m.get("file"):
+            return "📎 " + m["file"]["name"]
+        return m.get("text", "")[:n]
+
+    def jump_to(self, mid):
+        """Scroll to a message and flash it (from a reply quote or the pinned bar)."""
+        row = (self.__dict__.get("_rows_by_id") or {}).get(mid)
+        if not row:
+            self.win.flash_all("That message is further back than the chat shows")
+            return
+        alloc = row.get_allocation()
+        adj = self.scroll.get_vadjustment()
+        adj.set_value(max(0, alloc.y - 60))
+        ctx = row.get_style_context()
+        ctx.add_class("chat-flash")
+        GLib.timeout_add(1400, lambda: ctx.remove_class("chat-flash") or False)
 
     def insert_emoji(self, e, pop):
         pos = self.entry.get_position()
@@ -15977,6 +16435,15 @@ class MainWindow(Gtk.ApplicationWindow):
             p.update_info()
         return False
 
+    def on_chat_typing(self, gid):
+        for p in self.chat_panels():
+            if p.gid == gid and p.pages.get_visible_child_name() == "conv":
+                p.update_info()
+            elif p.pages.get_visible_child_name() == "list":
+                p.refresh()
+        GLib.timeout_add(6500, lambda: [p.update_info() if p.gid == gid else None for p in self.chat_panels()] and False)
+        return False
+
     def on_chat_message(self, gid, msg):
         self.on_chat_changed(gid)
         visible = any(p.gid == gid and p.get_mapped() and p.pages.get_visible_child_name() == "conv"
@@ -15985,9 +16452,21 @@ class MainWindow(Gtk.ApplicationWindow):
             self.chat.mark_read(gid)
             self.update_chat_button()
             return False
-        if msg["kind"] == "system":
+        if msg["kind"] in ("system", "edit", "pin", "delete"):
+            return False
+        if gid in self.cfg.get("chat_mute", []):            # muted chat: just the unread count
             return False
         g = self.chat.groups.get(gid, {})
+        if msg["kind"] == "react":                          # only reactions to MY messages get a quiet note
+            target, _, emoji = (msg.get("text") or "").partition("|")
+            t = next((x for x in self.chat.msgs.get(gid, []) if x["id"] == target), None)
+            if not emoji or not t or t.get("from") != self.chat.me or self.chat.is_locked():
+                return False
+            snippet = (t.get("text") or (t.get("file") or {}).get("name") or "your message")[:40]
+            self.show_toast(f"{msg.get('name', '?')} reacted {emoji}", f"to “{snippet}”",
+                            avatar_pixbuf(msg.get("name", "?"), self.chat.avatar_file(msg.get("from")), 40),
+                            lambda: self.open_chat_from_toast(gid)) if self.get_visible() else None
+            return False
         body = {"file": f"📎 {(msg.get('file') or {}).get('name', 'file')}", "sticker": "🏷 Sticker"}.get(
             msg["kind"], msg.get("text") or "")
         direct = g.get("kind") == "direct"
