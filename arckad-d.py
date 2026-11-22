@@ -90,10 +90,16 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.28.0"
+APP_VERSION = "3.28.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
+if IS_WIN:
+    try:                                          # no "There is no disk in the drive" pop-ups from empty card readers
+        import ctypes as _ct                      # or DVD drives: Arckad-D just skips them
+        _ct.windll.kernel32.SetErrorMode(0x0001 | 0x8000)       # SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX
+    except Exception:
+        pass
 FROZEN = bool(getattr(sys, "frozen", False))                  # built into an .exe
 SCRIPT = Path(__file__).resolve()
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", SCRIPT.parent))
@@ -356,19 +362,14 @@ def is_hidden(name, st=None):
 
 
 def lower_my_priority():
-    """The calling thread works in the background: lowest disk and CPU priority, so whatever you're doing comes
-    first (Linux: idle I/O class and nice 19; Windows: background mode, which also lowers disk priority)."""
+    """The calling thread reads the disk in the background: on Linux it gets the idle disk class, so other
+    programs' disk work goes first. The CPU priority is deliberately left alone, on every system: a starved
+    background thread holding Python's interpreter lock would freeze the whole window (that's what Windows'
+    background mode did in 3.27). The index also pauses briefly every few hundred files instead."""
     try:
         if IS_WIN:
-            import ctypes
-            k = ctypes.windll.kernel32
-            k.SetThreadPriority(k.GetCurrentThread(), 0x00010000)          # THREAD_MODE_BACKGROUND_BEGIN
             return
         tid = threading.get_native_id()
-        try:
-            os.setpriority(os.PRIO_PROCESS, tid, 19)
-        except (OSError, AttributeError):
-            pass
         import ctypes
         import platform
         nr = {"x86_64": 251, "aarch64": 30, "i686": 289, "i386": 289, "armv7l": 314}.get(platform.machine())
@@ -1534,6 +1535,8 @@ class FileIndex:
                 batch.append((str(p), p.name.lower(), "" if is_dir else ext_of(p.name),
                               int(is_dir), 0 if is_dir else st.st_size, st.st_mtime))
                 n += 1
+                if n % 300 == 0:
+                    time.sleep(0.01)              # give way: the window stays responsive and the disk breathes
                 if len(batch) >= 5000:
                     con.executemany("INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?)", batch)
                     batch = []
@@ -2244,6 +2247,14 @@ class FilePane(Gtk.Box):
         if mode != "folder":
             self.set_rows([])
             self.status.set_text("Loading…")
+        else:
+            def slow():                           # a slow drive: don't leave the previous folder on screen
+                if self.gen == gen and self.mode == "folder" and getattr(self, "_loading_gen", None) == gen:
+                    self.set_rows([])
+                    self.status.set_text(f"Opening {short(self.location) if self.location else 'the folder'}…")
+                return False
+            self._loading_gen = gen
+            GLib.timeout_add(400, slow)
 
         def work():
             try:
@@ -2302,6 +2313,7 @@ class FilePane(Gtk.Box):
     def finish_load(self, gen, rows, err):
         if gen != self.gen:
             return False
+        self._loading_gen = None
         self.set_busy(False)
         if err:
             self.set_rows([])
@@ -13355,6 +13367,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.setup_tray()
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
+        self.start_freeze_watch()
         if not IS_WIN:
             GLib.timeout_add_seconds(120, self._tracker_guard_tick)
             GLib.timeout_add_seconds(300, self._tracker_activity_tick)
@@ -13502,6 +13515,7 @@ class MainWindow(Gtk.ApplicationWindow):
             None,
             ("Update search index now", INDEX.rebuild),
             ("Search index settings…", self.index_settings),
+            ("Freeze report…", self.freeze_report),
         ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else [])))
         pair = Gtk.Box()
         pair.get_style_context().add_class("linked")
@@ -14066,7 +14080,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._side_header("Devices")
         if IS_WIN:
             for drive in self.windows_drives():
-                label, free = self.drive_info(drive)
+                label, free = self.cached_drive_info(drive)        # never waits for a slow drive
                 self._side_row(label, "drive-harddisk-symbolic", drive, sub=free)
         else:
             self._side_row("Computer", "drive-harddisk-symbolic", "/", sub=self.drive_info("/")[1])
@@ -14145,8 +14159,40 @@ class MainWindow(Gtk.ApplicationWindow):
 
     @staticmethod
     def windows_drives():
+        """The drive letters Windows has right now, from one instant call that never touches the drives
+        (checking each letter can hang for seconds on an offline network drive or an empty card reader)."""
+        import ctypes
         import string
-        return [f"{c}:\\" for c in string.ascii_uppercase if os.path.exists(f"{c}:\\")]
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        return [f"{c}:\\" for i, c in enumerate(string.ascii_uppercase) if mask >> i & 1]
+
+    def cached_drive_info(self, drive):
+        """A drive's name and free space from the cache; missing or old ones are fetched in the background."""
+        cache = self.__dict__.setdefault("_drive_cache", {})
+        hit = cache.get(drive)
+        if hit is None or time.time() - hit[2] > 60:
+            pending = self.__dict__.setdefault("_drive_pending", set())
+            if drive not in pending:
+                pending.add(drive)
+
+                def work(d=drive):
+                    try:
+                        import ctypes
+                        kind = ctypes.windll.kernel32.GetDriveTypeW(d)     # 2 removable, 4 network, 5 CD/DVD
+                        label, text = self.drive_info(d)
+                        if kind == 4 and not text:
+                            text = "network drive (not reachable)"
+                        elif kind in (2, 5) and not text:
+                            text = "no disc or card"
+                    except Exception:
+                        label, text = f"Drive {d[:2]}", ""
+                    old = cache.get(d)
+                    cache[d] = (label, text, time.time())
+                    pending.discard(d)
+                    if not old or old[:2] != (label, text):
+                        GLib.idle_add(lambda: self.build_sidebar() or False)
+                threading.Thread(target=work, daemon=True).start()
+        return (hit[0], hit[1]) if hit else (f"Drive {drive[:2]}", "…")
 
     def _poll_windows_drives(self):
         now = self.windows_drives()
@@ -15475,6 +15521,69 @@ class MainWindow(Gtk.ApplicationWindow):
             p.refresh()
         self.update_chat_button()
         return False
+
+    # ---------- freeze recorder: if the window is ever stuck, note what it was doing
+    def start_freeze_watch(self):
+        self._beat = time.time()
+
+        def beat():
+            self._beat = time.time()
+            return True
+        GLib.timeout_add(500, beat)
+        main_id = threading.main_thread().ident
+
+        def watch():
+            logged_for = 0
+            while True:
+                time.sleep(1.0)
+                stuck = time.time() - self._beat
+                if stuck > 3 and logged_for != int(self._beat):
+                    logged_for = int(self._beat)
+                    import traceback
+                    frame = sys._current_frames().get(main_id)
+                    stack = "".join(traceback.format_stack(frame)) if frame else "(no stack)"
+                    try:
+                        log = CONFIG_DIR / "freeze-report.txt"
+                        old = log.read_text(encoding="utf-8")[-60000:] if log.exists() else ""
+                        log.write_text(old + f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} · Arckad-D {APP_VERSION} · "
+                                       f"{OS_NAME} · window stuck for {stuck:.0f}+ s =====\n{stack}", encoding="utf-8")
+                    except OSError:
+                        pass
+        threading.Thread(target=watch, daemon=True).start()
+
+    def freeze_report(self):
+        log = CONFIG_DIR / "freeze-report.txt"
+        text = log.read_text(encoding="utf-8") if log.exists() else ""
+        d = Gtk.Dialog(title="Freeze report", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(720, 480)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        intro = Gtk.Label(xalign=0, wrap=True)
+        intro.set_markup("If Arckad-D's window is ever stuck for more than 3 seconds, it notes here what it was doing. "
+                         "<b>Copy this and send it to the developer</b>: it shows the cause exactly." if text else
+                         "✓ No freezes recorded. If the window ever gets stuck, Arckad-D notes what it was doing here.")
+        box.add(intro)
+        if text:
+            sw = Gtk.ScrolledWindow(vexpand=True)
+            tv = Gtk.TextView(editable=False, monospace=True, wrap_mode=Gtk.WrapMode.NONE)
+            tv.get_buffer().set_text(text[-20000:])
+            sw.add(tv)
+            box.pack_start(sw, True, True, 0)
+            row = Gtk.Box(spacing=8)
+            cp = Gtk.Button(label="Copy report")
+            cp.get_style_context().add_class("suggested-action")
+            cp.connect("clicked", lambda *_: (Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text[-20000:], -1),
+                                              self.flash_all("Freeze report copied")))
+            clear = Gtk.Button(label="Clear")
+            clear.connect("clicked", lambda *_: (log.unlink(missing_ok=True), d.response(Gtk.ResponseType.CLOSE)))
+            row.add(cp)
+            row.add(clear)
+            box.add(row)
+        d.show_all()
+        d.run()
+        d.destroy()
 
     def index_settings(self):
         d = Gtk.Dialog(title="Search index settings", transient_for=self, modal=True)
