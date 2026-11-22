@@ -90,7 +90,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.31.0"
+APP_VERSION = "3.31.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -14450,19 +14450,19 @@ Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
 SKINS = {
     "midnight": dict(dark=True, bg="#111114", bg2="#18181c", surface="#1b1b20", surface_hi="#25252c", side="#15151a",
                      text="#ededf2", dim="#a3a3b0", border="rgba(255,255,255,0.08)", accent="#ff7a1a", accent2="#ff9b45",
-                     accent_mid="#d9600c", tick="#7df9ff", ok="#3ddc84", warn="#ffb020", off="#a3a3b0",
+                     accent_mid="#d9600c", hover="#bf5208", tick="#7df9ff", ok="#3ddc84", warn="#ffb020", off="#a3a3b0",
                      accent_dark="#d4520a", on_accent="#ffffff", glow="rgba(255,122,26,0.38)",
                      glow_soft="rgba(255,122,26,0.16)", hdr1="#26262d", hdr2="#16161a", btn1="#2c2c34", btn2="#1f1f25",
                      menu="#1d1d23", scroll="rgba(255,255,255,0.22)", bubble_text="#ffffff"),
     "snow": dict(dark=False, bg="#f4f4f7", bg2="#ffffff", surface="#ffffff", surface_hi="#f1f1f5", side="#f7f7fa",
                  text="#1c1c22", dim="#5f5f6b", border="rgba(0,0,0,0.09)", accent="#f26b00", accent2="#ff9038",
-                 accent_mid="#c95500", tick="#7df9ff", ok="#1a7f37", warn="#b35900", off="#5f5f6b",
+                 accent_mid="#c95500", hover="#b04a00", tick="#7df9ff", ok="#1a7f37", warn="#b35900", off="#5f5f6b",
                  accent_dark="#c85400", on_accent="#ffffff", glow="rgba(242,107,0,0.30)",
                  glow_soft="rgba(242,107,0,0.12)", hdr1="#ffffff", hdr2="#ececf1", btn1="#ffffff", btn2="#eeeef3",
                  menu="#ffffff", scroll="rgba(0,0,0,0.25)", bubble_text="#ffffff"),
     "mono": dict(dark=True, bg="#0c0c0e", bg2="#141417", surface="#18181b", surface_hi="#232327", side="#111114",
                  text="#f3f3f3", dim="#a6a6ad", border="rgba(255,255,255,0.10)", accent="#f3f3f3", accent2="#ffffff",
-                 accent_mid="#e6e6e9", tick="#0a6cff", ok="#3ddc84", warn="#ffb020", off="#a6a6ad",
+                 accent_mid="#e6e6e9", hover="#f3f3f3", tick="#0a6cff", ok="#3ddc84", warn="#ffb020", off="#a6a6ad",
                  accent_dark="#cfcfd4", on_accent="#0c0c0e", glow="rgba(255,255,255,0.22)",
                  glow_soft="rgba(255,255,255,0.08)", hdr1="#222226", hdr2="#121215", btn1="#26262b", btn2="#1a1a1e",
                  menu="#1a1a1e", scroll="rgba(255,255,255,0.25)", bubble_text="#0c0c0e"),
@@ -14486,18 +14486,19 @@ button:active, button:checked, menubutton button:checked {
   background-color: $accent_mid; background-image: linear-gradient(to bottom, $accent2, $accent_dark); color: $on_accent;
   border-color: $accent_dark;
   box-shadow: inset 0 1px rgba(255,255,255,0.30), 0 0 12px $glow; }
-button:checked label, button:active label { color: $on_accent; }
+button:checked > label, button:active > label, button:checked > box > label, button:active > box > label
+{ color: $on_accent; }
 button:disabled { opacity: 0.45; box-shadow: none; }
 button.flat { background-image: none; background-color: transparent; border-color: transparent; box-shadow: none; }
 button.flat:hover { background-color: $glow_soft; border-color: transparent; }
 button.suggested-action { background-color: $accent_mid; background-image: linear-gradient(to bottom, $accent2, $accent_dark);
   color: $on_accent;
   border-color: $accent_dark; font-weight: 600; box-shadow: inset 0 1px rgba(255,255,255,0.35), 0 2px 12px $glow; }
-button.suggested-action label { color: $on_accent; }
+button.suggested-action > label, button.suggested-action > box > label { color: $on_accent; }
 button.destructive-action { background-color: #d32f2f; background-image: linear-gradient(to bottom, #ef5350, #c62828);
   color: #ffffff;
   border-color: #b71c1c; box-shadow: inset 0 1px rgba(255,255,255,0.3), 0 2px 10px rgba(229,57,53,0.35); }
-button.destructive-action label { color: #ffffff; }
+button.destructive-action > label, button.destructive-action > box > label { color: #ffffff; }
 entry, spinbutton:not(.vertical), searchbar entry { background-color: $surface; background-image: none; color: $text;
   border: 1px solid $border; border-radius: 10px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.20); caret-color: $accent; }
 entry:focus, spinbutton:focus { border-color: $accent; box-shadow: 0 0 0 3px $glow_soft; }
@@ -14539,8 +14540,11 @@ scale slider { background-image: linear-gradient(to bottom, #ffffff, #e2e2e6); b
 menu, .menu, .context-menu, popover, popover.background { background-color: $menu; color: $text;
   border: 1px solid $border; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.35); }
 menuitem { padding: 6px 12px; border-radius: 8px; }
-menuitem:hover { background-color: $accent_mid; background-image: linear-gradient(to right, $accent, $accent2); color: $on_accent; }
-menuitem:hover label { color: $on_accent; }
+menuitem:hover { background-color: $hover; background-image: none; color: $on_accent; }
+menu menuitem:not(:hover) label, .menu menuitem:not(:hover) label, menu menuitem:not(:hover) accellabel,
+popover label:not(:disabled) { color: $text; }
+menuitem:hover label, menuitem:hover accellabel { color: $on_accent; }
+popover button.suggested-action > label, popover button:checked > label { color: $on_accent; }
 tooltip, tooltip.background { background-color: $menu; color: $text; border: 1px solid $border; border-radius: 9px; }
 tooltip label { color: $text; }
 infobar, infobar > revealer > box { background-color: $surface_hi; background-image: none; color: $text; border: none; }
