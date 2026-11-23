@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.36.2"
+APP_VERSION = "3.36.3"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1826,16 +1826,18 @@ class FilePane(Gtk.Box):
         self.crumb_scroll = Gtk.ScrolledWindow(hexpand=True)
         self.crumb_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
         self.crumb_scroll.add(self.crumbs)
-        self.path_entry = Gtk.Entry(placeholder_text="Type a folder path and press Enter")
+        self.path_entry = Gtk.Entry(placeholder_text="Type a folder path and press Enter", width_chars=6)
         self.path_entry.connect("activate", self.on_path_entered)
         self.path_entry.connect("focus-out-event", lambda *_: self.path_stack.set_visible_child_name("crumbs"))
         self.path_stack = Gtk.Stack(hexpand=True)
         self.path_stack.add_named(self.crumb_scroll, "crumbs")
         self.path_stack.add_named(self.path_entry, "entry")
         self.row1.pack_start(self.path_stack, True, True, 0)
-        self.row1.add(self.win.icon_btn("document-edit-symbolic", "Type a path (Ctrl+L)", lambda *_: self.edit_path()))
+        self.edit_btn = self.win.icon_btn("document-edit-symbolic", "Type a path (Ctrl+L)", lambda *_: self.edit_path())
+        self.row1.add(self.edit_btn)
 
         views = Gtk.Box()
+        self.views_box = views
         views.get_style_context().add_class("linked")
         self.list_btn = Gtk.RadioButton.new(None)
         self.grid_btn = Gtk.RadioButton.new_from_widget(self.list_btn)
@@ -1858,18 +1860,20 @@ class FilePane(Gtk.Box):
         self.new_btn = Gtk.MenuButton(popup=new_menu)
         nb = Gtk.Box(spacing=4)
         nb.add(Gtk.Image.new_from_icon_name("folder-new-symbolic", Gtk.IconSize.BUTTON))
-        nb.add(Gtk.Label(label="New"))
+        self.new_label = Gtk.Label(label="New")
+        nb.add(self.new_label)
         self.new_btn.add(nb)
         self.new_btn.set_tooltip_text("Create a new folder or file here")
         self.new_btn.get_style_context().add_class("suggested-action")
         self.row1.add(self.new_btn)
         self.row1.reorder_child(self.new_btn, 1)          # right after Back / Forward / Up
         self.add(self.row1)
+        self.connect("size-allocate", self._on_pane_size)
 
         # filters (wrap onto two lines when the pane is narrow)
         flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=8,
                            column_spacing=4, row_spacing=4, border_width=4, homogeneous=False)
-        self.search = Gtk.SearchEntry(placeholder_text="Filter name or note (Ctrl+F)", width_chars=20)
+        self.search = Gtk.SearchEntry(placeholder_text="Filter name or note (Ctrl+F)", width_chars=12)
         self.search.connect("search-changed", self.on_filters_changed)
         self.kind_combo = Gtk.ComboBoxText()
         for k in KINDS:
@@ -2099,6 +2103,24 @@ class FilePane(Gtk.Box):
         self.search.handler_unblock_by_func(self.on_filters_changed)
         self.read_filters()
         self.load_location()
+
+    # ---------- narrow panes: a compact toolbar instead of being cut off
+    def _on_pane_size(self, _w, alloc):
+        narrow = getattr(self, "_narrow", False)
+        want = alloc.width < 430 if not narrow else alloc.width < 470          # a little hysteresis
+        if want != narrow and not getattr(self, "_narrow_pending", False):
+            self._narrow_pending = True
+            GLib.idle_add(self._set_narrow, want)                # never change sizes during an allocation
+
+    def _set_narrow(self, on):
+        self._narrow_pending = False
+        self._narrow = on
+        self.new_label.set_visible(not on)                       # “＋” only
+        self.edit_btn.set_visible(not on)                        # Ctrl+L still types a path
+        self.views_box.set_visible(not on)                       # Ctrl+1 / Ctrl+2 still switch views
+        self.search.set_placeholder_text("Filter (Ctrl+F)" if on else "Filter name or note (Ctrl+F)")
+        self.search.set_width_chars(8 if on else 12)
+        return False
 
     def go_back(self):
         if self.back_stack:
@@ -10826,8 +10848,23 @@ class ChatPanel(Gtk.Box):
                                        "then it's deleted")
         self.once_btn.connect("toggled", lambda b: self.entry.set_placeholder_text(
             "One-time message (deleted after viewing)…" if b.get_active() else "Message"))
-        for w in (self.emo_btn, self.sticker_btn, self.cam_btn, self.attach_btn, self.mic_btn, self.once_btn):
+        self.more_btn = Gtk.MenuButton(label="＋")
+        self.more_btn.set_tooltip_text("Sticker, camera, voice message, one-time message")
+        mm = Gtk.Menu()
+        for label, cb in (("🏷 Sticker", lambda: (self.sticker_pop.set_relative_to(self.more_btn), self.build_stickers(),
+                                                   self.sticker_pop.popup())),
+                          ("📷 Camera photo", lambda: self.take_photo()),
+                          ("🎤 Voice message", lambda: self.start_recording()),
+                          ("1× One-time message (next one)", lambda: self.once_btn.set_active(not self.once_btn.get_active()))):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            mm.append(it)
+        mm.show_all()
+        self.more_btn.set_popup(mm)
+        self.more_btn.set_no_show_all(True)
+        for w in (self.emo_btn, self.sticker_btn, self.cam_btn, self.attach_btn, self.mic_btn, self.once_btn, self.more_btn):
             comp.add(w)
+        comp.connect("size-allocate", self._on_comp_size)
         comp.pack_start(self.entry, True, True, 0)
         comp.add(self.send_btn)
         self.reply_bar = Gtk.Box(spacing=8, margin_start=6, margin_end=6)
@@ -12846,6 +12883,22 @@ class ChatPanel(Gtk.Box):
             self.once_btn.set_active(False)
             self.chat.start()
 
+    def _on_comp_size(self, _w, alloc):
+        narrow = getattr(self, "_comp_narrow", False)
+        want = alloc.width < 470 if not narrow else alloc.width < 520
+        if want != narrow:
+            self._comp_narrow = want
+
+            def apply():
+                for b in (self.sticker_btn, self.cam_btn, self.mic_btn):
+                    b.set_visible(not want)
+                self.once_btn.set_visible(not want or self.once_btn.get_active())
+                self.more_btn.set_visible(want)
+                if not want and self.sticker_pop.get_relative_to() is not self.sticker_btn:
+                    self.sticker_pop.set_relative_to(self.sticker_btn)
+                return False
+            GLib.idle_add(apply)
+
     def start_reply(self, m):
         self.editing = None
         self.reply_to = m["id"]
@@ -14681,8 +14734,10 @@ class PhonePanel(Gtk.Box):
         self.pin_msg = Gtk.Label()
         self.outer.add_named(LockScreen(win, self.pin, self.pin_msg, (), "Locked · enter your PIN to see your phone"), "locked")
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
-        sw = Gtk.StackSwitcher(stack=self.stack, halign=Gtk.Align.CENTER)
-        main.add(sw)
+        self.tabs = Gtk.Box(halign=Gtk.Align.CENTER)       # our own tab row (it can be compact)
+        self.tabs.get_style_context().add_class("linked")
+        self._tab_btns = {}
+        main.add(self.tabs)
         main.pack_start(self.stack, True, True, 0)
         # notifications
         nb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -14834,8 +14889,45 @@ class PhonePanel(Gtk.Box):
         self._m_key, self._ctl_seq, self._ctl_q = None, 0, None
         self._attach_control(self.m_area, lambda: self.m_image)
         self._parent = None
-        self.stack.connect("notify::visible-child-name", lambda *_: self.refresh())
+        for name, (full, _short) in self._TAB_TITLES.items():
+            b = Gtk.ToggleButton(label=full)
+            b.set_tooltip_text(full.split(" ", 1)[-1])
+            b.connect("toggled", lambda btn, n=name: self._tab_clicked(btn, n))
+            self.tabs.add(b)
+            self._tab_btns[name] = b
+        self.stack.connect("notify::visible-child-name", lambda *_: (self._sync_tabs(), self.refresh()))
+        self._sync_tabs()
+        self.connect("size-allocate", self._on_panel_size)      # icon-only tabs when the panel is narrow
         self.show_all()
+
+    # ---------- compact tabs (icons) when there's little room
+    _TAB_TITLES = {"notifs": ("🔔 Notifications", "🔔"), "sms": ("💬 Messages", "💬"), "calls": ("📞 Calls", "📞"),
+                   "files": ("📁 Files", "📁"), "screen": ("🖥 Screen", "🖥")}
+
+    def _on_panel_size(self, _w, alloc):
+        on = alloc.width < 560
+        if on != getattr(self, "_self_compact", None):
+            self._self_compact = on
+            GLib.idle_add(lambda: self.set_compact(on) or False)
+
+    def set_compact(self, on):
+        on = on or bool(getattr(self, "_self_compact", False))
+        for name, (full, short) in self._TAB_TITLES.items():
+            if name in getattr(self, "_tab_btns", {}):
+                self._tab_btns[name].set_label(short if on else full)
+
+    def _tab_clicked(self, btn, name):
+        if btn.get_active():
+            if self.stack.get_visible_child_name() != name:
+                self.stack.set_visible_child_name(name)
+        elif self.stack.get_visible_child_name() == name:
+            btn.set_active(True)                     # clicking the open tab keeps it open
+
+    def _sync_tabs(self):
+        cur = self.stack.get_visible_child_name()
+        for name, b in getattr(self, "_tab_btns", {}).items():
+            if b.get_active() != (name == cur):
+                b.set_active(name == cur)
 
     # ---------- talking to the phone (always in the background)
     def _ask(self, path, obj, done, timeout=20):
@@ -15859,6 +15951,9 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
         self.start_freeze_watch()
+        self.connect("configure-event", lambda *_: GLib.idle_add(self._check_compact) and False)
+        self.connect("window-state-event", lambda *_: GLib.idle_add(self._check_compact) and False)
+        GLib.idle_add(self._check_compact)
         GLib.timeout_add_seconds(20, self._features_hint)
         if self.cfg.get("player_on"):
             GLib.idle_add(lambda: self.music_on() and False)
@@ -15918,6 +16013,85 @@ class MainWindow(Gtk.ApplicationWindow):
         b.connect("clicked", cb)
         return b
 
+    # ---------- compact toolbar: fits half a screen (next to a browser) or a small window
+    def _compact_items(self):
+        return [(self._timeline_btn, "Where was I?", "🧭"), (self.dual_btn, "Dual", "◫"), (self.preview_btn, "Preview", "👁"),
+                (self.organize_btn, "Organize", "🗂"), (self.chat_btn, "💬 Chat", "💬")]
+
+    def set_compact(self, on):
+        if on == getattr(self, "_compact", None):
+            return
+        self._compact = on
+        for btn, full, short in self._compact_items():
+            btn.set_label(short if on else full)
+            if not btn.get_tooltip_text():
+                btn.set_tooltip_text(full)
+        for lbl in (self._last_lbl, self.share_label, self.recv_label):
+            lbl.set_visible(not on)
+        self._tools_btn._label.set_text("🛠" if on else "Tools")
+        if not hasattr(self, "_compact_css"):                 # tighter buttons in the compact toolbar
+            self._compact_css = Gtk.CssProvider()
+            self._compact_css.load_from_data(b"headerbar.arckad-compact button { padding-left: 5px; padding-right: 5px; "
+                                             b"min-width: 22px; } headerbar.arckad-compact { padding-left: 4px; "
+                                             b"padding-right: 4px; }")
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self._compact_css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 30)
+        ctx = self.get_titlebar().get_style_context()
+        ctx.add_class("arckad-compact") if on else ctx.remove_class("arckad-compact")
+        self.get_titlebar().set_property("spacing", 2 if on else 6)
+        self.update_chat_button()
+        self.phone_panel.set_compact(on)
+        self.chat_panel_compact(on)
+
+    def chat_panel_compact(self, on):
+        for p in self.chat_panels():
+            if hasattr(p, "set_compact"):
+                p.set_compact(on)
+
+    def _fit_layout(self):
+        """Never cut anything off: when the window is too narrow for everything, hide the sidebar first, then (in
+        Dual mode) the second folder pane, and bring them back when there's room. Your Dual setting stays."""
+        self._fit_pending = False
+        W = self.get_allocated_width()
+        if W < 50:
+            return False
+        panel = self.right_box.get_preferred_width()[0] if self.right_box.get_visible() else 0
+        dual = bool(self.cfg.get("dual"))
+        side_w, pane_w = 230, 290
+
+        def need(side, two):
+            return (side_w if side else 0) + (2 if two else 1) * pane_w + panel + 24
+        want_two = dual and need(False, True) <= W
+        want_side = need(True, want_two) <= W
+        changed = []
+        if self.side_box.get_visible() != want_side:
+            self.side_box.set_visible(want_side)
+            changed.append("sidebar " + ("back" if want_side else "hidden"))
+        if dual and self.right_nb.get_visible() != want_two:
+            self.right_nb.set_visible(want_two)
+            changed.append("second folder " + ("back" if want_two else "hidden"))
+        if changed:
+            everything = want_side and (want_two or not dual)
+            self.flash_all("To fit this window: " + ", ".join(changed) +
+                           ("" if everything else " · widen the window to see everything"))
+        return False
+
+    def _queue_fit(self, *_a):
+        if not getattr(self, "_fit_pending", False):
+            self._fit_pending = True
+            GLib.timeout_add(150, self._fit_layout)
+
+    def _check_compact(self, *_a):
+        """Compact when snapped to a side or narrower than 1700 px; full labels when maximised or wide."""
+        gw = self.get_window()
+        state = gw.get_state() if gw else 0
+        tiled = bool(state & (Gdk.WindowState.TILED | getattr(Gdk.WindowState, "LEFT_TILED", 0) |
+                              getattr(Gdk.WindowState, "RIGHT_TILED", 0)))
+        maxed = bool(state & (Gdk.WindowState.MAXIMIZED | Gdk.WindowState.FULLSCREEN))
+        self.set_compact(tiled or (not maxed and self.get_allocated_width() < 1700))
+        self._queue_fit()
+        return False
+
     def _menu_button(self, label, icon, items):
         menu = Gtk.Menu()
         for entry in items:
@@ -15937,8 +16111,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if icon:
             box.add(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
         if label:
-            box.add(Gtk.Label(label=label))
+            btn._label = Gtk.Label(label=label)
+            box.add(btn._label)
             box.add(Gtk.Image.new_from_icon_name("pan-down-symbolic", Gtk.IconSize.BUTTON))
+            btn.set_tooltip_text(btn.get_tooltip_text() or label)
         btn.add(box)
         return btn
 
@@ -15952,13 +16128,15 @@ class MainWindow(Gtk.ApplicationWindow):
         last_btn = Gtk.Button()
         lb = Gtk.Box(spacing=6)
         lb.add(Gtk.Image.new_from_icon_name("document-open-recent-symbolic", Gtk.IconSize.BUTTON))
-        lb.add(Gtk.Label(label="Last worked file"))
+        self._last_lbl = Gtk.Label(label="Last worked file")
+        lb.add(self._last_lbl)
         last_btn.add(lb)
         last_btn.get_style_context().add_class("suggested-action")
         last_btn.set_tooltip_text("Remind me which file I worked on last")
         last_btn.connect("clicked", lambda *_: self.find_last_file(show=True))
         hb.pack_start(last_btn)
         timeline_btn = Gtk.Button(label="Where was I?")
+        self._timeline_btn = timeline_btn
         timeline_btn.set_tooltip_text("See your recent work grouped into sessions")
         timeline_btn.connect("clicked", lambda *_: self.open_timeline())
         hb.pack_start(timeline_btn)
@@ -15998,7 +16176,7 @@ class MainWindow(Gtk.ApplicationWindow):
             (f"About {APP_NAME}", self.show_about),
         ]))
         hb.pack_end(self._theme_button())
-        hb.pack_end(self._menu_button("Tools", None, [
+        self._tools_btn = self._menu_button("Tools", None, [
             ("Organize this folder…", lambda: self.organize(self.active)),
             ("Find duplicate files…", lambda: self.duplicates(
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
@@ -16012,7 +16190,8 @@ class MainWindow(Gtk.ApplicationWindow):
         ] + ([("Install optional features…", self.features_dialog)] if not IS_WIN else []) + [
             ("Search index settings…", self.index_settings),
             ("Freeze report…", self.freeze_report),
-        ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else [])))
+        ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else []))
+        hb.pack_end(self._tools_btn)
         pair = Gtk.Box()
         pair.get_style_context().add_class("linked")
         self.share_btn = Gtk.Button()
@@ -16111,6 +16290,7 @@ class MainWindow(Gtk.ApplicationWindow):
         footer.add(self.icon_btn("view-refresh-symbolic", "Update the search index now", lambda *_: INDEX.rebuild()))
         side.add(footer)
         main.pack1(side, False, False)
+        self.side_box = side
 
         content = Gtk.Box()
         self.dual_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, hexpand=True)
@@ -16132,8 +16312,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.right_box.set_no_show_all(True)
         self.right_stack.show_all()
         self.content_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self.content_paned.pack1(self.dual_paned, True, False)
-        self.content_paned.pack2(self.right_box, False, False)
+        self.content_paned.pack1(self.dual_paned, True, True)     # both sides may get narrow: the window never
+        self.content_paned.pack2(self.right_box, False, True)     # grows past the screen when a panel opens
         content.pack_start(self.content_paned, True, True, 0)
         self._right = None
         self._right_guard = False
@@ -16536,6 +16716,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_dual_toggled(self, btn):
         on = btn.get_active()
         self.cfg["dual"] = on
+        self._queue_fit()
         self.right_nb.set_visible(on)
         if on:
             w = self.dual_paned.get_allocated_width()
@@ -16921,6 +17102,7 @@ class MainWindow(Gtk.ApplicationWindow):
         return self._right is not None and (page is None or self._right == page)
 
     def show_right(self, page):
+        GLib.idle_add(lambda: self._queue_fit() and False)     # opening a panel may need the space rearranged
         """Show the right pane with "preview" or "chat", or close it (None). The top-bar Preview and Chat
         buttons act as on/off switches for it."""
         if self._right and self.right_box.get_visible():
@@ -16935,8 +17117,8 @@ class MainWindow(Gtk.ApplicationWindow):
         if page:
             self.right_stack.set_visible_child_name(page)
             self.right_box.show()
-            width = max(300, min(int(self.cfg.get("right_width", 380)), 700))
             total = self.content_paned.get_allocated_width()
+            width = max(300, min(int(self.cfg.get("right_width", 380)), 700, max(300, int(total * 0.42))))
             if total > width + 300:
                 self.content_paned.set_position(total - width)
         else:
@@ -18960,7 +19142,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def update_chat_button(self):
         total = sum(n for g, n in self.chat.unread.items() if g in self.chat.groups) + len(self.chat.contacts["incoming"])
-        self.chat_btn.set_label(f"💬 Chat ({total})" if total else "💬 Chat")
+        if getattr(self, "_compact", False):
+            self.chat_btn.set_label(f"💬 {total}" if total else "💬")
+        else:
+            self.chat_btn.set_label(f"💬 Chat ({total})" if total else "💬 Chat")
         if getattr(self, "tray", None):
             self.tray.set_unread(total)
         return False
