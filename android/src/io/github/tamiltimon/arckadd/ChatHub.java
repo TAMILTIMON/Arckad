@@ -107,6 +107,14 @@ final class ChatHub implements ChatEngine.Ui {
         });
     }
 
+    void notifyIntent(int id, String title, String body, android.app.PendingIntent pi) {
+        NotificationManager nm = (NotificationManager) app.getSystemService(Context.NOTIFICATION_SERVICE);
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(app, CH_MSG) : new Notification.Builder(app);
+        b.setSmallIcon(statusIcon()).setContentTitle(title).setContentText(body).setAutoCancel(true).setContentIntent(pi);
+        if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_HIGH);
+        nm.notify(id, b.build());
+    }
+
     // ---------- background connection: battery saver (default), always, or off
     static final String BG_SAVER = "saver", BG_ALWAYS = "always", BG_OFF = "off";
     private int visible;                                   // Arckad-D screens on show

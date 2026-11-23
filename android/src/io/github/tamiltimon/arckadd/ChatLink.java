@@ -722,6 +722,12 @@ final class ChatLink {
         byte[] raw = n > 0 ? readStream(r.body, (int) Math.min(n, 50_000_000)) : new byte[0];
         JSONObject req = raw.length > 0 ? new JSONObject(new String(unseal(k, raw), StandardCharsets.UTF_8)) : new JSONObject();
         JSONObject res = new Obj().putOpt("ok", true);
+        if (path.equals("/t/phone/mirror/frame")) {        // screen frames: already sealed with the session key
+            byte[] out = !isLocal(r.client) || e.phone == null || !e.phone.enabled() ? new byte[]{3}
+                    : e.phone.frame(req.optLong("since"));
+            r.send(200, "application/octet-stream", out);
+            return;
+        }
         if (path.startsWith("/t/phone/")) {                // the PC's 📱 Phone panel: linked + local + switched on
             if (!isLocal(r.client)) res = err("not on a local network");
             else if (e.phone == null || !e.phone.enabled()) res = err("Phone link is off on the phone (Chat → ⋮ → 📱 Phone link)");

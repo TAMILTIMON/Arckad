@@ -38,6 +38,11 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
     }
 
     @Override
+    public byte[] frame(long since) {
+        return mirrorFrame(since);
+    }
+
+    @Override
     public boolean enabled() {
         return Ui.prefs(c).getBoolean("phone_link", false);
     }
@@ -84,6 +89,12 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
                 return endCall();
             case "/t/phone/call/dial":
                 return dial(req);
+            case "/t/phone/mirror/start":
+                return mirrorStart(req);
+            case "/t/phone/mirror/stop":
+                if (ScreenShare.active) c.startService(new Intent(c, ScreenShare.class).setAction(ScreenShare.STOP));
+                ScreenShare.sessionKey = null;
+                return new Obj().putOpt("ok", true);
             case "/t/phone/files":
                 return files(req);
             case "/t/phone/read":
@@ -277,6 +288,36 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         android.telecom.TelecomManager tm = (android.telecom.TelecomManager) c.getSystemService(Context.TELECOM_SERVICE);
         tm.placeCall(Uri.fromParts("tel", num, null), new Bundle());     // works from the background (no screen)
         return new Obj().putOpt("ok", true);
+    }
+
+    // ---------- screen mirroring (view only): a fresh key for every session
+    private JSONObject mirrorStart(JSONObject req) {
+        String theirs = req.optString("pub");
+        if (theirs.isEmpty()) return err("bad request");
+        java.math.BigInteger x = ChatCrypto.dhSecret(), pub = ChatCrypto.dhPublic(x);
+        byte[] shared = ChatCrypto.dhShared(theirs, x);
+        ScreenShare.sessionKey = ChatCrypto.sha256(ChatCrypto.utf8("arckad-mirror|"), shared,
+                ChatCrypto.fixed(new java.math.BigInteger(theirs, 16), 256), ChatCrypto.fixed(pub, 256));
+        ScreenShare.lastRequest = System.currentTimeMillis();
+        if (!ScreenShare.active) ScreenShare.askToShare(c, req.optString("pc"));
+        return new Obj().putOpt("ok", true).putOpt("pub", pub.toString(16)).putOpt("active", ScreenShare.active);
+    }
+
+    /** One frame for the PC: [status byte] + (frame number, 8 bytes) + frame sealed with the session key.
+     *  0 = waiting for approval on the phone, 1 = a new frame, 2 = no new frame yet, 3 = not sharing. */
+    static byte[] mirrorFrame(long since) {
+        ScreenShare.lastRequest = System.currentTimeMillis();
+        byte[] key = ScreenShare.sessionKey, f = ScreenShare.frame;
+        if (key == null) return new byte[]{3};
+        if (!ScreenShare.active) return new byte[]{0};
+        long n = ScreenShare.frameNo;
+        if (f == null || n <= since) return new byte[]{2};
+        byte[] sealed = ChatCrypto.seal(key, f);
+        byte[] out = new byte[9 + sealed.length];
+        out[0] = 1;
+        for (int i = 0; i < 8; i++) out[1 + i] = (byte) (n >>> (56 - 8 * i));
+        System.arraycopy(sealed, 0, out, 9, sealed.length);
+        return out;
     }
 
     // ---------- files (shared storage only)

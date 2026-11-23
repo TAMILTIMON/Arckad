@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.34.0"
+APP_VERSION = "3.35.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -9474,6 +9474,25 @@ class LinkedDevices:
             raise PermissionError(f"refused ({r.status})")
         return json.loads(unseal(k, data)) if data else {}
 
+    def _call_raw(self, inst, path, obj, timeout=10):
+        import http.client
+        t = self.twins().get(inst) or {}
+        k = self.key()
+        if not t.get("ip") or not t.get("port") or not k:
+            raise OSError("linked device not reachable")
+        body = seal(k, json.dumps(obj).encode())
+        ts = int(time.time())
+        hdr = {"X-Link-From": self.inst, "X-Link-Time": str(ts), "X-Link-Sig": _hm(k, "POST", path, ts, self.inst).hex(),
+               "Content-Length": str(len(body))}
+        cn = http.client.HTTPConnection(t["ip"], t["port"], timeout=timeout)
+        cn.request("POST", path, body, hdr)
+        r = cn.getresponse()
+        data = r.read()
+        cn.close()
+        if r.status != 200:
+            raise PermissionError(f"refused ({r.status})")
+        return data
+
     def push(self, gid, msg):
         """A new message (sent or received here) goes to my other devices at once."""
         if not self.key() or msg.get("local"):
@@ -14784,6 +14803,29 @@ class PhonePanel(Gtk.Box):
         self.f_progress.set_no_show_all(True)
         fb.add(self.f_progress)
         self.stack.add_titled(fb, "files", "📁 Files")
+        # screen (view only)
+        sb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sc = Gtk.Box(spacing=6)
+        self.mirror_btn = Gtk.Button(label="▶ Show phone screen")
+        self.mirror_btn.get_style_context().add_class("suggested-action")
+        self.mirror_btn.connect("clicked", lambda *_: self.mirror_stop() if self.mirroring else self.mirror_start())
+        sc.add(self.mirror_btn)
+        pop = Gtk.Button(label="⧉ Pop out")
+        pop.set_tooltip_text("Show the phone screen in its own window (resize it as you like)")
+        pop.connect("clicked", lambda *_: self.pop_out())
+        sc.add(pop)
+        sb.add(sc)
+        self.m_status = Gtk.Label(xalign=0, wrap=True)
+        self.m_status.get_style_context().add_class("dim-label")
+        self.m_status.set_markup("<small>View only · Android asks you to allow it on the phone · a fresh key for each "
+                                 "session · local network only</small>")
+        sb.add(self.m_status)
+        self.m_area = Gtk.EventBox(vexpand=True, hexpand=True)
+        self.m_image = Gtk.Image(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        self.m_area.add(self.m_image)
+        sb.pack_start(self.m_area, True, True, 0)
+        self.stack.add_titled(sb, "screen", "🖥 Screen")
+        self.mirroring, self.m_pix, self.m_pop = False, None, None
         self._parent = None
         self.stack.connect("notify::visible-child-name", lambda *_: self.refresh())
         self.show_all()
@@ -15168,6 +15210,126 @@ class PhonePanel(Gtk.Box):
                 return False
             GLib.idle_add(done)
         threading.Thread(target=work, daemon=True).start()
+
+    # ---------- screen mirroring (view only)
+    def mirror_start(self):
+        """A new session: fresh keys (Diffie-Hellman inside the link), Android's approval on the phone, then frames."""
+        if self.mirroring:
+            return
+        self.mirroring = True
+        self._m_gen = getattr(self, "_m_gen", 0) + 1
+        gen = self._m_gen
+        self.mirror_btn.set_label("■ Stop")
+        self.mirror_btn.get_style_context().remove_class("suggested-action")
+        self.mirror_btn.get_style_context().add_class("destructive-action")
+        self._m_say("Asking your phone…")
+
+        def work():
+            L = self.win.chat.linked
+            try:
+                x = secrets.randbits(320)
+                pub = pow(2, x, DH_P)
+                r = L.phone_call("/t/phone/mirror/start", {"pub": format(pub, "x"), "pc": self.win.nearby.name()}, timeout=10)
+                if not r.get("ok", True):
+                    raise OSError(r.get("reason", "the phone refused"))
+                theirs = int(r["pub"], 16)
+                shared = pow(theirs, x, DH_P).to_bytes(256, "big")
+                key = hashlib.sha256(b"arckad-mirror|" + shared + pub.to_bytes(256, "big") + theirs.to_bytes(256, "big")).digest()
+                inst = L.phone_twin()
+            except Exception as ex:
+                GLib.idle_add(lambda m=str(ex): (self._m_say("⚠ " + m), self._m_reset()) and False)
+                return
+            n, shown, t0, frames = 0, False, time.time(), 0
+            while self.mirroring and self._m_gen == gen:
+                if self.win.chat.is_locked():                  # the PIN lock stops mirroring
+                    GLib.idle_add(lambda: self.mirror_stop("Stopped: the chat is locked") and False)
+                    return
+                try:
+                    raw = L._call_raw(inst, "/t/phone/mirror/frame", {"since": n}, timeout=10)
+                except Exception as ex:
+                    GLib.idle_add(lambda m=str(ex): self._m_say("⚠ " + m) and False)
+                    time.sleep(1.0)
+                    continue
+                status = raw[0] if raw else 3
+                if status == 0:
+                    GLib.idle_add(lambda: self._m_say("📱 Waiting for you to allow it on the phone (tap the "
+                                                      "notification, then Start)…") and False)
+                    time.sleep(0.7)
+                elif status == 2:
+                    time.sleep(0.04)
+                elif status == 3:
+                    GLib.idle_add(lambda: self.mirror_stop("Sharing stopped on the phone" if shown else
+                                                           "The phone isn't sharing (declined or stopped)") and False)
+                    return
+                else:
+                    n = int.from_bytes(raw[1:9], "big")
+                    try:
+                        jpeg = unseal(key, raw[9:])
+                        loader = GdkPixbuf.PixbufLoader()
+                        loader.write(jpeg)
+                        loader.close()
+                        pb = loader.get_pixbuf()
+                    except Exception:
+                        continue
+                    frames += 1
+                    fps = frames / max(0.5, time.time() - t0)
+                    if time.time() - t0 > 4:
+                        t0, frames = time.time(), 0
+                    shown = True
+                    GLib.idle_add(self._m_show, pb, fps)
+                    time.sleep(0.05)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _m_say(self, text):
+        self.m_status.set_markup(f"<small>{esc(text)}</small>")
+
+    def _m_show(self, pb, fps):
+        if not self.mirroring:                    # a frame that arrived just after Stop
+            return False
+        self.m_pix = pb
+        self._m_say(f"🖥 Live · {pb.get_width()}×{pb.get_height()} · {fps:.0f} frames/s · encrypted")
+        for img, area in ((self.m_image, self.m_area), (getattr(self, "m_pop_img", None), getattr(self, "m_pop", None))):
+            if img is None or area is None or not area.get_mapped():
+                continue
+            aw, ah = max(50, area.get_allocated_width() - 8), max(50, area.get_allocated_height() - 8)
+            s = min(aw / pb.get_width(), ah / pb.get_height())
+            img.set_from_pixbuf(pb.scale_simple(max(1, int(pb.get_width() * s)), max(1, int(pb.get_height() * s)),
+                                                GdkPixbuf.InterpType.BILINEAR))
+        return False
+
+    def _m_reset(self):
+        self.mirroring = False
+        self.mirror_btn.set_label("▶ Show phone screen")
+        self.mirror_btn.get_style_context().remove_class("destructive-action")
+        self.mirror_btn.get_style_context().add_class("suggested-action")
+
+    def mirror_stop(self, why="Stopped"):
+        was = self.mirroring
+        self._m_reset()
+        self._m_say(why)
+        if was:
+            self._ask("/t/phone/mirror/stop", {}, lambda r, e: None, timeout=6)
+
+    def pop_out(self):
+        if self.m_pop:
+            self.m_pop.present()
+            return
+        w = Gtk.Window(title="📱 Phone screen")
+        w.set_transient_for(self.win)
+        w.set_default_size(420, 840)
+        self.m_pop_img = Gtk.Image()
+        box = Gtk.EventBox()
+        box.add(self.m_pop_img)
+        w.add(box)
+        self.m_pop = w
+
+        def closed(*_):
+            self.m_pop, self.m_pop_img = None, None
+        w.connect("destroy", closed)
+        w.show_all()
+        if not self.mirroring:
+            self.mirror_start()
 
     # ---------- the phone pushed something
     def phone_event(self, ev):

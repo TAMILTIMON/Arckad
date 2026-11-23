@@ -101,6 +101,10 @@ final class ChatEngine {
         boolean enabled();
 
         JSONObject handle(String path, JSONObject req) throws Exception;
+
+        default byte[] frame(long since) {               // screen mirroring (tests supply their own)
+            return new byte[]{3};
+        }
     }
 
     volatile PhoneHandler phone;
