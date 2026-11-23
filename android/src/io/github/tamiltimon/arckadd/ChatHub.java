@@ -56,6 +56,7 @@ final class ChatHub implements ChatEngine.Ui {
 
     private ChatHub(Context c) {
         app = c;
+        installCrashGuard();
         SharedPreferences p = Ui.prefs(c);
         if (!p.contains("device_id")) p.edit().putString("device_id", UUID.randomUUID().toString().substring(0, 16)).apply();
         String name = p.getString("device_name", "");
@@ -183,10 +184,74 @@ final class ChatHub implements ChatEngine.Ui {
 
     /** Start chat networking (and keep it running in the background, unless that's off) if chat is in use. */
     void start() {
-        if (!engine.active()) return;
+        if (!startEngine()) return;
+        if (!BG_OFF.equals(bgMode())) ChatService.ensure(app);
+    }
+
+    /** Chat networking only (what the background service calls: it must not start the service again). */
+    boolean startEngine() {
+        if (!engine.active()) return false;
         applyPower();
         engine.start();
-        if (!BG_OFF.equals(bgMode())) ChatService.ensure(app);
+        return true;
+    }
+
+    // ---------- crash recorder and crash-loop guard
+    private static final String CRASH_FILE = "problem-report.txt";
+
+    boolean safeMode() {
+        return Ui.prefs(app).getBoolean("safe_mode", false);
+    }
+
+    void leaveSafeMode() {
+        Ui.prefs(app).edit().putBoolean("safe_mode", false).putString("crash_times", "").apply();
+    }
+
+    /** Every crash is written down; two within 3 minutes start the app in safe mode next time (Phone link,
+     *  control and the background service off), so a bug can never lock the phone up again. */
+    private void installCrashGuard() {
+        final Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((t, ex) -> {
+            try {
+                java.io.StringWriter sw = new java.io.StringWriter();
+                ex.printStackTrace(new java.io.PrintWriter(sw));
+                File f = new File(app.getFilesDir(), CRASH_FILE);
+                String old = f.exists() ? new String(ChatEngine.readAll(f), java.nio.charset.StandardCharsets.UTF_8) : "";
+                if (old.length() > 60000) old = old.substring(old.length() - 60000);
+                String stamp = new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.ROOT).format(new java.util.Date());
+                ChatEngine.writeFile(f, ChatCrypto.utf8(old + "\n===== " + stamp + " · Arckad-D " + BuildInfo.VERSION + " · Android "
+                        + Build.VERSION.RELEASE + " · thread " + t.getName() + " =====\n" + sw));
+                SharedPreferences p = Ui.prefs(app);
+                long now = System.currentTimeMillis();
+                StringBuilder keep = new StringBuilder();
+                int recent = 1;
+                for (String s : p.getString("crash_times", "").split(",")) {
+                    if (s.isEmpty()) continue;
+                    long when = Long.parseLong(s);
+                    if (now - when < 180_000) {
+                        recent++;
+                        keep.append(when).append(',');
+                    }
+                }
+                keep.append(now);
+                SharedPreferences.Editor ed = p.edit().putString("crash_times", keep.toString());
+                if (recent >= 2)                         // a crash loop: next start is safe
+                    ed.putBoolean("safe_mode", true).putBoolean("phone_control", false).putBoolean("phone_link", false)
+                            .putString("chat_bg", BG_OFF);
+                ed.commit();
+            } catch (Throwable ignored) {
+            }
+            if (prev != null) prev.uncaughtException(t, ex);
+        });
+    }
+
+    String problemReport() {
+        File f = new File(app.getFilesDir(), CRASH_FILE);
+        try {
+            return f.exists() ? new String(ChatEngine.readAll(f), java.nio.charset.StandardCharsets.UTF_8) : "";
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     void addListener(Listener l) {

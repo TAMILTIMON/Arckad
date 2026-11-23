@@ -17,7 +17,18 @@ public class PhoneControl extends AccessibilityService {
 
     @Override
     protected void onServiceConnected() {
+        if (!Ui.prefs(this).getBoolean("phone_control", false) || ChatHub.get(this).safeMode()) {
+            disableSelf();                               // only runs while you actually want control from the PC
+            return;
+        }
         instance = this;
+    }
+
+    /** "Allow control from the PC" was switched off: the accessibility service turns itself off too. */
+    static void stopIfRunning() {
+        PhoneControl pc = instance;
+        instance = null;
+        if (pc != null) pc.disableSelf();
     }
 
     @Override

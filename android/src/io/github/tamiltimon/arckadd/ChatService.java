@@ -1,6 +1,7 @@
 package io.github.tamiltimon.arckadd;
 
 import android.app.Notification;
+import android.app.NotificationManager;
 import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -13,9 +14,16 @@ import android.os.IBinder;
 public class ChatService extends Service {
     static final String STOP = "io.github.tamiltimon.arckadd.CHAT_BG_OFF";
 
+    static volatile boolean running;               // the service is up: start requests are ignored
+    private static volatile long lastStart;
+
     static void ensure(Context c) {
         ChatHub hub = ChatHub.get(c);
-        if (!hub.engine.active() || ChatHub.BG_OFF.equals(hub.bgMode())) return;
+        if (!hub.engine.active() || ChatHub.BG_OFF.equals(hub.bgMode()) || hub.safeMode()) return;
+        if (running) return;
+        long now = System.currentTimeMillis();
+        if (now - lastStart < 10_000) return;      // safety net: never start the service in a loop
+        lastStart = now;
         try {
             Intent i = new Intent(c, ChatService.class);
             if (Build.VERSION.SDK_INT >= 26) c.startForegroundService(i);
@@ -27,7 +35,26 @@ public class ChatService extends Service {
     /** Update the notification after the background mode changed. */
     static void refresh(Context c) {
         if (ChatHub.BG_OFF.equals(ChatHub.get(c).bgMode())) c.stopService(new Intent(c, ChatService.class));
-        else ensure(c);
+        else if (running) {                          // already running: just update its notification text
+            NotificationManager nm = (NotificationManager) c.getSystemService(Context.NOTIFICATION_SERVICE);
+            nm.notify(1, build(c));
+        } else ensure(c);
+    }
+
+    static Notification build(Context c) {
+        ChatHub hub = ChatHub.get(c);
+        boolean saver = ChatHub.BG_SAVER.equals(hub.bgMode());
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(c, ChatHub.CH_SERVICE)
+                : new Notification.Builder(c);
+        android.app.PendingIntent off = android.app.PendingIntent.getService(c, 2, new Intent(c, ChatService.class).setAction(STOP),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? android.app.PendingIntent.FLAG_IMMUTABLE : 0));
+        b.setSmallIcon(hub.statusIcon()).setContentTitle(saver ? "Arckad-D chat · battery saver" : "Arckad-D chat is connected")
+                .setContentText(saver ? "Reachable when closed, checking in every 30 s. Tap “Turn off” to stop."
+                        : "Messages arrive instantly even when the app is closed.")
+                .setOngoing(true).setOnlyAlertOnce(true).setContentIntent(hub.openIntent(null, null, 1));
+        if (Build.VERSION.SDK_INT >= 20) b.addAction(new Notification.Action.Builder(null, "Turn off", off).build());
+        if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_MIN);
+        return b.build();
     }
 
     @Override
@@ -40,26 +67,23 @@ public class ChatService extends Service {
             stopSelf();
             return START_NOT_STICKY;
         }
-        boolean saver = ChatHub.BG_SAVER.equals(hub.bgMode());
-        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, ChatHub.CH_SERVICE)
-                : new Notification.Builder(this);
-        android.app.PendingIntent off = android.app.PendingIntent.getService(this, 2, new Intent(this, ChatService.class).setAction(STOP),
-                android.app.PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 23 ? android.app.PendingIntent.FLAG_IMMUTABLE : 0));
-        b.setSmallIcon(hub.statusIcon()).setContentTitle(saver ? "Arckad-D chat · battery saver" : "Arckad-D chat is connected")
-                .setContentText(saver ? "Reachable when closed, checking in every 30 s. Tap “Turn off” to stop."
-                        : "Messages arrive instantly even when the app is closed.")
-                .setOngoing(true).setContentIntent(hub.openIntent(null, null, 1));
-        if (Build.VERSION.SDK_INT >= 20) b.addAction(new Notification.Action.Builder(null, "Turn off", off).build());
-        if (Build.VERSION.SDK_INT < 26) b.setPriority(Notification.PRIORITY_MIN);
+        if (running) return START_STICKY;             // already up: nothing to do (no re-posting, no restarting)
         try {
-            if (Build.VERSION.SDK_INT >= 34) startForeground(1, b.build(), 512 /* FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING */);
-            else startForeground(1, b.build());
+            if (Build.VERSION.SDK_INT >= 34) startForeground(1, build(this), 512 /* FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING */);
+            else startForeground(1, build(this));
         } catch (Exception e) {
             stopSelf();
             return START_NOT_STICKY;
         }
-        hub.start();
+        running = true;
+        hub.startEngine();                            // chat only: this must never ask to start the service again
         return START_STICKY;
+    }
+
+    @Override
+    public void onDestroy() {
+        running = false;
+        super.onDestroy();
     }
 
     @Override

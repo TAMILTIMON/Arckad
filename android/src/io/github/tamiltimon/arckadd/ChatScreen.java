@@ -177,6 +177,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     // ================================================================= pages
     private void render() {
         root.removeAllViews();
+        safeModeNotice();
         if (e.isLocked()) {
             renderLocked();
             return;
@@ -1223,7 +1224,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         String[] items0 = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
                 "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)",
                 "Restore my profile from before a link", "☁ Back up chats (Google Drive or anywhere)", "Restore from a backup",
-                "🔋 Background connection", "📱 Phone link (PC panel)"};
+                "🔋 Background connection", "📱 Phone link (PC panel)", "🩺 Problem report"};
         String[] items = new String[items0.length + 1];
         items[0] = "⭐ Saved Messages";
         System.arraycopy(items0, 0, items, 1, items0.length);
@@ -1239,6 +1240,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             }
             if (w == 10) {
                 phoneLinkSettings();
+                return;
+            }
+            if (w == 11) {
+                problemReport();
                 return;
             }
             if (w == 7) {
@@ -1934,6 +1939,35 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 .setNegativeButton("Close", null).show();
     }
 
+    private void problemReport() {
+        String r = hub.problemReport();
+        TextView t = Ui.text(a, r.isEmpty() ? "✓ No problems recorded." : r.substring(Math.max(0, r.length() - 6000)), 11, Ui.TEXT, false);
+        t.setTextIsSelectable(true);
+        t.setTypeface(Typeface.MONOSPACE);
+        android.widget.ScrollView sv = new android.widget.ScrollView(a);
+        sv.setPadding(Ui.dp(a, 16), Ui.dp(a, 8), Ui.dp(a, 16), 0);
+        sv.addView(t);
+        android.app.AlertDialog.Builder b = Ui.dialog(a).setTitle("🩺 Problem report").setView(sv).setNegativeButton("Close", null);
+        if (!r.isEmpty()) b.setPositiveButton("Share", (d, w) -> a.startActivity(Intent.createChooser(
+                new Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, r.substring(Math.max(0, r.length() - 20000))),
+                "Send the problem report")));
+        b.show();
+    }
+
+    /** After a crash loop the app starts in safe mode: say so once, offer the report and a way back. */
+    private void safeModeNotice() {
+        if (!hub.safeMode() || safeShown) return;
+        safeShown = true;
+        Ui.dialog(a).setTitle("Arckad-D started in safe mode")
+                .setMessage("Arckad-D crashed twice in a row, so Phone link, control from the PC and the background connection were "
+                        + "switched off to protect your phone. Chat and files work as usual.\n\nPlease send the problem report to the "
+                        + "developer. You can turn the features on again in ⋮ → 📱 Phone link and ⋮ → 🔋 Background connection.")
+                .setPositiveButton("See the report", (d, w) -> problemReport())
+                .setNegativeButton("OK", (d, w) -> hub.leaveSafeMode()).show();
+    }
+
+    private boolean safeShown;
+
     private void phoneLinkSettings() {
         PhoneLink pl = new PhoneLink(a);
         LinearLayout box = new LinearLayout(a);
@@ -1959,7 +1993,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         ctl.setText("Allow control from the PC (tap, swipe, type while you share the screen)");
         ctl.setTextColor(Ui.TEXT);
         ctl.setChecked(Ui.prefs(a).getBoolean("phone_control", false));
-        ctl.setOnCheckedChangeListener((v, c) -> Ui.prefs(a).edit().putBoolean("phone_control", c).apply());
+        ctl.setOnCheckedChangeListener((v, c) -> {
+            Ui.prefs(a).edit().putBoolean("phone_control", c).apply();
+            if (!c) PhoneControl.stopIfRunning();          // accessibility off as well
+        });
         box.addView(ctl, Ui.matchWrap(a, 10));
         box.addView(Ui.button(a, (PhoneControl.instance != null ? "✓ " : "") + "Turn on Arckad-D in Accessibility (needed for control)",
                 PhoneControl.instance == null, v -> a.startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))),

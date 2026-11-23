@@ -23,6 +23,7 @@ public class PhoneNotifs extends NotificationListenerService {
 
     @Override
     public void onNotificationPosted(StatusBarNotification sbn) {
+        if (sbn.getPackageName().equals(getPackageName())) return;      // never react to Arckad-D's own notifications
         JSONObject item = PhoneLink.describe(this, sbn);
         if (item != null) ChatHub.get(this).engine.link.pushPhone(new Obj().putOpt("type", "posted").putOpt("item", item));
     }
