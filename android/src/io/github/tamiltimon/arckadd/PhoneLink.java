@@ -47,6 +47,13 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         return on != null && on.contains(c.getPackageName());
     }
 
+    boolean callsAllowed() {
+        for (String p : new String[]{Manifest.permission.READ_PHONE_STATE, Manifest.permission.READ_CALL_LOG,
+                Manifest.permission.ANSWER_PHONE_CALLS, Manifest.permission.CALL_PHONE})
+            if (c.checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) return false;
+        return true;
+    }
+
     boolean smsAllowed() {
         return c.checkSelfPermission(Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED
                 && c.checkSelfPermission(Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED;
@@ -69,6 +76,14 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
                 return messages(req);
             case "/t/phone/sms/send":
                 return send(req);
+            case "/t/phone/calls":
+                return calls();
+            case "/t/phone/call/answer":
+                return answer();
+            case "/t/phone/call/end":
+                return endCall();
+            case "/t/phone/call/dial":
+                return dial(req);
             case "/t/phone/files":
                 return files(req);
             case "/t/phone/read":
@@ -87,7 +102,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         int level = b == null ? -1 : b.getIntExtra(BatteryManager.EXTRA_LEVEL, -1), scale = b == null ? 100 : b.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
         int plugged = b == null ? 0 : b.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
         return new Obj().putOpt("ok", true).putOpt("battery", level < 0 ? null : level * 100 / Math.max(1, scale))
-                .putOpt("charging", plugged != 0).putOpt("notif_ok", notifAllowed()).putOpt("sms_ok", smsAllowed());
+                .putOpt("charging", plugged != 0).putOpt("notif_ok", notifAllowed()).putOpt("sms_ok", smsAllowed())
+                .putOpt("calls_ok", callsAllowed());
     }
 
     // ---------- notifications
@@ -158,7 +174,7 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
     }
 
     // ---------- SMS
-    private String contactName(String number) {
+    String contactName(String number) {
         if (number == null || c.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return null;
         Uri u = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(number));
         try (Cursor q = c.getContentResolver().query(u, new String[]{ContactsContract.PhoneLookup.DISPLAY_NAME}, null, null, null)) {
@@ -213,6 +229,53 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         SmsManager sm = android.os.Build.VERSION.SDK_INT >= 31 ? c.getSystemService(SmsManager.class) : SmsManager.getDefault();
         ArrayList<String> parts = sm.divideMessage(text);
         sm.sendMultipartTextMessage(to, null, parts, null, null);
+        return new Obj().putOpt("ok", true);
+    }
+
+    // ---------- calls (the call itself runs on the phone)
+    private JSONObject callState() {
+        return new Obj().putOpt("state", PhoneCalls.state).putOpt("number", PhoneCalls.number).putOpt("name", PhoneCalls.name)
+                .putOpt("since", PhoneCalls.since);
+    }
+
+    private JSONObject calls() {
+        if (!callsAllowed()) return err("Calls aren't allowed on the phone (Chat → ⋮ → 📱 Phone link → Allow calls)");
+        JSONArray out = new JSONArray();
+        try (Cursor q = c.getContentResolver().query(android.provider.CallLog.Calls.CONTENT_URI,
+                new String[]{"number", "name", "date", "duration", "type"}, null, null, "date DESC LIMIT 150")) {
+            while (q != null && q.moveToNext()) {
+                int t = q.getInt(4);
+                String kind = t == 1 ? "in" : t == 2 ? "out" : t == 3 ? "missed" : t == 5 ? "declined" : "other";
+                out.put(new Obj().putOpt("number", q.getString(0)).putOpt("name", q.getString(1)).putOpt("ts", q.getLong(2) / 1000.0)
+                        .putOpt("duration", q.getLong(3)).putOpt("type", kind));
+            }
+        }
+        return new Obj().putOpt("ok", true).putOpt("items", out).putOpt("call", callState());
+    }
+
+    @SuppressWarnings({"deprecation", "MissingPermission"})
+    private JSONObject answer() {
+        if (!callsAllowed()) return err("Calls aren't allowed on the phone");
+        android.telecom.TelecomManager tm = (android.telecom.TelecomManager) c.getSystemService(Context.TELECOM_SERVICE);
+        tm.acceptRingingCall();
+        return new Obj().putOpt("ok", true);
+    }
+
+    @SuppressWarnings({"deprecation", "MissingPermission"})
+    private JSONObject endCall() {
+        if (!callsAllowed()) return err("Calls aren't allowed on the phone");
+        if (android.os.Build.VERSION.SDK_INT < 28) return err("Ending calls from the PC needs Android 9 or newer");
+        android.telecom.TelecomManager tm = (android.telecom.TelecomManager) c.getSystemService(Context.TELECOM_SERVICE);
+        return tm.endCall() ? new Obj().putOpt("ok", true) : err("There's no call to end");
+    }
+
+    @SuppressWarnings("MissingPermission")
+    private JSONObject dial(JSONObject req) {
+        if (!callsAllowed()) return err("Calls aren't allowed on the phone");
+        String num = req.optString("number").replaceAll("[^0-9+*#]", "");
+        if (num.isEmpty()) return err("no number");
+        android.telecom.TelecomManager tm = (android.telecom.TelecomManager) c.getSystemService(Context.TELECOM_SERVICE);
+        tm.placeCall(Uri.fromParts("tel", num, null), new Bundle());     // works from the background (no screen)
         return new Obj().putOpt("ok", true);
     }
 

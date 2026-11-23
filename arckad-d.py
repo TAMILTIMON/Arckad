@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.33.0"
+APP_VERSION = "3.34.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -14654,10 +14654,26 @@ class PhonePanel(Gtk.Box):
         self.status = Gtk.Label(xalign=0, wrap=True)
         self.status.get_style_context().add_class("dim-label")
         self.add(self.status)
+        self.outer = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.pack_start(self.outer, True, True, 0)
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.outer.add_named(main, "main")
+        lock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
+        ll = Gtk.Label(justify=Gtk.Justification.CENTER)
+        ll.set_markup("<span size='xx-large'>🔒</span>\n<b>Locked</b>\nEnter your chat PIN to see your phone")
+        lock.add(ll)
+        self.pin = Gtk.Entry(visibility=False, max_length=4, placeholder_text="PIN", width_chars=8, xalign=0.5)
+        self.pin.set_input_purpose(Gtk.InputPurpose.PIN)
+        self.pin.connect("changed", self._pin_typed)
+        lock.add(self.pin)
+        self.pin_msg = Gtk.Label()
+        self.pin_msg.get_style_context().add_class("dim-label")
+        lock.add(self.pin_msg)
+        self.outer.add_named(lock, "locked")
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         sw = Gtk.StackSwitcher(stack=self.stack, halign=Gtk.Align.CENTER)
-        self.add(sw)
-        self.pack_start(self.stack, True, True, 0)
+        main.add(sw)
+        main.pack_start(self.stack, True, True, 0)
         # notifications
         nb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         top = Gtk.Box(spacing=6)
@@ -14691,6 +14707,10 @@ class PhonePanel(Gtk.Box):
         ch.add(back)
         self.c_title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
         ch.pack_start(self.c_title, True, True, 0)
+        callb = Gtk.Button(label="📞")
+        callb.set_tooltip_text("Call this number from your phone")
+        callb.connect("clicked", lambda *_: self.thread and self.dial(self.thread.get("address", "")))
+        ch.add(callb)
         cp.add(ch)
         self.c_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.c_scroll = Gtk.ScrolledWindow(vexpand=True)
@@ -14707,6 +14727,43 @@ class PhonePanel(Gtk.Box):
         cp.add(comp)
         self.sms.add_named(cp, "conv")
         self.stack.add_titled(self.sms, "sms", "💬 Messages")
+        # calls
+        cb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.call_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.call_card.get_style_context().add_class("chat-pinbar")
+        self.call_label = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, margin=8)
+        self.call_card.add(self.call_label)
+        cbtn = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER, margin_bottom=8)
+        self.answer_btn = Gtk.Button(label="📞 Answer")
+        self.answer_btn.get_style_context().add_class("suggested-action")
+        self.answer_btn.connect("clicked", lambda *_: self.call_action("/t/phone/call/answer"))
+        self.end_btn = Gtk.Button(label="✕ Decline")
+        self.end_btn.get_style_context().add_class("destructive-action")
+        self.end_btn.connect("clicked", lambda *_: self.call_action("/t/phone/call/end"))
+        cbtn.add(self.answer_btn)
+        cbtn.add(self.end_btn)
+        self.call_card.add(cbtn)
+        self.call_card.set_no_show_all(True)
+        cb.add(self.call_card)
+        dial = Gtk.Box(spacing=6)
+        self.dial_entry = Gtk.Entry(hexpand=True, placeholder_text="Number to call", input_purpose=Gtk.InputPurpose.PHONE)
+        self.dial_entry.connect("activate", lambda *_: self.dial(self.dial_entry.get_text()))
+        db = Gtk.Button(label="📞 Call")
+        db.get_style_context().add_class("suggested-action")
+        db.connect("clicked", lambda *_: self.dial(self.dial_entry.get_text()))
+        dial.pack_start(self.dial_entry, True, True, 0)
+        dial.add(db)
+        cb.add(dial)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>Calls run on your phone: talk on the phone or a headset connected to it.</small>")
+        note.get_style_context().add_class("dim-label")
+        cb.add(note)
+        self.k_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        ksw = Gtk.ScrolledWindow(vexpand=True)
+        ksw.add(self.k_list)
+        cb.pack_start(ksw, True, True, 0)
+        self.stack.add_titled(cb, "calls", "📞 Calls")
+        self.call = {"state": "idle"}
         # files
         fb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         fh = Gtk.Box(spacing=6)
@@ -14743,6 +14800,13 @@ class PhonePanel(Gtk.Box):
         threading.Thread(target=work, daemon=True).start()
 
     def refresh(self, force=False):
+        if self.win.chat.is_locked():                     # the chat PIN protects the phone panel too
+            self.outer.set_visible_child_name("locked")
+            self.pin.set_text("")
+            self.pin_msg.set_text("")
+            self.pin.grab_focus()
+            return
+        self.outer.set_visible_child_name("main")
         L = self.win.chat.linked
         inst = L.phone_twin()
         if not inst:
@@ -14765,6 +14829,8 @@ class PhonePanel(Gtk.Box):
                 self.open_thread(self.thread)
             else:
                 self.load_threads()
+        elif page == "calls":
+            self.load_calls()
         elif page == "files" and (force or not self.f_list.get_children()):
             self.load_files(self.fpath)
         self._info()
@@ -14792,7 +14858,87 @@ class PhonePanel(Gtk.Box):
             return False
         if self.stack.get_visible_child_name() == "notifs":
             self.load_notifs()
+        if self.call.get("state") == "offhook":
+            self.show_call(self.call)
         return True
+
+    def _pin_typed(self, e):
+        if len(e.get_text()) == 4:
+            ok, msg = self.win.chat.unlock(e.get_text())
+            e.set_text("")
+            if ok:
+                self.refresh(force=True)
+            else:
+                self.pin_msg.set_text(msg)
+
+    # ---------- calls
+    def load_calls(self):
+        def done(r, err):
+            for c in self.k_list.get_children():
+                self.k_list.remove(c)
+            if err:
+                self.k_list.add(Gtk.Label(label="⚠ " + err, wrap=True, margin=10))
+                self.k_list.show_all()
+                return
+            if r.get("call"):
+                self.show_call(r["call"])
+            icons = {"in": "↙", "out": "↗", "missed": "✗", "declined": "⊘"}
+            for it in r.get("items", []):
+                row = Gtk.ListBoxRow()
+                box = Gtk.Box(spacing=8, margin=5)
+                ic = Gtk.Label()
+                colour = "#e01b24" if it.get("type") in ("missed", "declined") else skin_color("ok")
+                ic.set_markup(f"<span foreground='{colour}' size='large'><b>{icons.get(it.get('type'), '•')}</b></span>")
+                box.add(ic)
+                t = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+                dur = int(it.get("duration") or 0)
+                t.set_markup(f"<b>{esc(it.get('name') or it.get('number') or 'Unknown')}</b>\n<small>"
+                             f"{time.strftime('%d %b %H:%M', time.localtime(it.get('ts', 0)))}"
+                             f"{f' · {dur // 60}:{dur % 60:02d}' if dur else ''} · {esc(it.get('type', ''))}</small>")
+                box.pack_start(t, True, True, 0)
+                if it.get("number"):
+                    b = Gtk.Button(label="📞")
+                    b.set_tooltip_text(f"Call {it['number']} from your phone")
+                    b.connect("clicked", lambda _b, n=it["number"]: self.dial(n))
+                    box.add(b)
+                row.add(box)
+                self.k_list.add(row)
+            self.k_list.show_all()
+        self._ask("/t/phone/calls", {}, done)
+
+    def show_call(self, call):
+        """The live call card: ringing (Answer / Decline), on a call (timer, End), or hidden."""
+        self.call = call
+        state = call.get("state", "idle")
+        who = call.get("name") or call.get("number") or "Unknown number"
+        if state == "idle":
+            self.call_card.hide()
+            return
+        if self.win.chat.is_locked():
+            who = "a caller"
+        if state == "ringing":
+            self.call_label.set_markup(f"<span size='large'>📞 <b>Incoming call</b></span>\n{esc(who)}")
+            self.answer_btn.show()
+            self.end_btn.set_label("✕ Decline")
+        else:
+            secs = max(0, int(time.time() - float(call.get("since") or time.time())))
+            self.call_label.set_markup(f"<span size='large'>📞 <b>On a call</b></span>\n{esc(who)} · {secs // 60}:{secs % 60:02d}")
+            self.answer_btn.hide()
+            self.end_btn.set_label("✕ End call")
+        self.call_card.set_no_show_all(False)
+        self.call_card.show_all()
+        if state == "offhook":
+            self.answer_btn.hide()
+
+    def call_action(self, path):
+        self._ask(path, {}, lambda r, err: self.win.flash_all("✗ " + err) if err else self.load_calls())
+
+    def dial(self, number):
+        number = (number or "").strip()
+        if not number:
+            return
+        self.win.flash_all(f"📞 Calling {number} on your phone…")
+        self._ask("/t/phone/call/dial", {"number": number}, lambda r, err: self.win.flash_all("✗ " + err) if err else None)
 
     # ---------- notifications
     def load_notifs(self):
@@ -15025,6 +15171,11 @@ class PhonePanel(Gtk.Box):
 
     # ---------- the phone pushed something
     def phone_event(self, ev):
+        if ev.get("type") == "call":
+            self.show_call(ev)
+            if self.get_mapped() and self.stack.get_visible_child_name() == "calls" and ev.get("state") == "idle":
+                self.load_calls()
+            return
         if self.get_mapped():
             if ev.get("type") in ("posted", "removed") and self.stack.get_visible_child_name() == "notifs":
                 self.load_notifs()
@@ -17761,6 +17912,8 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_chat_lock_changed(self):
         for p in self.chat_panels():
             p.refresh()
+        if self._right == "phone":
+            self.phone_panel.refresh(force=True)          # the phone panel locks and unlocks with the chat
         self.update_chat_button()
         return False
 
@@ -18220,13 +18373,49 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def on_phone_event(self, ev):
-        """The linked phone pushed a notification (or a new SMS)."""
+        """The linked phone pushed a notification, a new SMS, or a call state."""
         self.phone_panel.phone_event(ev)
+        locked = self.chat.is_locked()
+        if ev.get("type") == "call":
+            self._phone_call_popup(ev, locked)
+            return False
         it = ev.get("item") or {}
         if ev.get("type") in ("posted", "sms") and self._right != "phone" and it.get("title"):
-            self.show_toast(f"📱 {it.get('app', 'Phone')} · {it.get('title', '')}", (it.get("text") or "")[:120], None,
-                            lambda: self.show_right("phone"))
+            if locked:
+                self.show_toast("📱 New phone notification", "Unlock to see it", None, lambda: self.show_right("phone"))
+            else:
+                self.show_toast(f"📱 {it.get('app', 'Phone')} · {it.get('title', '')}", (it.get("text") or "")[:120], None,
+                                lambda: self.show_right("phone"))
         return False
+
+    def _phone_call_popup(self, ev, locked):
+        """Incoming phone call: Answer / Decline from anywhere in Arckad-D (it goes away when the call does)."""
+        d = getattr(self, "_call_dlg", None)
+        if ev.get("state") != "ringing":
+            if d:
+                d.destroy()
+                self._call_dlg = None
+            return
+        if d:
+            d.destroy()
+        who = "a caller" if locked else (ev.get("name") or ev.get("number") or "Unknown number")
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text="📞 Incoming call on your phone")
+        d.format_secondary_text(f"From {who}" + ("" if locked or not ev.get("name") else f"  ({ev.get('number', '')})"))
+        d.add_buttons("✕ Decline", Gtk.ResponseType.REJECT, "📞 Answer", Gtk.ResponseType.ACCEPT)
+        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+        d.get_widget_for_response(Gtk.ResponseType.REJECT).get_style_context().add_class("destructive-action")
+        d.set_keep_above(True)
+
+        def respond(dlg, r):
+            if r in (Gtk.ResponseType.ACCEPT, Gtk.ResponseType.REJECT):
+                self.phone_panel.call_action("/t/phone/call/answer" if r == Gtk.ResponseType.ACCEPT else "/t/phone/call/end")
+            dlg.destroy()
+            self._call_dlg = None
+        d.connect("response", respond)
+        self._call_dlg = d
+        d.show_all()
+        d.present()
 
     def on_chat_typing(self, gid):
         for p in self.chat_panels():

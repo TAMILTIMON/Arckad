@@ -1952,6 +1952,9 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         box.addView(Ui.button(a, (pl.smsAllowed() ? "✓ " : "") + "Allow text messages (SMS) and contact names", !pl.smsAllowed(),
                 v -> a.requestPermissions(new String[]{android.Manifest.permission.READ_SMS, android.Manifest.permission.SEND_SMS,
                         android.Manifest.permission.READ_CONTACTS}, 7310)), Ui.matchWrap(a, 6));
+        box.addView(Ui.button(a, (pl.callsAllowed() ? "✓ " : "") + "Allow calls (see, answer and make calls from the PC)", !pl.callsAllowed(),
+                v -> a.requestPermissions(new String[]{android.Manifest.permission.READ_PHONE_STATE, android.Manifest.permission.READ_CALL_LOG,
+                        android.Manifest.permission.ANSWER_PHONE_CALLS, android.Manifest.permission.CALL_PHONE}, 7311)), Ui.matchWrap(a, 6));
         if (e.link.twins().length() == 0)
             box.addView(Ui.text(a, "This phone isn't linked to a PC yet: ⋮ → Linked devices → Join my PC's account.", 13, 0xffe01b24, false));
         Ui.dialog(a).setTitle("📱 Phone link").setView(box).setPositiveButton("Done", null).show();
