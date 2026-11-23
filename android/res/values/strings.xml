@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="control_description">Lets your linked PC tap, swipe and type on this phone while you share its screen with Arckad-D (Phone link). It only works during a screen-sharing session you started, from your own linked PC on your local network, and only while "Allow control from the PC" is on.</string>
+</resources>

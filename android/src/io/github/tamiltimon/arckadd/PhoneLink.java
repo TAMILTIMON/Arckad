@@ -89,6 +89,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
                 return endCall();
             case "/t/phone/call/dial":
                 return dial(req);
+            case "/t/phone/control":
+                return control(req);
             case "/t/phone/mirror/start":
                 return mirrorStart(req);
             case "/t/phone/mirror/stop":
@@ -114,7 +116,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         int plugged = b == null ? 0 : b.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
         return new Obj().putOpt("ok", true).putOpt("battery", level < 0 ? null : level * 100 / Math.max(1, scale))
                 .putOpt("charging", plugged != 0).putOpt("notif_ok", notifAllowed()).putOpt("sms_ok", smsAllowed())
-                .putOpt("calls_ok", callsAllowed());
+                .putOpt("calls_ok", callsAllowed()).putOpt("control_ok", PhoneControl.instance != null)
+                .putOpt("control_on", Ui.prefs(c).getBoolean("phone_control", false));
     }
 
     // ---------- notifications
@@ -200,8 +203,9 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         Map<Long, JSONObject> byThread = new LinkedHashMap<>();
         Map<String, String> names = new java.util.HashMap<>();
         try (Cursor q = c.getContentResolver().query(Uri.parse("content://sms"),
-                new String[]{"thread_id", "address", "body", "date", "type", "read"}, null, null, "date DESC LIMIT 600")) {
-            while (q != null && q.moveToNext()) {
+                new String[]{"thread_id", "address", "body", "date", "type", "read"}, null, null, "date DESC")) {
+            int seen = 0;
+            while (q != null && q.moveToNext() && seen++ < 600) {
                 long tid = q.getLong(0);
                 JSONObject t = byThread.get(tid);
                 if (t == null) {
@@ -223,8 +227,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         if (!smsAllowed()) return err("SMS isn't allowed on the phone");
         java.util.List<JSONObject> list = new ArrayList<>();
         try (Cursor q = c.getContentResolver().query(Uri.parse("content://sms"), new String[]{"_id", "body", "date", "type"},
-                "thread_id=?", new String[]{String.valueOf(req.optLong("thread"))}, "date DESC LIMIT 200")) {
-            while (q != null && q.moveToNext())
+                "thread_id=?", new String[]{String.valueOf(req.optLong("thread"))}, "date DESC")) {
+            while (q != null && q.moveToNext() && list.size() < 200)
                 list.add(new Obj().putOpt("id", q.getLong(0)).putOpt("body", q.getString(1)).putOpt("ts", q.getLong(2) / 1000.0)
                         .putOpt("out", q.getInt(3) == 2));
         }
@@ -253,8 +257,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         if (!callsAllowed()) return err("Calls aren't allowed on the phone (Chat → ⋮ → 📱 Phone link → Allow calls)");
         JSONArray out = new JSONArray();
         try (Cursor q = c.getContentResolver().query(android.provider.CallLog.Calls.CONTENT_URI,
-                new String[]{"number", "name", "date", "duration", "type"}, null, null, "date DESC LIMIT 150")) {
-            while (q != null && q.moveToNext()) {
+                new String[]{"number", "name", "date", "duration", "type"}, null, null, "date DESC")) {
+            while (q != null && q.moveToNext() && out.length() < 150) {
                 int t = q.getInt(4);
                 String kind = t == 1 ? "in" : t == 2 ? "out" : t == 3 ? "missed" : t == 5 ? "declined" : "other";
                 out.put(new Obj().putOpt("number", q.getString(0)).putOpt("name", q.getString(1)).putOpt("ts", q.getLong(2) / 1000.0)
@@ -301,6 +305,53 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         ScreenShare.lastRequest = System.currentTimeMillis();
         if (!ScreenShare.active) ScreenShare.askToShare(c, req.optString("pc"));
         return new Obj().putOpt("ok", true).putOpt("pub", pub.toString(16)).putOpt("active", ScreenShare.active);
+    }
+
+    private static long lastSeq;
+
+    /** A tap, swipe, key or text from the PC. Allowed only: with "Allow control" on, the accessibility service on,
+     *  during a screen-sharing session, signed with that session's own key and numbered (no fakes, no replays). */
+    private JSONObject control(JSONObject req) {
+        if (!Ui.prefs(c).getBoolean("phone_control", false))
+            return err("Control is off on the phone (Chat → ⋮ → 📱 Phone link → Allow control from the PC)");
+        PhoneControl pc = PhoneControl.instance;
+        if (pc == null) return err("Turn on Arckad-D in the phone's Settings → Accessibility first");
+        byte[] key = ScreenShare.sessionKey;
+        if (key == null || !ScreenShare.active) return err("Control works only while you share the phone's screen");
+        long seq = req.optLong("seq");
+        // positions are whole numbers 0..10000 (Java and Python write decimals differently; whole numbers match exactly)
+        long X = req.optLong("x"), Y = req.optLong("y"), X2 = req.optLong("x2"), Y2 = req.optLong("y2");
+        String body = req.optString("action") + "|" + X + "|" + Y + "|" + X2 + "|" + Y2 + "|" + req.optLong("ms") + "|"
+                + req.optString("key") + "|" + req.optString("text");
+        if (!ChatCrypto.same(ChatCrypto.hex(ChatCrypto.hm(key, "control", seq, body)), req.optString("proof")))
+            return err("not signed for this session");
+        synchronized (PhoneLink.class) {
+            if (seq <= lastSeq && seq != 1) return err("repeated command");
+            lastSeq = seq;
+        }
+        ScreenShare.lastRequest = System.currentTimeMillis();
+        boolean ok;
+        switch (req.optString("action")) {
+            case "tap":
+                ok = pc.gesture(X / 10000.0, Y / 10000.0, X / 10000.0, Y / 10000.0, 60);
+                break;
+            case "long":
+                ok = pc.gesture(X / 10000.0, Y / 10000.0, X / 10000.0, Y / 10000.0, 700);
+                break;
+            case "swipe":
+                ok = pc.gesture(X / 10000.0, Y / 10000.0, X2 / 10000.0, Y2 / 10000.0, Math.max(80, req.optLong("ms")));
+                break;
+            case "key":
+                ok = pc.key(req.optString("key"));
+                break;
+            case "text":
+                ok = pc.type(req.optString("text"));
+                if (!ok) return err("No text field is selected on the phone (tap one first)");
+                break;
+            default:
+                return err("unknown action");
+        }
+        return ok ? new Obj().putOpt("ok", true) : err("the phone couldn't do that");
     }
 
     /** One frame for the PC: [status byte] + (frame number, 8 bytes) + frame sealed with the session key.

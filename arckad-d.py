@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.35.0"
+APP_VERSION = "3.36.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -9199,8 +9199,9 @@ class LinkedDevices:
         return self.link.get("twins", {})
 
     def twin_online(self, inst):
+        """Seen recently. A phone in battery saver checks in every 30 s, so allow 90 s (not 15)."""
         t = self.twins().get(inst) or {}
-        return time.time() - t.get("seen", 0) < 15
+        return time.time() - t.get("seen", 0) < 90
 
     def twin_addresses(self):
         return [(t["ip"], t["port"]) for i, t in self.twins().items() if t.get("ip") and t.get("port") and self.twin_online(i)]
@@ -9721,11 +9722,17 @@ class LinkedDevices:
                    for pfx in self.chat.win.cfg.get("local_networks", []))
 
     def phone_twin(self):
-        """The linked phone (online, on a local network), or None."""
+        """The linked phone on a local network: seen recently, or at least with a known address to try (a phone in
+        battery saver is often quiet for a while but still answers)."""
+        best = None
         for inst, t in self.twins().items():
-            if (t.get("os") or "").lower().startswith("android") and self.twin_online(inst) and self.is_local(t.get("ip", "")):
+            if not (t.get("os") or "").lower().startswith("android") or not t.get("ip") or not self.is_local(t["ip"]):
+                continue
+            if self.twin_online(inst):
                 return inst
-        return None
+            if time.time() - t.get("seen", 0) < 24 * 3600:
+                best = best or inst
+        return best
 
     def phone_call(self, path, obj=None, timeout=20):
         inst = self.phone_twin()
@@ -14814,7 +14821,20 @@ class PhonePanel(Gtk.Box):
         pop.set_tooltip_text("Show the phone screen in its own window (resize it as you like)")
         pop.connect("clicked", lambda *_: self.pop_out())
         sc.add(pop)
+        self.ctl_btn = Gtk.ToggleButton(label="🖱 Control")
+        self.ctl_btn.set_tooltip_text("Tap, swipe and type on the phone from here (while sharing). Needs “Allow control "
+                                      "from the PC” and Accessibility on the phone.")
+        self.ctl_btn.connect("toggled", lambda b: self._ctl_toggled(b.get_active()))
+        sc.add(self.ctl_btn)
         sb.add(sc)
+        self.keys_bar = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        for label, key, tip in (("◀", "back", "Back (Esc)"), ("⬤", "home", "Home"), ("▢", "recents", "Recent apps"),
+                                ("🔔", "notifications", "Notifications")):
+            b = Gtk.Button(label=label)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, k=key: self.control("key", key=k))
+            self.keys_bar.add(b)
+        self.keys_bar.set_no_show_all(True)
         self.m_status = Gtk.Label(xalign=0, wrap=True)
         self.m_status.get_style_context().add_class("dim-label")
         self.m_status.set_markup("<small>View only · Android asks you to allow it on the phone · a fresh key for each "
@@ -14824,8 +14844,11 @@ class PhonePanel(Gtk.Box):
         self.m_image = Gtk.Image(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
         self.m_area.add(self.m_image)
         sb.pack_start(self.m_area, True, True, 0)
+        sb.add(self.keys_bar)
         self.stack.add_titled(sb, "screen", "🖥 Screen")
         self.mirroring, self.m_pix, self.m_pop = False, None, None
+        self._m_key, self._ctl_seq, self._ctl_q = None, 0, None
+        self._attach_control(self.m_area, lambda: self.m_image)
         self._parent = None
         self.stack.connect("notify::visible-child-name", lambda *_: self.refresh())
         self.show_all()
@@ -14973,7 +14996,21 @@ class PhonePanel(Gtk.Box):
             self.answer_btn.hide()
 
     def call_action(self, path):
-        self._ask(path, {}, lambda r, err: self.win.flash_all("✗ " + err) if err else self.load_calls())
+        answering = path.endswith("answer")
+        btn = self.answer_btn if answering else self.end_btn
+        old = btn.get_label()
+        btn.set_label("Answering…" if answering else "Ending…")
+        btn.set_sensitive(False)
+
+        def done(r, err):
+            btn.set_label(old)
+            btn.set_sensitive(True)
+            if err:
+                self.win.error(f"Your phone couldn't {'answer' if answering else 'end'} the call: {err}")
+            else:
+                self.win.flash_all("📞 Answered on your phone" if answering else "📞 Call ended")
+                self.load_calls()
+        self._ask(path, {}, done, timeout=8)
 
     def dial(self, number):
         number = (number or "").strip()
@@ -15236,6 +15273,7 @@ class PhonePanel(Gtk.Box):
                 shared = pow(theirs, x, DH_P).to_bytes(256, "big")
                 key = hashlib.sha256(b"arckad-mirror|" + shared + pub.to_bytes(256, "big") + theirs.to_bytes(256, "big")).digest()
                 inst = L.phone_twin()
+                self._m_key, self._ctl_seq = key, 0          # control commands are signed with this session's key
             except Exception as ex:
                 GLib.idle_add(lambda m=str(ex): (self._m_say("⚠ " + m), self._m_reset()) and False)
                 return
@@ -15288,7 +15326,8 @@ class PhonePanel(Gtk.Box):
         if not self.mirroring:                    # a frame that arrived just after Stop
             return False
         self.m_pix = pb
-        self._m_say(f"🖥 Live · {pb.get_width()}×{pb.get_height()} · {fps:.0f} frames/s · encrypted")
+        ctl = " · 🖱 control on (click, drag, wheel, type · Esc = Back)" if self.ctl_btn.get_active() else ""
+        self._m_say(f"🖥 Live · {pb.get_width()}×{pb.get_height()} · {fps:.0f} frames/s · encrypted{ctl}")
         for img, area in ((self.m_image, self.m_area), (getattr(self, "m_pop_img", None), getattr(self, "m_pop", None))):
             if img is None or area is None or not area.get_mapped():
                 continue
@@ -15300,6 +15339,9 @@ class PhonePanel(Gtk.Box):
 
     def _m_reset(self):
         self.mirroring = False
+        self._m_key = None
+        if self.ctl_btn.get_active():
+            self.ctl_btn.set_active(False)
         self.mirror_btn.set_label("▶ Show phone screen")
         self.mirror_btn.get_style_context().remove_class("destructive-action")
         self.mirror_btn.get_style_context().add_class("suggested-action")
@@ -15311,6 +15353,130 @@ class PhonePanel(Gtk.Box):
         if was:
             self._ask("/t/phone/mirror/stop", {}, lambda r, e: None, timeout=6)
 
+    # ---------- control from the PC (stage 4)
+    def _ctl_toggled(self, on):
+        if on and not self.mirroring:
+            self.ctl_btn.set_active(False)
+            self.win.flash_all("Start sharing the phone screen first (▶ Show phone screen)")
+            return
+        self.keys_bar.set_no_show_all(not on)
+        self.keys_bar.set_visible(on)
+        if on:
+            self.keys_bar.show_all()
+            self.m_area.grab_focus()
+            self._m_say("🖱 Control on · click = tap · drag = swipe · hold = long press · wheel = scroll · type to enter "
+                        "text · Esc = Back")
+
+    def _attach_control(self, area, image_of):
+        """Mouse and keyboard on the shown phone screen become taps, swipes, keys and typing on the phone."""
+        area.set_can_focus(True)
+        area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.SCROLL_MASK |
+                        Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.POINTER_MOTION_MASK)
+        down = {}
+
+        def where(ev):
+            """0..1 position on the phone screen, or None outside the picture."""
+            img = image_of()
+            pb = img.get_pixbuf() if img else None
+            if pb is None:
+                return None
+            ia = img.get_allocation()
+            x0 = ia.x + (ia.width - pb.get_width()) / 2 - area.get_allocation().x
+            y0 = ia.y + (ia.height - pb.get_height()) / 2 - area.get_allocation().y
+            fx, fy = (ev.x - x0) / pb.get_width(), (ev.y - y0) / pb.get_height()
+            return (fx, fy) if 0 <= fx <= 1 and 0 <= fy <= 1 else None
+
+        def press(_w, ev):
+            area.grab_focus()
+            if not self.ctl_btn.get_active() or ev.button != 1:
+                return False
+            p = where(ev)
+            if p:
+                down.update(p=p, t=time.time())
+            return True
+
+        def release(_w, ev):
+            if not self.ctl_btn.get_active() or ev.button != 1 or "p" not in down:
+                return False
+            p0, t0 = down.pop("p"), down.pop("t")
+            p1 = where(ev) or p0
+            ms = int((time.time() - t0) * 1000)
+            if abs(p1[0] - p0[0]) < 0.015 and abs(p1[1] - p0[1]) < 0.015:
+                self.control("long" if ms >= 500 else "tap", x=p0[0], y=p0[1])
+            else:
+                self.control("swipe", x=p0[0], y=p0[1], x2=p1[0], y2=p1[1], ms=min(max(ms, 120), 1500))
+            return True
+
+        def scroll(_w, ev):
+            if not self.ctl_btn.get_active():
+                return False
+            p = where(ev) or (0.5, 0.5)
+            up = ev.direction == Gdk.ScrollDirection.UP or (ev.direction == Gdk.ScrollDirection.SMOOTH and
+                                                            ev.get_scroll_deltas()[2] < 0)
+            a, b = (0.35, 0.65) if up else (0.65, 0.35)                      # wheel down = content moves up
+            self.control("swipe", x=p[0], y=a, x2=p[0], y2=b, ms=250)
+            return True
+
+        pending = {"text": "", "id": None}
+
+        def flush_text():
+            pending["id"] = None
+            if pending["text"]:
+                self.control("text", text=pending["text"])
+                pending["text"] = ""
+            return False
+
+        def key(_w, ev):
+            if not self.ctl_btn.get_active():
+                return False
+            name = Gdk.keyval_name(ev.keyval) or ""
+            if name in ("Return", "KP_Enter"):
+                flush_text()
+                self.control("key", key="enter")
+            elif name == "BackSpace":
+                flush_text()
+                self.control("key", key="backspace")
+            elif name == "Escape":
+                self.control("key", key="back")
+            else:
+                ch = chr(Gdk.keyval_to_unicode(ev.keyval)) if Gdk.keyval_to_unicode(ev.keyval) else ""
+                if not ch or ev.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.MOD1_MASK):
+                    return False
+                pending["text"] += ch
+                if pending["id"]:
+                    GLib.source_remove(pending["id"])
+                pending["id"] = GLib.timeout_add(180, flush_text)        # a burst of typing goes as one piece
+            return True
+        area.connect("button-press-event", press)
+        area.connect("button-release-event", release)
+        area.connect("scroll-event", scroll)
+        area.connect("key-press-event", key)
+
+    def control(self, action, x=0.0, y=0.0, x2=0.0, y2=0.0, ms=0, key="", text=""):
+        """One command, signed with this session's key and numbered, sent in order from a background queue."""
+        if not self._m_key or not self.mirroring:
+            return
+        import queue
+        if self._ctl_q is None:
+            self._ctl_q = queue.Queue()
+
+            def worker():
+                while True:
+                    cmd = self._ctl_q.get()
+                    try:
+                        r = self.win.chat.linked.phone_call("/t/phone/control", cmd, timeout=8)
+                        if not r.get("ok", True):
+                            GLib.idle_add(lambda m=r.get("reason", "refused"): self._m_say("⚠ " + m) and False)
+                    except Exception as ex:
+                        GLib.idle_add(lambda m=str(ex): self._m_say("⚠ " + m) and False)
+            threading.Thread(target=worker, daemon=True).start()
+        X, Y, X2, Y2 = (int(round(max(0.0, min(1.0, v)) * 10000)) for v in (x, y, x2, y2))
+        self._ctl_seq += 1
+        body = f"{action}|{X}|{Y}|{X2}|{Y2}|{int(ms)}|{key}|{text}"
+        proof = _hm(self._m_key, "control", self._ctl_seq, body).hex()
+        self._ctl_q.put({"action": action, "x": X, "y": Y, "x2": X2, "y2": Y2, "ms": int(ms), "key": key, "text": text,
+                         "seq": self._ctl_seq, "proof": proof})
+
     def pop_out(self):
         if self.m_pop:
             self.m_pop.present()
@@ -15321,6 +15487,7 @@ class PhonePanel(Gtk.Box):
         self.m_pop_img = Gtk.Image()
         box = Gtk.EventBox()
         box.add(self.m_pop_img)
+        self._attach_control(box, lambda: self.m_pop_img)
         w.add(box)
         self.m_pop = w
 
@@ -18110,7 +18277,10 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def freeze_report(self):
         log = CONFIG_DIR / "freeze-report.txt"
+        problems = CONFIG_DIR / "problem-report.txt"
         text = log.read_text(encoding="utf-8") if log.exists() else ""
+        if problems.exists():
+            text += "\n\n#################### ERRORS ####################\n" + problems.read_text(encoding="utf-8")[-30000:]
         d = Gtk.Dialog(title="Freeze report", transient_for=self, modal=True)
         d.add_button("Close", Gtk.ResponseType.CLOSE)
         d.set_default_size(720, 480)
@@ -18134,7 +18304,8 @@ class MainWindow(Gtk.ApplicationWindow):
             cp.connect("clicked", lambda *_: (Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text[-20000:], -1),
                                               self.flash_all("Freeze report copied")))
             clear = Gtk.Button(label="Clear")
-            clear.connect("clicked", lambda *_: (log.unlink(missing_ok=True), d.response(Gtk.ResponseType.CLOSE)))
+            clear.connect("clicked", lambda *_: (log.unlink(missing_ok=True), problems.unlink(missing_ok=True),
+                                                 d.response(Gtk.ResponseType.CLOSE)))
             row.add(cp)
             row.add(clear)
             box.add(row)
@@ -19151,7 +19322,37 @@ def selftest(out):
     return 0 if lines[-1] == "SELFTEST OK" else 1
 
 
+def install_error_recorder():
+    """Errors inside Arckad-D are written to its own problem log at once. Without this, Ubuntu's crash reporter
+    (apport) takes over Python's error handler and spends seconds on the main thread listing packages, which froze
+    the window every time."""
+    import traceback
+    log = CONFIG_DIR / "problem-report.txt"
+    state = {"n": 0, "t": 0.0}
+
+    def record(kind, etype, value, tb):
+        try:
+            now = time.time()
+            if now - state["t"] > 60:
+                state.update(n=0, t=now)
+            state["n"] += 1
+            if state["n"] > 20:                         # a burst of the same error: don't flood the disk
+                return
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            old = log.read_text(encoding="utf-8")[-80000:] if log.exists() else ""
+            text = "".join(traceback.format_exception(etype, value, tb))
+            log.write_text(old + f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} · Arckad-D {APP_VERSION} · {OS_NAME} · "
+                           f"{kind} =====\n{text}", encoding="utf-8")
+            sys.stderr.write(text)
+        except Exception:
+            pass
+    sys.excepthook = lambda t, v, tb: record("error", t, v, tb)
+    threading.excepthook = lambda a: record(f"error in background work ({a.thread.name if a.thread else '?'})",
+                                            a.exc_type, a.exc_value, a.exc_traceback)
+
+
 def main():
+    install_error_recorder()
     if "--selftest" in sys.argv:
         i = sys.argv.index("--selftest")
         sys.exit(selftest(sys.argv[i + 1] if len(sys.argv) > i + 1 else "selftest.txt"))

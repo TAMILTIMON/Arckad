@@ -76,5 +76,12 @@
         <service android:name=".ScreenShare" android:exported="false" android:foregroundServiceType="mediaProjection" />
         <activity android:name=".ScreenConsent" android:exported="false" android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <service android:name=".PhoneControl" android:exported="true" android:label="Arckad-D (control from your PC)"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/arckad_control" />
+        </service>
     </application>
 </manifest>

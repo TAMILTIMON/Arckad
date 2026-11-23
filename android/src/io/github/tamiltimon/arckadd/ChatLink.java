@@ -53,7 +53,7 @@ final class ChatLink {
 
     boolean twinOnline(String inst) {
         JSONObject t = twins().optJSONObject(inst);
-        return t != null && now() - t.optDouble("seen", 0) < 15;
+        return t != null && now() - t.optDouble("seen", 0) < 90;     // allow for battery saver's 30 s check-ins
     }
 
     String[] twinAddress() {

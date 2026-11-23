@@ -1955,6 +1955,15 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         box.addView(Ui.button(a, (pl.callsAllowed() ? "✓ " : "") + "Allow calls (see, answer and make calls from the PC)", !pl.callsAllowed(),
                 v -> a.requestPermissions(new String[]{android.Manifest.permission.READ_PHONE_STATE, android.Manifest.permission.READ_CALL_LOG,
                         android.Manifest.permission.ANSWER_PHONE_CALLS, android.Manifest.permission.CALL_PHONE}, 7311)), Ui.matchWrap(a, 6));
+        Switch ctl = new Switch(a);
+        ctl.setText("Allow control from the PC (tap, swipe, type while you share the screen)");
+        ctl.setTextColor(Ui.TEXT);
+        ctl.setChecked(Ui.prefs(a).getBoolean("phone_control", false));
+        ctl.setOnCheckedChangeListener((v, c) -> Ui.prefs(a).edit().putBoolean("phone_control", c).apply());
+        box.addView(ctl, Ui.matchWrap(a, 10));
+        box.addView(Ui.button(a, (PhoneControl.instance != null ? "✓ " : "") + "Turn on Arckad-D in Accessibility (needed for control)",
+                PhoneControl.instance == null, v -> a.startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))),
+                Ui.matchWrap(a, 6));
         if (e.link.twins().length() == 0)
             box.addView(Ui.text(a, "This phone isn't linked to a PC yet: ⋮ → Linked devices → Join my PC's account.", 13, 0xffe01b24, false));
         Ui.dialog(a).setTitle("📱 Phone link").setView(box).setPositiveButton("Done", null).show();
