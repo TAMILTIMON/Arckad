@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.36.3"
+APP_VERSION = "3.36.4"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -15620,6 +15620,14 @@ class LockScreen(Gtk.EventBox):
     .lock-btn { background-image: none; background-color: rgba(0,0,0,0.30); border: none; box-shadow: none;
       color: #ffffff; border-radius: 16px; }
     .lock-btn label { color: #ffffff; }
+    .lock-dots { color: #ffffff; font-size: 22px; letter-spacing: 10px; text-shadow: 0 1px 4px rgba(0,0,0,0.5); }
+    .lock-key { min-width: 64px; min-height: 64px; padding: 0; border-radius: 32px; border: none; box-shadow: none;
+      background-image: none; background-color: rgba(255,255,255,0.20); }
+    .lock-key:hover { background-color: rgba(255,255,255,0.32); }
+    .lock-key:active { background-color: rgba(255,255,255,0.50); }
+    .lock-key label { color: #ffffff; text-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+    .lock-key.lock-plain { background-color: transparent; }
+    .lock-scroll, .lock-scroll viewport { background-color: transparent; background-image: none; border: none; }
     """
 
     def __init__(self, win, pin_entry, msg_label, extras=(), title="Locked"):
@@ -15635,7 +15643,10 @@ class LockScreen(Gtk.EventBox):
         self._css = Gtk.CssProvider()
         self.get_style_context().add_provider(self._css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 21)
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=18)
-        self.add(col)
+        sc = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, vscrollbar_policy=Gtk.PolicyType.AUTOMATIC)
+        sc.get_style_context().add_class("lock-scroll")
+        sc.add(col)                                         # a short window scrolls instead of cutting the pad off
+        self.add(sc)
         lock = Gtk.Label()
         lock.set_markup(f"<span size='large'>🔒</span>  <b>{esc(title)}</b>")
         lock.get_style_context().add_class("lock-small")
@@ -15661,9 +15672,41 @@ class LockScreen(Gtk.EventBox):
         self.card.add(ctl)
         self.card.set_no_show_all(True)
         col.pack_start(self.card, False, False, 4)
-        pin_entry.get_style_context().add_class("lock-pin")
-        pin_entry.set_halign(Gtk.Align.CENTER)
-        col.pack_start(pin_entry, False, False, 4)
+        # phone-style PIN pad: four dots and round number keys (the PC keyboard works too)
+        self.pin = pin_entry
+        pin_entry.set_no_show_all(True)
+        pin_entry.hide()
+        col.pack_start(pin_entry, False, False, 0)
+        pin_entry.grab_focus = self.grab_focus             # the lock screen takes the typing instead
+        self.dots = Gtk.Label()
+        self.dots.get_style_context().add_class("lock-dots")
+        col.pack_start(self.dots, False, False, 6)
+        pin_entry.connect("changed", lambda *_: self._show_dots())
+        self._show_dots()
+        pad = Gtk.Grid(row_spacing=12, column_spacing=22, halign=Gtk.Align.CENTER)
+        letters = {"2": "ABC", "3": "DEF", "4": "GHI", "5": "JKL", "6": "MNO", "7": "PQRS", "8": "TUV", "9": "WXYZ", "0": "+"}
+        keys = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "✕", "0", "⌫"]
+        for i, k in enumerate(keys):
+            b = Gtk.Button()
+            b.get_style_context().add_class("lock-key")
+            lbl = Gtk.Label(justify=Gtk.Justification.CENTER)
+            if k.isdigit():
+                lbl.set_markup(f"<span size='x-large' weight='bold'>{k}</span>\n<span size='x-small'>{letters.get(k, ' ')}</span>")
+                b.connect("clicked", lambda _b, k=k: self.press(k))
+            else:
+                b.get_style_context().add_class("lock-plain")
+                lbl.set_markup(f"<span size='x-large'>{k}</span>")
+                b.set_tooltip_text("Delete a digit (Backspace)" if k == "⌫" else "Start over (Esc)")
+                b.connect("clicked", lambda _b, k=k: self.press("back" if k == "⌫" else "clear"))
+            b.add(lbl)
+            b.set_can_focus(False)
+            pad.attach(b, i % 3, i // 3, 1, 1)
+        col.pack_start(pad, False, False, 6)
+        self.set_can_focus(True)
+        self.add_events(Gdk.EventMask.KEY_PRESS_MASK | Gdk.EventMask.BUTTON_PRESS_MASK)
+        self.connect("key-press-event", self._key)
+        self.connect("button-press-event", lambda *_: self.grab_focus() and False)
+        self.connect("map", lambda *_: GLib.idle_add(lambda: self.grab_focus() and False))
         msg_label.get_style_context().add_class("lock-small")
         col.pack_start(msg_label, False, False, 0)
         bottom = Gtk.Box(spacing=8)
@@ -15679,6 +15722,35 @@ class LockScreen(Gtk.EventBox):
         self.apply()
         self._tick()
         GLib.timeout_add(1000, self._tick)
+
+    def _show_dots(self):
+        n = min(4, len(self.pin.get_text()))
+        self.dots.set_text("●" * n + "○" * (4 - n))
+
+    def press(self, k):
+        """A key on the pad (or the keyboard): a digit, back (delete one) or clear."""
+        t = self.pin.get_text()
+        if k == "back":
+            self.pin.set_text(t[:-1])
+        elif k == "clear":
+            self.pin.set_text("")
+        elif len(t) < 4:
+            self.pin.set_text(t + k)                       # the 4th digit checks the PIN (the box's own handler)
+
+    def _key(self, _w, ev):
+        name = Gdk.keyval_name(ev.keyval) or ""
+        digit = name[-1] if (name.isdigit() or (name.startswith("KP_") and name[3:].isdigit())) else None
+        if digit:
+            self.press(digit)
+        elif name == "BackSpace":
+            self.press("back")
+        elif name == "Escape":
+            self.press("clear")
+        elif name in ("Return", "KP_Enter"):
+            self.pin.activate()
+        else:
+            return False
+        return True
 
     def _tick(self):
         if self.get_mapped():
