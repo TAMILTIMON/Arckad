@@ -282,6 +282,18 @@ public class MainActivity extends Activity implements Net.NearbyUi {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        ChatHub.get(this).setVisible(true);                // full speed while Arckad-D is on screen
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        ChatHub.get(this).setVisible(false);               // background: battery saver, always, or off
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         if (!ready && hasStorage()) start(getIntent());

@@ -58,6 +58,8 @@ def _clear_forced_theme():
 
 
 _clear_forced_theme()
+if sys.platform == "win32":
+    os.environ.setdefault("GDK_WIN32_USE_EXPERIMENTAL_OLE2_DND", "1")     # drops from Explorer and other apps
 
 try:
     import gi
@@ -90,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.31.1"
+APP_VERSION = "3.32.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1976,11 +1978,37 @@ class FilePane(Gtk.Box):
             view.connect("drag-data-get", self.on_drag_get)
             view.connect("drag-data-received", self.on_drag_received)
             view.connect("drag-drop", self.on_drag_drop)
-            view.connect("drag-begin", self.on_drag_begin)
+            view.connect_after("drag-begin", self.on_drag_begin)     # after GTK's own (it sets a picture of the row)
 
     def on_drag_begin(self, view, context):
-        n = len(self.selected_paths())
-        Gtk.drag_set_icon_name(context, "folder-documents" if n > 1 else "text-x-generic", 0, 0)
+        """A small picture while dragging: the item's icon, plus a count badge for several (not the whole row)."""
+        paths = self.selected_paths()
+        n = len(paths)
+        theme = Gtk.IconTheme.get_default()
+        if n == 1:
+            name = "folder" if os.path.isdir(paths[0]) else "text-x-generic"
+            try:
+                info = Gio.content_type_get_icon(Gio.content_type_guess(paths[0], None)[0]) if name != "folder" else None
+                pb = theme.lookup_by_gicon(info, 48, 0).load_icon() if info else theme.load_icon(name, 48, 0)
+            except (GLib.Error, AttributeError, TypeError):
+                pb = theme.load_icon(name, 48, 0)
+        else:
+            pb = theme.load_icon("folder-documents" if theme.has_icon("folder-documents") else "folder", 48, 0)
+        pb = pb.scale_simple(48, 48, GdkPixbuf.InterpType.BILINEAR) if pb.get_width() != 48 else pb
+        canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 64, 64)
+        canvas.fill(0x00000000)
+        pb.composite(canvas, 0, 8, 48, 48, 0, 8, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+        if n > 1:
+            txt = str(n) if n < 100 else "99+"
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30"><circle cx="15" cy="15" r="14" '
+                   f'fill="#ff7a1a" stroke="white" stroke-width="2"/><text x="15" y="20" font-size="{13 if n < 100 else 10}" '
+                   f'font-family="sans-serif" font-weight="bold" text-anchor="middle" fill="white">{txt}</text></svg>')
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write(svg.encode())
+            loader.close()
+            badge = loader.get_pixbuf()
+            badge.composite(canvas, 34, 0, 30, 30, 34, 0, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+        Gtk.drag_set_icon_pixbuf(context, canvas, 24, 32)
 
     def on_drag_get(self, view, context, selection, info, time_):
         uris = [Gio.File.new_for_path(p).get_uri() for p in self.selected_paths()]
@@ -2660,7 +2688,7 @@ class FilePane(Gtk.Box):
             add("Move to Trash (Delete)", lambda: win.trash(self, paths))
             add("Delete permanently (Shift+Delete)", lambda: win.delete_forever(self, paths))
         else:
-            add("Paste (Ctrl+V)", lambda: win.paste_into(self), in_folder and win.clipboard is not None)
+            add("Paste (Ctrl+V)", lambda: win.paste_into(self), in_folder)
             add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
             add("New empty file…", lambda: win.new_file(self), in_folder)
             for item in win.terminal_menu_items(self.location):
@@ -10860,7 +10888,7 @@ class ChatPanel(Gtk.Box):
             if real:
                 self._first_unread = real[-min(n, len(real))]["id"]
         self.cancel_reply()
-        self.show_messages()
+        self.show_messages(force=True)
         self.update_info()
         self.chat.mark_read(gid)
         self.chat.unread[gid] = 0
@@ -10901,21 +10929,25 @@ class ChatPanel(Gtk.Box):
             return
         if self.pages.get_visible_child_name() == "locked":
             self.pages.set_visible_child_name("conv" if self.gid in self.chat.groups else "list")
-        self.me_btn.set_image(Gtk.Image.new_from_pixbuf(avatar_pixbuf(self.chat.my_name(),
-                                                                      self.chat.avatar_file(self.chat.me), 30)))
+        me_key = (self.chat.my_name(), self.chat.photo_hash())
+        if me_key != getattr(self, "_me_key", None):
+            self._me_key = me_key
+            self.me_btn.set_image(Gtk.Image.new_from_pixbuf(avatar_pixbuf(self.chat.my_name(),
+                                                                          self.chat.avatar_file(self.chat.me), 30)))
         self.setup_bar.set_visible(not self.chat.profile.get("setup"))
         n = len(self.chat.contacts["incoming"])
         self.people_badge.set_markup(f"<b>{n}</b>" if n else "")
-        # chats, newest activity first
-        for r in self.chat_list.get_children():
-            self.chat_list.remove(r)
-        order = self.order_chats()
-        for g in order:
-            if self.chat.groups[g].get("hidden"):
-                continue
-            self.chat_list.add(self._chat_row(g))
-        self.chat_list.show_all()
-        self.list_stack.set_visible_child_name("chats" if order else "empty")
+        # chats, newest activity first (only rebuilt while the list is on screen)
+        if self.pages.get_visible_child_name() == "list" or not self.chat_list.get_children():
+            for r in self.chat_list.get_children():
+                self.chat_list.remove(r)
+            order = self.order_chats()
+            for g in order:
+                if self.chat.groups[g].get("hidden"):
+                    continue
+                self.chat_list.add(self._chat_row(g))
+            self.chat_list.show_all()
+            self.list_stack.set_visible_child_name("chats" if order else "empty")
         if self.gid and self.gid not in self.chat.groups:
             self.show_list()
             return
@@ -11937,7 +11969,64 @@ class ChatPanel(Gtk.Box):
             return
         d.destroy()
 
-    def show_messages(self):
+    def _conv_signature(self):
+        """What the open conversation looks like (to tell a full redraw from 'just ticks' or 'just new rows')."""
+        msgs = self.chat.msgs.get(self.gid, [])
+        struct = tuple((m["id"], m.get("deleted"), m.get("kind")) for m in msgs
+                       if m.get("kind") not in ("delete", "react", "edit"))
+        der = self.chat.derived(self.gid)
+        dsig = (tuple(sorted((k, tuple(sorted((e, tuple(v)) for e, v in r.items()))) for k, r in der["reacts"].items())),
+                tuple(sorted(der["edits"].items())), der["pinned"])
+        view = (self.find_bar.get_visible(), self.find_text.get_text(), self.find_kind.get_active_id(),
+                self.find_date.get_active_id(), self.select_mode, tuple(sorted(self.selected)))
+        return self.gid, struct, dsig, view
+
+    def show_messages(self, force=False):
+        """Redraw only what changed: ticks only, new rows only, or (when needed) everything."""
+        if not self.gid or force or not self.list.get_children():
+            self._last_sig = None
+            return self._show_all_messages()
+        sig = self._conv_signature()
+        old = getattr(self, "_last_sig", None)
+        if old and sig[0] == old[0] and sig[2] == old[2] and sig[3] == old[3]:
+            if sig[1] == old[1]:                                   # only receipts / presence: update the ticks
+                for upd in list(getattr(self, "_tick_updaters", {}).values()):
+                    upd()
+                return
+            n = len(old[1])
+            if not sig[3][0] and not sig[3][4] and sig[1][:n] == old[1]:   # new messages at the end: add them
+                adj = self.scroll.get_vadjustment()
+                at_bottom = adj.get_value() + adj.get_page_size() >= adj.get_upper() - 60
+                by_id = {m["id"]: m for m in self.chat.msgs.get(self.gid, [])}
+                for mid, _d, _k in sig[1][n:]:
+                    m = by_id.get(mid)
+                    if not m or m.get("deleted") == "me":
+                        continue
+                    day = time.strftime("%A %d %B %Y", time.localtime(m.get("ts", 0)))
+                    if day != getattr(self, "_last_day_shown", None):
+                        self._last_day_shown = day
+                        d = Gtk.Label(margin_top=8, margin_bottom=2)
+                        d.set_markup(f"<small><b>{esc(day)}</b></small>")
+                        d.get_style_context().add_class("dim-label")
+                        dr = Gtk.ListBoxRow(activatable=False)
+                        dr.add(d)
+                        self.list.add(dr)
+                    r = self._row(m)
+                    self._rows_by_id[m["id"]] = r
+                    self.list.add(r)
+                self.list.show_all()
+                for upd in list(getattr(self, "_tick_updaters", {}).values()):
+                    upd()
+                self._last_sig = sig
+                if self.pages.get_visible_child_name() == "conv" and self.get_mapped():
+                    self.chat.mark_read(self.gid)
+                if at_bottom:
+                    GLib.idle_add(self._scroll_bottom)
+                return
+        self._show_all_messages()
+
+    def _show_all_messages(self):
+        self._tick_updaters = {}
         for r in self.list.get_children():
             self.list.remove(r)
         if not self.gid:
@@ -11971,6 +12060,7 @@ class ChatPanel(Gtk.Box):
             self.list.add(r)
         for m in shown[-300:]:
             day = time.strftime("%A %d %B %Y", time.localtime(m.get("ts", 0)))
+            self._last_day_shown = day
             if day != last_day:
                 last_day = day
                 d = Gtk.Label(margin_top=8, margin_bottom=2)
@@ -11991,6 +12081,7 @@ class ChatPanel(Gtk.Box):
             self._rows_by_id[m["id"]] = r
             self.list.add(r)
         self.list.show_all()
+        self._last_sig = self._conv_signature()
         if first_unread and getattr(self, "_unread_row", None):
             GLib.idle_add(lambda: self.scroll.get_vadjustment().set_value(
                 max(0, self._unread_row.get_allocation().y - 40)) or False)
@@ -12289,6 +12380,9 @@ class ChatPanel(Gtk.Box):
         ticks = self._ticks(m) if mine and m.get("deleted") != "everyone" else ""
         edited = " <i>edited</i>" if m["id"] in der["edits"] and not m.get("deleted") else ""
         tl.set_markup(f"<small>{when}{edited}</small>{ticks}")
+        if mine and m.get("deleted") != "everyone":
+            self.__dict__.setdefault("_tick_updaters", {})[m["id"]] = \
+                lambda tl=tl, m=m, when=when, edited=edited: tl.set_markup(f"<small>{when}{edited}</small>{self._ticks(m)}")
         tl.set_opacity(0.9)
         tl.set_tooltip_text(time.strftime("%A %d %B %Y, %H:%M:%S", time.localtime(m.get("ts", 0)))
                             + (("\n" + self._tick_text(m)) if mine else ""))
@@ -13705,6 +13799,84 @@ def install_packages(pkgs):
         return False, "Cancelled (the password window was closed)."
     tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
     return False, "apt couldn't install them:\n" + "\n".join(tail) + "\n\nYou can try in a terminal:\n  sudo apt install " + " ".join(pkgs)
+
+
+# ---------------------------------------------------------------- System clipboard: files to and from other apps
+def win_clip_set_files(paths, move):
+    """Windows: put files on the clipboard the way Explorer does (CF_HDROP), marked as Cut or Copy."""
+    import ctypes
+    from ctypes import wintypes
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    k32.GlobalAlloc.restype = wintypes.HGLOBAL
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    files = ("\0".join(os.path.abspath(p) for p in paths) + "\0\0").encode("utf-16-le")
+    header = (20).to_bytes(4, "little") + bytes(12) + (1).to_bytes(4, "little")    # DROPFILES, wide names
+    data = header + files
+    effect_fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
+    if not u32.OpenClipboard(None):
+        return False
+    try:
+        u32.EmptyClipboard()
+        for fmt, blob in ((15, data), (effect_fmt, (2 if move else 5).to_bytes(4, "little"))):   # 15 = CF_HDROP
+            h = k32.GlobalAlloc(0x0042, len(blob))                     # GMEM_MOVEABLE | GMEM_ZEROINIT
+            ptr = k32.GlobalLock(h)
+            ctypes.memmove(ptr, blob, len(blob))
+            k32.GlobalUnlock(h)
+            u32.SetClipboardData(fmt, h)
+    finally:
+        u32.CloseClipboard()
+    return u32.GetClipboardSequenceNumber()
+
+
+def win_clip_get_files():
+    """Windows: files copied in Explorer (or anywhere): (paths, move) or None."""
+    import ctypes
+    from ctypes import wintypes
+    u32, k32, sh = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.shell32
+    u32.GetClipboardData.restype = wintypes.HANDLE
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    sh.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+    if not u32.IsClipboardFormatAvailable(15) or not u32.OpenClipboard(None):
+        return None
+    try:
+        h = u32.GetClipboardData(15)
+        if not h:
+            return None
+        n = sh.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+        paths = []
+        for i in range(n):
+            size = sh.DragQueryFileW(h, i, None, 0) + 1
+            buf = ctypes.create_unicode_buffer(size)
+            sh.DragQueryFileW(h, i, buf, size)
+            paths.append(buf.value)
+        move = False
+        fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
+        if u32.IsClipboardFormatAvailable(fmt):
+            he = u32.GetClipboardData(fmt)
+            ptr = k32.GlobalLock(he) if he else None
+            if ptr:
+                move = bool(ctypes.c_uint32.from_address(ptr).value & 2)
+                k32.GlobalUnlock(he)
+        return paths, move
+    finally:
+        u32.CloseClipboard()
+
+
+def parse_clip_files(raw, target):
+    """Linux: files from another file manager's clipboard: (paths, move) or None."""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else (raw or "")
+    lines = [ln.strip() for ln in text.replace("\r", "").split("\n") if ln.strip()]
+    move = False
+    if target == "x-special/gnome-copied-files" and lines and lines[0] in ("copy", "cut"):
+        move, lines = lines[0] == "cut", lines[1:]
+    paths = [Gio.File.new_for_uri(u).get_path() for u in lines if u.startswith("file://")]
+    paths = [p for p in paths if p]
+    return (paths, move) if paths else None
 
 
 # ---------------------------------------------------------------- Music & clock widget
@@ -16065,17 +16237,109 @@ class MainWindow(Gtk.ApplicationWindow):
         self.active.flash("Copied to clipboard")
 
     def set_clipboard(self, paths, move):
+        """Copy / Cut: kept here and put on the system clipboard, so Explorer and other file managers can paste."""
         self.clipboard = (list(paths), move)
+        self._publish_clipboard(list(paths), move)
         word = "Cut" if move else "Copied"
-        self.active.flash(f"{word} {len(paths)} item{'s' if len(paths) != 1 else ''}: go to a folder and press Ctrl+V")
+        self.active.flash(f"{word} {len(paths)} item{'s' if len(paths) != 1 else ''}: go to a folder and press Ctrl+V "
+                          "(here or in another file manager)")
 
-    def paste_into(self, pane):
-        if not self.clipboard or not is_folder_loc(pane.location) or pane.mode == "search":
+    _CLIP_TARGETS = ["x-special/gnome-copied-files", "text/uri-list", "application/x-kde-cutselection",
+                     "UTF8_STRING", "text/plain"]
+
+    def _publish_clipboard(self, paths, move):
+        if IS_WIN:
+            try:
+                self._clip_seq = win_clip_set_files(paths, move)
+            except Exception:
+                self._clip_seq = None
+            return
+        if not getattr(self, "_clip_ready", False):
+            self._clip_ready = True
+            for i, t in enumerate(self._CLIP_TARGETS):
+                Gtk.selection_add_target(self, Gdk.SELECTION_CLIPBOARD, Gdk.Atom.intern(t, False), i)
+            self.connect("selection-get", self._clip_get)
+            self.connect("selection-clear-event", self._clip_lost)
+        self._clip_owned = Gtk.selection_owner_set(self, Gdk.SELECTION_CLIPBOARD, Gdk.CURRENT_TIME)
+
+    def _clip_get(self, _w, data, info, _time):
+        if not self.clipboard:
             return
         paths, move = self.clipboard
-        self.transfer(paths, move, pane.location)
-        if move:
-            self.clipboard = None
+        uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
+        target = self._CLIP_TARGETS[info]
+        if target == "x-special/gnome-copied-files":
+            data.set(data.get_target(), 8, ("cut" if move else "copy").encode() + b"\n" + "\n".join(uris).encode())
+        elif target == "text/uri-list":
+            data.set_uris(uris)
+        elif target == "application/x-kde-cutselection":
+            data.set(data.get_target(), 8, b"1" if move else b"0")
+        else:
+            data.set_text("\n".join(paths), -1)
+
+    def _clip_lost(self, *_):
+        self._clip_owned = False                     # something else was copied: paste takes that instead
+        return False
+
+    def _ours(self):
+        """Is Arckad-D's own Copy/Cut still the newest thing on the clipboard?"""
+        if not self.clipboard:
+            return False
+        if IS_WIN:
+            try:
+                import ctypes
+                return getattr(self, "_clip_seq", None) == ctypes.windll.user32.GetClipboardSequenceNumber()
+            except Exception:
+                return True
+        return getattr(self, "_clip_owned", True)
+
+    def paste_into(self, pane):
+        """Paste Arckad-D's own Copy/Cut, or files copied in Explorer / another file manager."""
+        if not is_folder_loc(pane.location) or pane.mode == "search":
+            return
+        dest = pane.location
+        if self._ours():
+            paths, move = self.clipboard
+            self.transfer(paths, move, dest)
+            if move:
+                self.clipboard = None
+            return
+        if IS_WIN:
+            try:
+                got = win_clip_get_files()
+            except Exception:
+                got = None
+            self._paste_external(got, dest)
+            return
+        cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+
+        def try_target(targets):
+            if not targets:
+                self._paste_external(None, dest)
+                return
+            t = targets[0]
+
+            def got_data(_cb, data):
+                raw = data.get_data() if data is not None and data.get_length() > 0 else None
+                parsed = parse_clip_files(raw, t) if raw else None
+                if parsed and t == "text/uri-list":
+                    def kde(_c, d):
+                        cut = d is not None and d.get_length() > 0 and d.get_data()[:1] == b"1"
+                        self._paste_external((parsed[0], cut), dest)
+                    cb.request_contents(Gdk.Atom.intern("application/x-kde-cutselection", False), kde)
+                elif parsed:
+                    self._paste_external(parsed, dest)
+                else:
+                    try_target(targets[1:])
+            cb.request_contents(Gdk.Atom.intern(t, False), got_data)
+        try_target(["x-special/gnome-copied-files", "text/uri-list"])
+
+    def _paste_external(self, got, dest):
+        if not got or not got[0]:
+            self.active.flash("Nothing to paste: copy some files first (here, in Explorer or another file manager)")
+            return
+        paths, move = got
+        self.transfer([p for p in paths if os.path.exists(p)], move, dest)
 
     def transfer(self, paths, move, dest):
         """Copies or moves items into dest, asking what to do when a name already exists."""
@@ -16971,9 +17235,19 @@ class MainWindow(Gtk.ApplicationWindow):
         return [self.chat_panel] + [w.panel for w in self.chat_windows]
 
     def on_chat_changed(self, gid):
-        for p in self.chat_panels():
-            p.refresh(gid)
-        self.update_chat_button()
+        """Chat events come in bursts (receipts, presence, typing): one update per burst, 0.2 s later."""
+        pend = self.__dict__.setdefault("_chat_pending", set())
+        pend.add(gid)
+        if not getattr(self, "_chat_flush", None):
+            def flush():
+                self._chat_flush = None
+                gids = set(self._chat_pending)
+                self._chat_pending.clear()
+                for p in self.chat_panels():
+                    p.refresh(None if (None in gids or len(gids) > 1) else next(iter(gids)))
+                self.update_chat_button()
+                return False
+            self._chat_flush = GLib.timeout_add(200, flush)
         return False
 
     # ---------- in-window pop-up (top centre) for new messages and friend requests
@@ -17925,7 +18199,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.set_clipboard(pane.selected_paths(), False)
         elif ctrl and low == "x" and not typing and pane.selected_paths():
             self.set_clipboard(pane.selected_paths(), True)
-        elif ctrl and low == "v" and not typing and self.clipboard:
+        elif ctrl and low == "v" and not typing:
             self.paste_into(pane)
         elif pane.handle_key(key, ctrl, alt, typing):
             pass

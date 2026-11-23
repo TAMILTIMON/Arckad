@@ -1222,7 +1222,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
     private void listMenu() {
         String[] items0 = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
                 "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)",
-                "Restore my profile from before a link", "☁ Back up chats (Google Drive or anywhere)", "Restore from a backup"};
+                "Restore my profile from before a link", "☁ Back up chats (Google Drive or anywhere)", "Restore from a backup",
+                "🔋 Background connection"};
         String[] items = new String[items0.length + 1];
         items[0] = "⭐ Saved Messages";
         System.arraycopy(items0, 0, items, 1, items0.length);
@@ -1232,6 +1233,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 return;
             }
             int w = w0 - 1;
+            if (w == 9) {
+                backgroundSettings();
+                return;
+            }
             if (w == 7) {
                 backupChats();
                 return;
@@ -1923,6 +1928,20 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 .setPositiveButton("💻 Join my PC's account", (x, w) -> linkThisPhone())
                 .setNeutralButton("Add my PC to this phone", (x, w) -> showLinkCode())
                 .setNegativeButton("Close", null).show();
+    }
+
+    private void backgroundSettings() {
+        String[] keys = {ChatHub.BG_SAVER, ChatHub.BG_ALWAYS, ChatHub.BG_OFF};
+        String[] labels = {"🔋 Battery saver (recommended): reachable when closed, checks in every 30 s",
+                "⚡ Always connected: instant presence, uses more battery",
+                "⏸ Off: chat only while Arckad-D is open (no notification)"};
+        String cur = hub.bgMode();
+        int sel = cur.equals(ChatHub.BG_ALWAYS) ? 1 : cur.equals(ChatHub.BG_OFF) ? 2 : 0;
+        Ui.dialog(a).setTitle("Background connection").setSingleChoiceItems(labels, sel, (d, w) -> {
+            hub.setBgMode(keys[w]);
+            d.dismiss();
+            Ui.toast(a, w == 2 ? "Chat disconnects a minute after you leave Arckad-D" : "Saved");
+        }).setNegativeButton("Close", null).show();
     }
 
     private void backupChats() {

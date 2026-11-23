@@ -89,6 +89,7 @@ final class ChatEngine {
     private DatagramSocket udp;
     private volatile boolean running;
     private long lastBeacon, lastDirect, lastSync;
+    volatile long beaconMs = 3000, directMs = 6000;   // slower in the background (battery saver)
     private final Map<String, Long> answered = new ConcurrentHashMap<>();
     private Map<String, String> tagTable = new HashMap<>();
     private String tagStamp = "";
@@ -2364,7 +2365,7 @@ final class ChatEngine {
                 if (!running) break;
             }
             long t = System.currentTimeMillis();
-            if (active() && t - lastBeacon > 3000) {
+            if (active() && t - lastBeacon > beaconMs) {
                 lastBeacon = t;
                 Set<String> targets = new HashSet<>();
                 targets.add("255.255.255.255");
@@ -2374,7 +2375,7 @@ final class ChatEngine {
                 }
                 sendBeacon(targets);
             }
-            if (t - lastDirect > 6000) {
+            if (t - lastDirect > directMs) {
                 lastDirect = t;
                 sendBeacon(directTargets());          // other VLANs: greet friends and members directly
                 tick();

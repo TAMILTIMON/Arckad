@@ -106,20 +106,78 @@ final class ChatHub implements ChatEngine.Ui {
         });
     }
 
-    /** Start chat networking (and keep it running in the background) if chat is in use. */
-    void start() {
-        if (!engine.active()) return;
-        if (mlock == null) {
+    // ---------- background connection: battery saver (default), always, or off
+    static final String BG_SAVER = "saver", BG_ALWAYS = "always", BG_OFF = "off";
+    private int visible;                                   // Arckad-D screens on show
+    private final Runnable offLater = this::stopForBackground;
+
+    String bgMode() {
+        return Ui.prefs(app).getString("chat_bg", BG_SAVER);
+    }
+
+    void setBgMode(String mode) {
+        Ui.prefs(app).edit().putString("chat_bg", mode).apply();
+        applyPower();
+        if (!BG_OFF.equals(mode)) ChatService.ensure(app);
+        ChatService.refresh(app);
+    }
+
+    boolean onScreen() {
+        return visible > 0;
+    }
+
+    /** MainActivity tells us when Arckad-D comes on screen or leaves it. */
+    void setVisible(boolean on) {
+        visible = Math.max(0, visible + (on ? 1 : -1));
+        main.removeCallbacks(offLater);
+        if (on) start();
+        else if (BG_OFF.equals(bgMode())) main.postDelayed(offLater, 60_000);    // off: disconnect a minute later
+        applyPower();
+    }
+
+    /** Full speed on screen; in the background: battery saver checks in every 30 s and lets Wi-Fi sleep. */
+    void applyPower() {
+        boolean full = onScreen() || BG_ALWAYS.equals(bgMode());
+        engine.beaconMs = full ? 3000 : 30_000;
+        engine.directMs = full ? 6000 : 60_000;
+        if (full) {
+            if (mlock == null) {
+                try {
+                    WifiManager wm = (WifiManager) app.getSystemService(Context.WIFI_SERVICE);
+                    mlock = wm.createMulticastLock("arckad-chat");      // some phones drop broadcasts without it
+                    mlock.setReferenceCounted(false);
+                } catch (Exception ignored) {
+                }
+            }
             try {
-                WifiManager wm = (WifiManager) app.getSystemService(Context.WIFI_SERVICE);
-                mlock = wm.createMulticastLock("arckad-chat");      // some phones drop broadcasts without it
-                mlock.setReferenceCounted(false);
-                mlock.acquire();
+                if (mlock != null && !mlock.isHeld()) mlock.acquire();
+            } catch (Exception ignored) {
+            }
+        } else {
+            try {
+                if (mlock != null && mlock.isHeld()) mlock.release();         // friends reach us directly anyway
             } catch (Exception ignored) {
             }
         }
+    }
+
+    /** Background connection is off and Arckad-D left the screen: disconnect (it reconnects when opened). */
+    void stopForBackground() {
+        if (onScreen()) return;
+        engine.stop();
+        try {
+            if (mlock != null && mlock.isHeld()) mlock.release();
+        } catch (Exception ignored) {
+        }
+        app.stopService(new Intent(app, ChatService.class));
+    }
+
+    /** Start chat networking (and keep it running in the background, unless that's off) if chat is in use. */
+    void start() {
+        if (!engine.active()) return;
+        applyPower();
         engine.start();
-        ChatService.ensure(app);
+        if (!BG_OFF.equals(bgMode())) ChatService.ensure(app);
     }
 
     void addListener(Listener l) {
