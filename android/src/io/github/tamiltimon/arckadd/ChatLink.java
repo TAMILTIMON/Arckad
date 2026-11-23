@@ -545,8 +545,12 @@ final class ChatLink {
                 changed = true;
                 continue;
             }
-            if (g.optInt("version") > mine.optInt("version") || (direct && !g.optBoolean("removed") && !g.optString("key").equals(mine.optString("key")))) {
-                for (String k : new String[]{"name", "owner_only", "members", "key", "version", "past", "removed", "owner"})
+            // friendship keys: the NEWEST one wins on both devices (they used to swap and never agree)
+            boolean newerKey = direct && !g.optBoolean("removed") && !g.optString("key").equals(mine.optString("key"))
+                    && (g.optDouble("key_ts", 0) > mine.optDouble("key_ts", 0)
+                    || (g.optDouble("key_ts", 0) == mine.optDouble("key_ts", 0) && g.optString("key").compareTo(mine.optString("key")) > 0));
+            if (g.optInt("version") > mine.optInt("version") || newerKey) {
+                for (String k : new String[]{"name", "owner_only", "members", "key", "key_ts", "version", "past", "removed", "owner", "photo"})
                     if (g.has(k)) put(mine, k, g.opt(k));
                 changed = true;
             }

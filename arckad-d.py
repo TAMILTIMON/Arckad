@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.37.1"
+APP_VERSION = "3.37.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -5349,7 +5349,7 @@ def make_pair_handler(pr):
         def do_GET(self):
             try:
                 path = self.path.split("?")[0]
-                if (path.startswith("/c/file/") or path in ("/f/photo", "/f/hello", "/f/card")) and getattr(pr.win, "chat", None):
+                if (path.startswith("/c/file/") or path in ("/f/photo", "/f/hello", "/f/card", "/c/gphoto")) and getattr(pr.win, "chat", None):
                     return pr.win.chat.handle_get(self, path)
                 self._plain(404, {"ok": False})
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -6282,8 +6282,8 @@ class Chat:
         return downloads_dir() / "Arckad-D Chat" / _safe_folder_name(self.groups.get(gid, {}).get("name", "Group"))
 
     def _meta_for_members(self, g):
-        return {k: g[k] for k in ("id", "name", "owner", "key", "version", "owner_only", "members", "created", "past")
-                if k in g}
+        return {k: g[k] for k in ("id", "name", "owner", "key", "version", "owner_only", "members", "created", "past",
+                                  "photo") if k in g}
 
     def _system(self, gid, text, share=True):
         """A notice in the chat ("X joined"). The owner's notices go to everyone; others stay on this device."""
@@ -6413,6 +6413,12 @@ class Chat:
         for k in ("name", "owner_only", "members", "key", "version", "past"):
             if k in meta:
                 g[k] = meta[k]
+        if meta.get("photo") != g.get("photo"):
+            g["photo"] = meta.get("photo")
+            if g["photo"]:
+                threading.Thread(target=self._fetch_group_photo, args=(gid,), daemon=True).start()
+            else:
+                self.group_photo_path(gid).unlink(missing_ok=True)
         self.save()
         self._tag_cache = (None, {})
         self.ui("on_chat_changed", gid)
@@ -7125,6 +7131,62 @@ class Chat:
         o = self.online.get(pid) or {}
         return max(f.get("last_seen", 0), o.get("seen", 0), (self.people.get(pid) or {}).get("seen", 0))
 
+    # ---------- group photos (set by the group's admin)
+    def group_photo_path(self, gid):
+        return CHAT_DIR / "avatars" / f"g-{gid}.jpg"
+
+    def group_photo_file(self, gid):
+        p = self.group_photo_path(gid)
+        return str(p) if (self.groups.get(gid) or {}).get("photo") and p.exists() else None
+
+    def set_group_photo(self, gid, src):
+        """Admin: a new group photo (or None to remove it); members get it with the group's details."""
+        g = self.groups.get(gid)
+        if not g or not self.is_owner(gid):
+            return
+        p = self.group_photo_path(gid)
+        if src:
+            pb = GdkPixbuf.Pixbuf.new_from_file(src)
+            side = min(pb.get_width(), pb.get_height())
+            pb = pb.new_subpixbuf((pb.get_width() - side) // 2, (pb.get_height() - side) // 2, side, side)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            pb.scale_simple(256, 256, GdkPixbuf.InterpType.HYPER).savev(str(p), "jpeg", ["quality"], ["88"])
+            g["photo"] = hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+        else:
+            p.unlink(missing_ok=True)
+            g["photo"] = None
+        g["version"] = g.get("version", 1) + 1
+        self.save()
+        _avatar_cache.clear()
+        self._system(gid, f"{self.my_name()} {'changed' if src else 'removed'} the group photo")
+        self.push_meta(gid)
+        self.ui("on_chat_changed", None)
+
+    def _fetch_group_photo(self, gid):
+        g = self.groups.get(gid) or {}
+        want = g.get("photo")
+        if not want:
+            return
+        sources = [g.get("owner")] + [d for d in self.online_members(gid) if d not in (g.get("owner"), self.me)]
+        for did in [d for d in sources if d]:
+            try:
+                c, r = self._request(gid, did, "GET", "/c/gphoto", None, timeout=15, raw=True)
+                data = r.read(2_000_000)
+                c.close()
+                if r.status != 200:
+                    continue
+                jpeg = unseal(self.key(gid), data)
+                if hashlib.sha256(jpeg).hexdigest()[:12] != want:
+                    continue
+                p = self.group_photo_path(gid)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(jpeg)
+                _avatar_cache.clear()
+                self.ui("on_chat_changed", None)
+                return
+            except Exception:
+                continue
+
     def card_of(self, pid):
         if pid == self.me:
             return self.my_card()
@@ -7264,6 +7326,7 @@ class Chat:
         req = self.contacts["incoming"].pop(pid, None)
         if not req:
             return
+        self.linked.tomb("req", pid)                           # my linked device drops this request too
         x, offer = self._dh_offer(pid)
         key = self._friend_key(x, req["dh"], offer["dh"])
         self._become_friends(pid, req["name"], req.get("os", ""), req["sigpub"], key, req.get("ph", ""))
@@ -7316,7 +7379,8 @@ class Chat:
             g = self.groups.get(gid)
             if g is None or g.get("removed"):
                 self.groups[gid] = {"id": gid, "kind": "direct", "peer": pid, "name": name, "owner": None,
-                                    "key": key.hex(), "version": 1, "owner_only": False, "created": time.time(),
+                                    "key": key.hex(), "key_ts": time.time(), "version": 1, "owner_only": False,
+                                    "created": time.time(),
                                     "files": {}, "members": {self.me: {"name": self.my_name(), "pub": self.my_pub(),
                                                                        "os": OS_NAME, "role": "member"},
                                                              pid: {"name": name, "pub": sigpub, "os": os_name,
@@ -7324,10 +7388,13 @@ class Chat:
                 self.msgs.setdefault(gid, [])
                 self.ids.setdefault(gid, set())
             else:
-                g["key"] = key.hex()
+                g["key"], g["key_ts"] = key.hex(), time.time()     # linked devices keep the newest key
         self.save()
         self.save_contacts()
         self._tag_cache = (None, {})
+        if self.linked.key():                                  # tell my other device at once (no second accept)
+            for inst in list(self.linked.twins()):
+                threading.Thread(target=self.linked.sync, args=(inst,), daemon=True).start()
         self.start()
         p = self.people.get(pid)
         if p and p.get("ph"):
@@ -8595,6 +8662,11 @@ class Chat:
         gid, did, auth = self._auth(h)
         if not gid or auth[1]:
             return h._plain(401, {"ok": False})
+        if path == "/c/gphoto":                      # the group photo, for members (sealed with the group key)
+            f = self.group_photo_file(gid)
+            if not f:
+                return h._plain(404, {"ok": False})
+            return h._raw(200, seal(auth[0], Path(f).read_bytes()))
         parts = [p for p in path.split("/") if p]
         fid = parts[2] if len(parts) == 3 else ""
         src = self.local_file(gid, fid)
@@ -9595,9 +9667,12 @@ class LinkedDevices:
                 c.ids.setdefault(gid, set())
                 changed = True
             else:
-                if int(g.get("version", 0)) > int(mine.get("version", 0)) or (g.get("key") != mine.get("key") and
-                                                                              g.get("kind") == "direct" and not g.get("removed")):
-                    for k in ("name", "owner_only", "members", "key", "version", "past", "removed", "owner"):
+                newer_key = (g.get("kind") == "direct" and not g.get("removed") and g.get("key") != mine.get("key")
+                             and (float(g.get("key_ts", 0)), g.get("key", "")) > (float(mine.get("key_ts", 0)), mine.get("key", "")))
+                if int(g.get("version", 0)) > int(mine.get("version", 0)) or newer_key:
+                    # friendship keys: the NEWEST one wins on both devices (they used to swap and never agree)
+                    for k in ("name", "owner_only", "members", "key", "key_ts", "version", "past", "removed", "owner",
+                              "photo"):
                         if k in g:
                             mine[k] = g[k]
                     changed = True
@@ -10194,9 +10269,40 @@ def _round(pb, size):
                                            size, size, rs)
 
 
-def avatar_pixbuf(name, photo, size, group=False):
+def _rounded_square_with_badge(src, size):
+    """A group photo: a rounded square (people are round) with a small 👥 badge in the corner."""
+    pb = src.scale_simple(size, size, GdkPixbuf.InterpType.BILINEAR).add_alpha(False, 0, 0, 0)
+    n, stride = pb.get_n_channels(), pb.get_rowstride()
+    px = bytearray(pb.get_pixels())
+    r = max(3, size // 6)
+    for y in range(size):
+        dy = r - y if y < r else (y - (size - 1 - r) if y > size - 1 - r else 0)
+        if not dy:
+            continue
+        for x in list(range(r)) + list(range(size - r, size)):
+            dx = r - x if x < r else x - (size - 1 - r)
+            if dx * dx + dy * dy > r * r:
+                px[y * stride + x * n + 3] = 0
+    pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(px)), GdkPixbuf.Colorspace.RGB, True, 8, size, size, stride)
+    b = max(10, size * 2 // 5)
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><circle cx="20" cy="20" r="19" fill="#ff7a1a" '
+           'stroke="#fff" stroke-width="2"/><g fill="#fff"><circle cx="14" cy="16" r="5"/><circle cx="26" cy="16" r="5"/>'
+           '<path d="M5 33 C5 22 23 22 23 33 Z"/><path d="M17 33 C17 22 35 22 35 33 Z"/></g></svg>')
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.set_size(b, b)
+        loader.write(svg.encode())
+        loader.close()
+        badge = loader.get_pixbuf()
+        badge.composite(pb, size - b, size - b, b, b, size - b, size - b, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+    except Exception:
+        pass
+    return pb
+
+
+def avatar_pixbuf(name, photo, size, group=False, saved=False):
     stamp = os.path.getmtime(photo) if photo and os.path.exists(photo) else 0
-    key = (name, photo, size, group, stamp)
+    key = (name, photo, size, group, saved, stamp)
     if key in _avatar_cache:
         return _avatar_cache[key]
     pb = None
@@ -10205,16 +10311,26 @@ def avatar_pixbuf(name, photo, size, group=False):
             src = GdkPixbuf.Pixbuf.new_from_file(photo)
             side = min(src.get_width(), src.get_height())
             src = src.new_subpixbuf((src.get_width() - side) // 2, (src.get_height() - side) // 2, side, side)
-            pb = _round(src, size)
+            pb = _rounded_square_with_badge(src, size) if group else _round(src, size)
         except GLib.Error:
             pb = None
     if pb is None:
         colour = _AVATAR_COLOURS[int(hashlib.md5(name.encode()).hexdigest(), 16) % len(_AVATAR_COLOURS)]
-        shape = (f'<rect width="100" height="100" rx="26" fill="{colour}"/>' if group
-                 else f'<circle cx="50" cy="50" r="50" fill="{colour}"/>')
-        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">{shape}<text x="50" y="64" '
-               f'text-anchor="middle" fill="#fff" font-size="40" font-weight="700" '
-               f'font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif">{esc(_initials(name))}</text></svg>')
+        font = 'font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif"'
+        if saved:                                   # Saved Messages: a gold bookmark star
+            svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="22" '
+                   'fill="#f5a623"/><path d="M50 18 L59 40 L83 42 L65 57 L71 81 L50 68 L29 81 L35 57 L17 42 L41 40 Z" '
+                   'fill="#ffffff"/></svg>')
+        elif group:                                 # groups: a square with a faint “people” silhouette
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" '
+                   f'rx="16" fill="{colour}"/><g fill="#ffffff" opacity="0.22"><circle cx="34" cy="38" r="13"/>'
+                   f'<circle cx="66" cy="38" r="13"/><path d="M10 92 C10 64 58 64 58 92 Z"/><path d="M42 92 C42 64 90 64 90 92 Z"/>'
+                   f'</g><text x="50" y="62" text-anchor="middle" fill="#fff" font-size="34" font-weight="800" {font}>'
+                   f'{esc(_initials(name))}</text></svg>')
+        else:
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="50" '
+                   f'fill="{colour}"/><text x="50" y="64" text-anchor="middle" fill="#fff" font-size="40" '
+                   f'font-weight="700" {font}>{esc(_initials(name))}</text></svg>')
         try:
             loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
             loader.set_size(size, size)
@@ -11008,7 +11124,9 @@ class ChatPanel(Gtk.Box):
         g = self.chat.groups[gid]
         if g.get("kind") == "direct":
             return avatar_pixbuf(self.chat_title(gid), self.chat.avatar_file(g["peer"]), size)
-        return avatar_pixbuf(g.get("name", "?"), None, size, group=True)
+        if g.get("kind") == "saved":
+            return avatar_pixbuf("Saved Messages", None, size, saved=True)
+        return avatar_pixbuf(g.get("name", "?"), self.chat.group_photo_file(gid), size, group=True)
 
     def refresh(self, gid=None):
         if self.chat.is_locked():
@@ -11295,7 +11413,35 @@ class ChatPanel(Gtk.Box):
                                else "Only the group owner can post here.")
 
     # ---------- people page
-    def refresh_people(self):
+    def _typing_entries(self):
+        """Text boxes on the People page with something typed (or the cursor) in them."""
+        out = []
+
+        def walk(w):
+            if isinstance(w, Gtk.Entry):
+                out.append(w)
+            elif isinstance(w, Gtk.Container):
+                for c in w.get_children():
+                    walk(c)
+        walk(self.people_box)
+        return [e for e in out if e.get_text() or e.has_focus()]
+
+    def refresh_people(self, force=False):
+        """Rebuild the People page, but never under your fingers: while you're typing in one of its boxes the
+        automatic rebuilds wait, and a rebuild keeps what you typed (it used to erase the profile-code box)."""
+        typing = self._typing_entries()
+        if typing and not force:
+            if not getattr(self, "_people_later", None):
+                def later():
+                    self._people_later = None
+                    if not self._typing_entries():
+                        self.refresh_people()
+                    else:
+                        self._people_later = GLib.timeout_add(3000, later)
+                    return False
+                self._people_later = GLib.timeout_add(3000, later)
+            return
+        kept = {e.get_placeholder_text(): (e.get_text(), e.has_focus(), e.get_position()) for e in typing}
         for c in self.people_box.get_children():
             self.people_box.remove(c)
         ch = self.chat
@@ -11434,6 +11580,18 @@ class ChatPanel(Gtk.Box):
             person(pid, f["name"], sub, [("Message", lambda pid=pid: self.open_chat(ch._direct_gid(pid)),
                                           "suggested-action")], online=ch.person_online(pid))
         self.people_box.show_all()
+        if kept:                                               # put back what you were typing
+            def walk(w):
+                if isinstance(w, Gtk.Entry) and w.get_placeholder_text() in kept:
+                    text, focus, pos = kept[w.get_placeholder_text()]
+                    w.set_text(text)
+                    if focus:
+                        w.grab_focus()
+                        w.set_position(pos)
+                elif isinstance(w, Gtk.Container):
+                    for c in w.get_children():
+                        walk(c)
+            walk(self.people_box)
 
     def show_friend_code(self):
         self.chat.new_friend_code()
@@ -11742,7 +11900,15 @@ class ChatPanel(Gtk.Box):
 
         def work():
             ok, msg = self.chat.add_by_profile_code(code)
-            GLib.idle_add(lambda: (self.win.info(("✓ " if ok else "✗ ") + msg), self.refresh_people()) and False)
+            def done():
+                if ok:                                         # sent: empty the box so the page can refresh
+                    for e in self._typing_entries():
+                        if (e.get_placeholder_text() or "").startswith("Add with a profile code"):
+                            e.set_text("")
+                self.win.info(("✓ " if ok else "✗ ") + msg)
+                self.refresh_people()
+                return False
+            GLib.idle_add(done)
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- wallpaper
@@ -12925,6 +13091,26 @@ class ChatPanel(Gtk.Box):
         if was_editing:
             self.entry.set_text("")
 
+    def change_group_photo(self):
+        fc = Gtk.FileChooserNative(title="Choose the group photo", transient_for=self.get_toplevel(),
+                                   action=Gtk.FileChooserAction.OPEN)
+        flt = Gtk.FileFilter()
+        flt.set_name("Pictures")
+        for e in ("jpg", "jpeg", "png", "webp", "bmp"):
+            flt.add_pattern(f"*.{e}")
+            flt.add_pattern(f"*.{e.upper()}")
+        fc.add_filter(flt)
+        if fc.run() == Gtk.ResponseType.ACCEPT:
+            try:
+                crop = CropDialog(self.get_toplevel(), fc.get_filename())
+                if crop.run() == Gtk.ResponseType.OK:
+                    self.chat.set_group_photo(self.gid, crop.save())
+                    self.win.flash_all("Group photo changed: members get it automatically")
+                crop.destroy()
+            except GLib.Error as ex:
+                self.win.error(f"That picture couldn't be opened: {ex.message}")
+        fc.destroy()
+
     def _snippet(self, m, n=60):
         if not m:
             return "a message"
@@ -13313,6 +13499,14 @@ class ChatPanel(Gtk.Box):
             self.more_menu.show_all()
             return
         owner = self.chat.is_owner(self.gid)
+        if g.get("kind") not in ("direct", "saved") and owner and not g.get("removed"):
+            for label, cb in (("🖼 Change group photo…", self.change_group_photo),
+                              ("Remove group photo", lambda: self.chat.set_group_photo(self.gid, None))):
+                if label.startswith("Remove") and not g.get("photo"):
+                    continue
+                it = Gtk.MenuItem(label=label)
+                it.connect("activate", lambda _i, cb=cb: cb())
+                self.more_menu.append(it)
         for label, cb in (("Wallpaper for this chat…", lambda: self.choose_wallpaper(self.gid)),
                           ("Search and filter…", lambda: self.find_btn.set_active(True)),
                           ("Select messages…", lambda: self.set_select(True)),

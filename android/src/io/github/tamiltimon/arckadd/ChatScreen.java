@@ -1791,7 +1791,8 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         JSONObject grp = e.groups.get(g);
         if (grp != null && "direct".equals(grp.optString("kind")))
             return avatar(title(g), e.avatarFile(grp.optString("peer")), dp, false);
-        return avatar(title(g), null, dp, true);
+        if (grp != null && "saved".equals(grp.optString("kind"))) return avatar("★saved", null, dp, true);
+        return avatar(title(g), e.groupPhoto(g), dp, true);
     }
 
     Bitmap avatar(String name, File photo, int dp, boolean group) {
@@ -1801,15 +1802,32 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         if (b != null) return b;
         if (photo != null) {
             Bitmap src = BitmapFactory.decodeFile(photo.getPath());
-            if (src != null) b = round(src, px);
+            if (src != null) b = group ? groupPhotoTile(src, px) : round(src, px);
         }
         if (b == null) {
             b = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
             Canvas c = new Canvas(b);
             Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+            if (name.equals("★saved")) {                            // Saved Messages: a gold star
+                p.setColor(0xfff5a623);
+                c.drawRoundRect(new RectF(0, 0, px, px), px * 0.22f, px * 0.22f, p);
+                p.setColor(Color.WHITE);
+                p.setTextSize(px * 0.55f);
+                p.setTextAlign(Paint.Align.CENTER);
+                c.drawText("★", px / 2f, px * 0.70f, p);
+                avatars.put(key, b);
+                return b;
+            }
             p.setColor(AV_COLOURS[Math.abs(name.hashCode()) % AV_COLOURS.length]);
-            if (group) c.drawRoundRect(new RectF(0, 0, px, px), px * 0.26f, px * 0.26f, p);
-            else c.drawCircle(px / 2f, px / 2f, px / 2f, p);
+            if (group) {                                             // groups: a square with a faint “people” silhouette
+                c.drawRoundRect(new RectF(0, 0, px, px), px * 0.16f, px * 0.16f, p);
+                Paint s = new Paint(Paint.ANTI_ALIAS_FLAG);
+                s.setColor(0x38ffffff);
+                c.drawCircle(px * 0.34f, px * 0.38f, px * 0.13f, s);
+                c.drawCircle(px * 0.66f, px * 0.38f, px * 0.13f, s);
+                c.drawOval(new RectF(px * 0.10f, px * 0.64f, px * 0.58f, px * 1.10f), s);
+                c.drawOval(new RectF(px * 0.42f, px * 0.64f, px * 0.90f, px * 1.10f), s);
+            } else c.drawCircle(px / 2f, px / 2f, px / 2f, p);
             p.setColor(Color.WHITE);
             p.setTextSize(px * 0.4f);
             p.setTypeface(Typeface.DEFAULT_BOLD);
@@ -1821,6 +1839,29 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         }
         avatars.put(key, b);
         return b;
+    }
+
+    /** A group photo: a rounded square (people are round) with a small orange 👥 badge. */
+    private Bitmap groupPhotoTile(Bitmap src, int px) {
+        int side = Math.min(src.getWidth(), src.getHeight());
+        Bitmap sq = Bitmap.createScaledBitmap(Bitmap.createBitmap(src, (src.getWidth() - side) / 2, (src.getHeight() - side) / 2, side, side), px, px, true);
+        Bitmap out = Bitmap.createBitmap(px, px, Bitmap.Config.ARGB_8888);
+        Canvas c = new Canvas(out);
+        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+        c.drawRoundRect(new RectF(0, 0, px, px), px * 0.16f, px * 0.16f, p);
+        p.setXfermode(new android.graphics.PorterDuffXfermode(android.graphics.PorterDuff.Mode.SRC_IN));
+        c.drawBitmap(sq, 0, 0, p);
+        Paint b = new Paint(Paint.ANTI_ALIAS_FLAG);
+        float r = px * 0.2f, cx = px - r, cy = px - r;
+        b.setColor(Color.WHITE);
+        c.drawCircle(cx, cy, r, b);
+        b.setColor(0xffff7a1a);
+        c.drawCircle(cx, cy, r * 0.85f, b);
+        b.setColor(Color.WHITE);
+        b.setTextSize(r * 1.0f);
+        b.setTextAlign(Paint.Align.CENTER);
+        c.drawText("👥", cx, cy + r * 0.35f, b);
+        return out;
     }
 
     static String initials(String name) {

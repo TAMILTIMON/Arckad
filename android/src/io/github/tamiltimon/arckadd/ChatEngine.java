@@ -493,7 +493,7 @@ final class ChatEngine {
 
     JSONObject metaForMembers(JSONObject g) {
         JSONObject o = new JSONObject();
-        for (String k : new String[]{"id", "name", "owner", "key", "version", "owner_only", "members", "created", "past"})
+        for (String k : new String[]{"id", "name", "owner", "key", "version", "owner_only", "members", "created", "past", "photo"})
             if (g.has(k)) put(o, k, g.opt(k));
         return o;
     }
@@ -669,6 +669,12 @@ final class ChatEngine {
         if (meta.optInt("version", 0) <= g.optInt("version", 0)) return;
         for (String k : new String[]{"name", "owner_only", "members", "key", "version", "past"})
             if (meta.has(k)) put(g, k, meta.opt(k));
+        String photo = meta.optString("photo", "");
+        if (!photo.equals(g.optString("photo", ""))) {               // the admin changed the group photo
+            put(g, "photo", photo.isEmpty() ? JSONObject.NULL : photo);
+            if (photo.isEmpty()) groupPhotoFile(gid).delete();
+            else bg(() -> fetchGroupPhoto(gid));
+        }
         save();
         tagStamp = "";
         ui.changed(gid);
@@ -1019,6 +1025,7 @@ final class ChatEngine {
     void acceptRequest(String pid) {
         JSONObject req = (JSONObject) incoming().remove(pid);
         if (req == null) return;
+        link.tomb("req", pid);                                  // my linked PC drops this request too
         Object[] off = dhOffer(pid);
         JSONObject offer = (JSONObject) off[1];
         byte[] key = friendKey((BigInteger) off[0], req.optString("dh"), offer.optString("dh"));
@@ -1076,6 +1083,11 @@ final class ChatEngine {
     }
 
     String becomeFriends(String pid, String name, String os, String sigpub, byte[] key, String ph) {
+        if (link != null && link.key() != null)                // tell my linked device at once (no second accept)
+            bg(() -> {
+                sleep(500);
+                for (Iterator<String> it = link.twins().keys(); it.hasNext(); ) link.sync(it.next());
+            });
         JSONObject seen = people.get(pid);
         JSONObject f = new JSONObject();
         put(f, "name", name);
@@ -1101,6 +1113,7 @@ final class ChatEngine {
                 put(g, "name", name);
                 put(g, "owner", JSONObject.NULL);
                 put(g, "key", hex(key));
+                put(g, "key_ts", now());
                 put(g, "version", 1);
                 put(g, "owner_only", false);
                 put(g, "created", now());
@@ -1113,6 +1126,7 @@ final class ChatEngine {
                 ids.putIfAbsent(gid, Collections.synchronizedSet(new HashSet<>()));
             } else {
                 put(g, "key", hex(key));
+                put(g, "key_ts", now());                      // linked devices keep the newest key
             }
         }
         save();
@@ -2138,6 +2152,46 @@ final class ChatEngine {
         });
     }
 
+    // ---------- group photos (set by the group's admin on the PC)
+    File groupPhotoFile(String gid) {
+        return new File(new File(dir, "avatars"), "g-" + gid + ".jpg");
+    }
+
+    File groupPhoto(String gid) {
+        JSONObject g = groups.get(gid);
+        File f = groupPhotoFile(gid);
+        return g != null && !g.optString("photo", "").isEmpty() && !g.isNull("photo") && f.exists() ? f : null;
+    }
+
+    private void fetchGroupPhoto(String gid) {
+        JSONObject g = groups.get(gid);
+        if (g == null) return;
+        String want = g.optString("photo", "");
+        byte[] key = key(gid);
+        if (want.isEmpty() || key == null) return;
+        List<String> sources = new ArrayList<>();
+        if (!g.optString("owner").isEmpty()) sources.add(g.optString("owner"));
+        for (String d : onlineMembers(gid)) if (!sources.contains(d) && !d.equals(me)) sources.add(d);
+        for (String did : sources) {
+            try {
+                HttpURLConnection c = open(gid, did, "GET", "/c/gphoto", key, 15_000, -1);
+                if (c.getResponseCode() != 200) continue;
+                byte[] sealed;
+                try (InputStream in = c.getInputStream()) {
+                    sealed = readStream(in, 2_000_000);
+                }
+                byte[] jpeg = unseal(key, sealed);
+                if (!hex(sha256(jpeg)).startsWith(want)) continue;
+                File f = groupPhotoFile(gid);
+                f.getParentFile().mkdirs();
+                writeFile(f, jpeg);
+                ui.changed(null);
+                return;
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
     private boolean fetchFile(String gid, String did, JSONObject m) {
         JSONObject f = m.optJSONObject("file");
         String fid = f.optString("id");
@@ -2418,6 +2472,13 @@ final class ChatEngine {
             }
             if (path.startsWith("/c/file/")) {
                 serveFile(r, path);
+                return;
+            }
+            if (path.equals("/c/gphoto")) {                          // the group photo, for members only
+                Object[] auth = auth(r);
+                File f = auth == null || (Boolean) auth[3] ? null : groupPhoto((String) auth[0]);
+                if (f == null) r.json(auth == null ? 401 : 404, err("no group photo"));
+                else r.send(200, "application/octet-stream", seal(key((String) auth[0]), readAll(f)));
                 return;
             }
             r.json(404, err("unknown"));
