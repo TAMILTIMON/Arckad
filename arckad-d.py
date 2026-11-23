@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.36.0"
+APP_VERSION = "3.36.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -10893,24 +10893,15 @@ class ChatPanel(Gtk.Box):
         ppl.pack_start(psc, True, True, 0)
         self.pages.add_named(ppl, "people")
 
-        # ===== page 4: locked (4-digit PIN)
-        lk = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
-        li = Gtk.Label()
-        li.set_markup("<span size='xx-large'>🔒</span>\n<b>Chat is locked</b>")
-        li.set_justify(Gtk.Justification.CENTER)
-        lk.add(li)
+        # ===== page 4: locked (4-digit PIN), phone-style lock screen
         self.pin_entry = Gtk.Entry(visibility=False, max_length=4, width_chars=8, xalign=0.5,
                                    placeholder_text="PIN", input_purpose=Gtk.InputPurpose.PIN)
         self.pin_entry.connect("activate", lambda *_: self.try_unlock())
         self.pin_entry.connect("changed", lambda e: self.try_unlock() if len(e.get_text()) == 4 else None)
-        lk.add(self.pin_entry)
         self.pin_msg = Gtk.Label(wrap=True, justify=Gtk.Justification.CENTER, max_width_chars=34)
-        lk.add(self.pin_msg)
         forgot = Gtk.Button(label="Forgot PIN?")
-        forgot.set_relief(Gtk.ReliefStyle.NONE)
         forgot.connect("clicked", lambda *_: self.forgot_pin())
-        lk.add(forgot)
-        self.pages.add_named(lk, "locked")
+        self.pages.add_named(LockScreen(win, self.pin_entry, self.pin_msg, [forgot], "Chat is locked"), "locked")
 
         self.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
                            Gdk.DragAction.COPY | Gdk.DragAction.MOVE)
@@ -14684,18 +14675,11 @@ class PhonePanel(Gtk.Box):
         self.pack_start(self.outer, True, True, 0)
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.outer.add_named(main, "main")
-        lock = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
-        ll = Gtk.Label(justify=Gtk.Justification.CENTER)
-        ll.set_markup("<span size='xx-large'>🔒</span>\n<b>Locked</b>\nEnter your chat PIN to see your phone")
-        lock.add(ll)
         self.pin = Gtk.Entry(visibility=False, max_length=4, placeholder_text="PIN", width_chars=8, xalign=0.5)
         self.pin.set_input_purpose(Gtk.InputPurpose.PIN)
         self.pin.connect("changed", self._pin_typed)
-        lock.add(self.pin)
         self.pin_msg = Gtk.Label()
-        self.pin_msg.get_style_context().add_class("dim-label")
-        lock.add(self.pin_msg)
-        self.outer.add_named(lock, "locked")
+        self.outer.add_named(LockScreen(win, self.pin, self.pin_msg, (), "Locked · enter your PIN to see your phone"), "locked")
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         sw = Gtk.StackSwitcher(stack=self.stack, halign=Gtk.Align.CENTER)
         main.add(sw)
@@ -14866,6 +14850,8 @@ class PhonePanel(Gtk.Box):
 
     def refresh(self, force=False):
         if self.win.chat.is_locked():                     # the chat PIN protects the phone panel too
+            self.title.set_markup("<b>📱 Phone</b>")
+            self.status.set_text("")                       # nothing about the phone shows while locked
             self.outer.set_visible_child_name("locked")
             self.pin.set_text("")
             self.pin_msg.set_text("")
@@ -15510,6 +15496,181 @@ class PhonePanel(Gtk.Box):
                 self.load_notifs()
             elif ev.get("type") == "sms" and self.stack.get_visible_child_name() == "sms":
                 self.refresh()
+
+
+# ---------------------------------------------------------------- Lock screen (phone style): clock, date, wallpaper
+LOCK_WALLPAPERS = [  # id, label, CSS background
+    ("sunset", "Sunset", "linear-gradient(to bottom, #e8262f 0%, #f15a24 45%, #f7931e 75%, #2a7fa8 100%)"),
+    ("dusk", "Dusk", "linear-gradient(to bottom, #8e7f74 0%, #b5a596 50%, #2b2626 100%)"),
+    ("night", "Night", "linear-gradient(to bottom, #0f2027 0%, #203a43 50%, #2c5364 100%)"),
+    ("ocean", "Ocean", "linear-gradient(to bottom, #2193b0 0%, #6dd5ed 100%)"),
+    ("forest", "Forest", "linear-gradient(to bottom, #134e5e 0%, #71b280 100%)"),
+    ("orange", "Arckad", "linear-gradient(160deg, #26262d 0%, #16161a 55%, #ff7a1a 140%)"),
+]
+_LOCK_SCREENS = []
+
+
+class LockScreen(Gtk.EventBox):
+    """A phone-style lock screen: big clock and date over your wallpaper, now playing (from the music bar),
+    then the PIN box. The same look for the chat and the phone panel; the wallpaper is yours to choose."""
+
+    CSS_BASE = """
+    .lock-time { font-family: "Poppins", "Inter", "Segoe UI Variable Display", "Segoe UI", "Ubuntu", sans-serif;
+      font-size: 64px; font-weight: 800; color: #ffffff; text-shadow: 0 2px 8px rgba(0,0,0,0.45); }
+    .lock-date, .lock-small { color: #ffffff; text-shadow: 0 1px 4px rgba(0,0,0,0.5); }
+    .lock-date { font-size: 15px; font-weight: 600; }
+    .lock-card { background-color: rgba(0,0,0,0.28); border-radius: 18px; padding: 10px 14px; }
+    .lock-card label { color: #ffffff; }
+    .lock-card button { background-image: none; background-color: rgba(255,255,255,0.14); border: none; box-shadow: none;
+      color: #ffffff; border-radius: 14px; min-width: 34px; min-height: 30px; }
+    .lock-card button label { color: #ffffff; }
+    .lock-pin { background-color: rgba(255,255,255,0.88); color: #1b1b20; border-radius: 14px; border: none; }
+    .lock-btn { background-image: none; background-color: rgba(0,0,0,0.30); border: none; box-shadow: none;
+      color: #ffffff; border-radius: 16px; }
+    .lock-btn label { color: #ffffff; }
+    """
+
+    def __init__(self, win, pin_entry, msg_label, extras=(), title="Locked"):
+        super().__init__()
+        self.win = win
+        self.set_name(f"arckad-lock-{len(_LOCK_SCREENS)}")
+        _LOCK_SCREENS.append(self)
+        if not getattr(LockScreen, "_base_css", None):
+            LockScreen._base_css = Gtk.CssProvider()
+            LockScreen._base_css.load_from_data(self.CSS_BASE.encode())
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), LockScreen._base_css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 20)
+        self._css = Gtk.CssProvider()
+        self.get_style_context().add_provider(self._css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 21)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=18)
+        self.add(col)
+        lock = Gtk.Label()
+        lock.set_markup(f"<span size='large'>🔒</span>  <b>{esc(title)}</b>")
+        lock.get_style_context().add_class("lock-small")
+        col.pack_start(lock, False, False, 6)
+        self.time = Gtk.Label()
+        self.time.get_style_context().add_class("lock-time")
+        self.date = Gtk.Label()
+        self.date.get_style_context().add_class("lock-date")
+        col.pack_start(self.date, False, False, 0)
+        col.pack_start(self.time, False, False, 0)
+        col.pack_start(Gtk.Box(), True, True, 0)                 # the wallpaper shows in the middle
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.card.get_style_context().add_class("lock-card")
+        self.song = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        self.card.add(self.song)
+        self.song_bar = Gtk.ProgressBar()
+        self.card.add(self.song_bar)
+        ctl = Gtk.Box(spacing=8, halign=Gtk.Align.CENTER)
+        for label, fn in (("⏮", "prev"), ("⏯", "toggle"), ("⏭", "next")):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, fn=fn: getattr(self.win, "music", None) and getattr(self.win.music, fn)())
+            ctl.add(b)
+        self.card.add(ctl)
+        self.card.set_no_show_all(True)
+        col.pack_start(self.card, False, False, 4)
+        pin_entry.get_style_context().add_class("lock-pin")
+        pin_entry.set_halign(Gtk.Align.CENTER)
+        col.pack_start(pin_entry, False, False, 4)
+        msg_label.get_style_context().add_class("lock-small")
+        col.pack_start(msg_label, False, False, 0)
+        bottom = Gtk.Box(spacing=8)
+        for w in extras:
+            w.get_style_context().add_class("lock-btn")
+            bottom.pack_start(w, False, False, 0)
+        wb = Gtk.Button(label="🖼 Wallpaper")
+        wb.get_style_context().add_class("lock-btn")
+        wb.set_tooltip_text("Choose the lock screen wallpaper (a picture or a colour)")
+        wb.connect("clicked", lambda *_: self.choose())
+        bottom.pack_end(wb, False, False, 0)
+        col.pack_end(bottom, False, False, 0)
+        self.apply()
+        self._tick()
+        GLib.timeout_add(1000, self._tick)
+
+    def _tick(self):
+        if self.get_mapped():
+            now = time.localtime()
+            self.time.set_text(time.strftime("%H:%M", now))
+            self.date.set_text(time.strftime("%A, %d %B", now))
+            m = getattr(self.win, "music", None)
+            playing = m is not None and 0 <= m.index < len(m.queue)
+            if playing:
+                t = m._tags(m.queue[m.index])
+                self.song.set_markup(f"<b>{esc(t['title'])}</b>\n<small>{esc(t['artist'] or t['album'] or '')}</small>")
+                p = m.player
+                self.song_bar.set_fraction(min(1.0, p.position() / p.duration()) if p and p.duration() else 0)
+                self.card.set_no_show_all(False)
+                self.card.show_all()
+            else:
+                self.card.hide()
+        return True
+
+    def apply(self):
+        """The chosen wallpaper (a built-in colour, or your picture with a soft shade for readable text)."""
+        wid = self.win.cfg.get("lock_wallpaper", "sunset")
+        css = next((c for i, _l, c in LOCK_WALLPAPERS if i == wid), LOCK_WALLPAPERS[0][2])
+        if wid.startswith("file:") and os.path.isfile(wid[5:]):
+            url = Gio.File.new_for_path(wid[5:]).get_uri()
+            css = (f"linear-gradient(to bottom, rgba(0,0,0,0.20), rgba(0,0,0,0.05) 40%, rgba(0,0,0,0.45)), url('{url}')")
+        size = "cover" if wid.startswith("file:") else "auto"
+        self._css.load_from_data(f"#{self.get_name()} {{ background-image: {css}; background-size: {size}; "
+                                 f"background-position: center; background-repeat: no-repeat; }}".encode())
+
+    def choose(self):
+        d = Gtk.Dialog(title="Lock screen wallpaper", transient_for=self.get_toplevel(), modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(14)
+        flow = Gtk.FlowBox(max_children_per_line=3, selection_mode=Gtk.SelectionMode.NONE, column_spacing=10, row_spacing=10)
+
+        def pick(wid):
+            self.win.cfg["lock_wallpaper"] = wid
+            write_json(CONFIG_FILE, self.win.cfg)
+            for s in _LOCK_SCREENS:
+                s.apply()
+        for wid, label, css in LOCK_WALLPAPERS:
+            b = Gtk.Button()
+            b.set_name(f"lockpick-{wid}")
+            prov = Gtk.CssProvider()
+            prov.load_from_data(f"#lockpick-{wid} {{ background-image: {css}; min-width: 90px; min-height: 140px; "
+                                f"border-radius: 14px; border: none; }}".encode())
+            b.get_style_context().add_provider(prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 30)
+            lbl = Gtk.Label(valign=Gtk.Align.END)
+            lbl.set_markup(f"<span foreground='white'><b>{esc(label)}</b></span>")
+            b.add(lbl)
+            b.connect("clicked", lambda _b, w=wid: pick(w))
+            flow.add(b)
+        box.add(flow)
+        pic = Gtk.Button(label="📷 Your own picture…")
+        pic.get_style_context().add_class("suggested-action")
+
+        def choose_pic(*_):
+            fc = Gtk.FileChooserNative(title="Choose a lock screen picture", transient_for=d, action=Gtk.FileChooserAction.OPEN)
+            flt = Gtk.FileFilter()
+            flt.set_name("Pictures")
+            for e in ("jpg", "jpeg", "png", "webp", "bmp"):
+                flt.add_pattern(f"*.{e}")
+                flt.add_pattern(f"*.{e.upper()}")
+            fc.add_filter(flt)
+            pics = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES)
+            if pics and os.path.isdir(pics):
+                fc.set_current_folder(pics)
+            if fc.run() == Gtk.ResponseType.ACCEPT:
+                src = fc.get_filename()
+                CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+                dest = CONFIG_DIR / ("lock-wallpaper" + os.path.splitext(src)[1].lower())
+                for old in CONFIG_DIR.glob("lock-wallpaper.*"):
+                    old.unlink(missing_ok=True)
+                shutil.copy2(src, dest)
+                pick("file:" + str(dest))
+            fc.destroy()
+        pic.connect("clicked", choose_pic)
+        box.add(pic)
+        d.show_all()
+        d.run()
+        d.destroy()
 
 
 # ---------------------------------------------------------------- main window
