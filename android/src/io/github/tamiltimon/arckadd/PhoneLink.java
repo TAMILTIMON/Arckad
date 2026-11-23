@@ -83,6 +83,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
                 return send(req);
             case "/t/phone/calls":
                 return calls();
+            case "/t/phone/contacts":
+                return contacts();
             case "/t/phone/call/answer":
                 return answer();
             case "/t/phone/call/end":
@@ -245,6 +247,39 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         ArrayList<String> parts = sm.divideMessage(text);
         sm.sendMultipartTextMessage(to, null, parts, null, null);
         return new Obj().putOpt("ok", true);
+    }
+
+    // ---------- contacts (names and numbers, for calling from the PC)
+    private JSONObject contacts() {
+        if (c.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED)
+            return err("Contacts aren't allowed on the phone (Chat → ⋮ → 📱 Phone link → Allow text messages and contact names)");
+        Map<String, JSONObject> byName = new LinkedHashMap<>();
+        String[] cols = {ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER,
+                ContactsContract.CommonDataKinds.Phone.TYPE, ContactsContract.CommonDataKinds.Phone.LABEL};
+        try (Cursor q = c.getContentResolver().query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI, cols, null, null,
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE ASC")) {
+            int rows = 0;
+            while (q != null && q.moveToNext() && rows++ < 8000) {
+                String name = q.getString(0), num = q.getString(1);
+                if (num == null || num.trim().isEmpty()) continue;
+                if (name == null || name.isEmpty()) name = num;
+                JSONObject ct = byName.get(name);
+                if (ct == null) {
+                    ct = new Obj().putOpt("name", name).putOpt("numbers", new JSONArray());
+                    byName.put(name, ct);
+                }
+                String label = ContactsContract.CommonDataKinds.Phone.getTypeLabel(c.getResources(), q.getInt(2), q.getString(3)).toString();
+                JSONArray nums = ct.optJSONArray("numbers");
+                String digits = num.replaceAll("[^0-9+]", "");
+                boolean dup = false;
+                for (int i = 0; i < nums.length(); i++)
+                    if (nums.optJSONObject(i).optString("number").replaceAll("[^0-9+]", "").equals(digits)) dup = true;
+                if (!dup) nums.put(new Obj().putOpt("number", num).putOpt("label", label));
+            }
+        }
+        JSONArray out = new JSONArray();
+        for (JSONObject ct : byName.values()) out.put(ct);
+        return new Obj().putOpt("ok", true).putOpt("contacts", out);
     }
 
     // ---------- calls (the call itself runs on the phone)

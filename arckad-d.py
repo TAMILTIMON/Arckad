@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.36.4"
+APP_VERSION = "3.37.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -13796,14 +13796,14 @@ def set_start_at_login(on):
 INSTANCE_FILE = CONFIG_DIR / "instance.json"
 
 
-def hand_over_to_running(folder, background):
+def hand_over_to_running(folder, background, select=None):
     info = read_json(INSTANCE_FILE, {})
     if not info.get("port") or not info.get("token"):
         return False
     try:
         with socket.create_connection(("127.0.0.1", int(info["port"])), timeout=1.5) as s:
             s.sendall(json.dumps({"token": info["token"], "cmd": "background" if background else "show",
-                                  "folder": folder}).encode() + b"\n")
+                                  "folder": folder, "select": select}).encode() + b"\n")
             return s.recv(8).startswith(b"ok")
     except (OSError, ValueError):
         return False
@@ -13832,7 +13832,7 @@ def start_instance_listener(win):
                 data = json.loads(conn.makefile().readline() or "{}")
                 if data.get("token") == token:
                     if data.get("cmd") == "show":
-                        GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder")) or False)
+                        GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder"), select=d.get("select")) or False)
                     conn.sendall(b"ok")
             except (OSError, ValueError):
                 pass
@@ -14718,7 +14718,7 @@ class PhonePanel(Gtk.Box):
         head.pack_start(self.title, True, True, 0)
         rb = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
         rb.set_tooltip_text("Refresh")
-        rb.connect("clicked", lambda *_: self.refresh(force=True))
+        rb.connect("clicked", lambda *_: (setattr(self, "_contacts_force", True), self.refresh(force=True)))
         head.add(rb)
         self.add(head)
         self.status = Gtk.Label(xalign=0, wrap=True)
@@ -14811,11 +14811,12 @@ class PhonePanel(Gtk.Box):
         self.call_card.set_no_show_all(True)
         cb.add(self.call_card)
         dial = Gtk.Box(spacing=6)
-        self.dial_entry = Gtk.Entry(hexpand=True, placeholder_text="Number to call", input_purpose=Gtk.InputPurpose.PHONE)
-        self.dial_entry.connect("activate", lambda *_: self.dial(self.dial_entry.get_text()))
+        self.dial_entry = Gtk.SearchEntry(hexpand=True, placeholder_text="Search contacts and calls, or type a number")
+        self.dial_entry.connect("search-changed", lambda *_: self._render_calls())       # filters as you type
+        self.dial_entry.connect("activate", lambda *_: self._dial_entered())
         db = Gtk.Button(label="📞 Call")
         db.get_style_context().add_class("suggested-action")
-        db.connect("clicked", lambda *_: self.dial(self.dial_entry.get_text()))
+        db.connect("clicked", lambda *_: self._dial_entered())
         dial.pack_start(self.dial_entry, True, True, 0)
         dial.add(db)
         cb.add(dial)
@@ -15016,38 +15017,120 @@ class PhonePanel(Gtk.Box):
 
     # ---------- calls
     def load_calls(self):
+        """Call history (every time) and contacts (once per session; ↻ refreshes them)."""
         def done(r, err):
-            for c in self.k_list.get_children():
-                self.k_list.remove(c)
-            if err:
-                self.k_list.add(Gtk.Label(label="⚠ " + err, wrap=True, margin=10))
-                self.k_list.show_all()
-                return
-            if r.get("call"):
-                self.show_call(r["call"])
-            icons = {"in": "↙", "out": "↗", "missed": "✗", "declined": "⊘"}
-            for it in r.get("items", []):
+            self._calls_err = err
+            if not err:
+                self._calls = r.get("items", [])
+                if r.get("call"):
+                    self.show_call(r["call"])
+            self._render_calls()
+        self._ask("/t/phone/calls", {}, done)
+        if getattr(self, "_contacts", None) is None or getattr(self, "_contacts_force", False):
+            self._contacts_force = False
+
+            def got(r, err):
+                self._contacts = r.get("contacts", []) if not err else []
+                self._contacts_err = err
+                self._render_calls()
+            self._ask("/t/phone/contacts", {}, got, timeout=30)
+
+    @staticmethod
+    def _digits(s):
+        d = "".join(ch for ch in (s or "") if ch.isdigit())
+        return d[-10:] if len(d) > 10 else d                # +91 98400 12345 and 9840012345 match
+
+    def _matches(self, q, name, numbers):
+        if not q:
+            return True
+        ql, qd = q.lower(), self._digits(q)
+        if ql in (name or "").lower():
+            return True
+        return bool(qd) and len(qd) >= 3 and any(qd in self._digits(n) for n in numbers)
+
+    def _render_calls(self):
+        """Contacts first (when you're searching), then the call history, both filtered by name or number."""
+        for c in self.k_list.get_children():
+            self.k_list.remove(c)
+        q = self.dial_entry.get_text().strip()
+        err = getattr(self, "_calls_err", None)
+        if err:
+            self.k_list.add(Gtk.Label(label="⚠ " + err, wrap=True, margin=10))
+
+        def header(text):
+            r = Gtk.ListBoxRow(activatable=False, selectable=False)
+            lbl = Gtk.Label(xalign=0, margin_start=6, margin_top=6)
+            lbl.set_markup(f"<small><b>{esc(text)}</b></small>")
+            lbl.get_style_context().add_class("dim-label")
+            r.add(lbl)
+            self.k_list.add(r)
+
+        def call_btn(number, tip=None):
+            b = Gtk.Button(label="📞")
+            b.set_tooltip_text(tip or f"Call {number} from your phone")
+            b.connect("clicked", lambda *_: self.dial(number))
+            return b
+        self._shown_numbers = []
+        if q:
+            hits = [ct for ct in (getattr(self, "_contacts", None) or [])
+                    if self._matches(q, ct.get("name"), [n.get("number", "") for n in ct.get("numbers", [])])][:30]
+            if hits:
+                header(f"Contacts ({len(hits)})")
+            elif getattr(self, "_contacts_err", None):
+                header("Contacts: " + self._contacts_err)
+            for ct in hits:
                 row = Gtk.ListBoxRow()
-                box = Gtk.Box(spacing=8, margin=5)
-                ic = Gtk.Label()
-                colour = "#e01b24" if it.get("type") in ("missed", "declined") else skin_color("ok")
-                ic.set_markup(f"<span foreground='{colour}' size='large'><b>{icons.get(it.get('type'), '•')}</b></span>")
-                box.add(ic)
-                t = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
-                dur = int(it.get("duration") or 0)
-                t.set_markup(f"<b>{esc(it.get('name') or it.get('number') or 'Unknown')}</b>\n<small>"
-                             f"{time.strftime('%d %b %H:%M', time.localtime(it.get('ts', 0)))}"
-                             f"{f' · {dur // 60}:{dur % 60:02d}' if dur else ''} · {esc(it.get('type', ''))}</small>")
-                box.pack_start(t, True, True, 0)
-                if it.get("number"):
-                    b = Gtk.Button(label="📞")
-                    b.set_tooltip_text(f"Call {it['number']} from your phone")
-                    b.connect("clicked", lambda _b, n=it["number"]: self.dial(n))
-                    box.add(b)
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=5)
+                nm = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+                nm.set_markup(f"👤 <b>{esc(ct.get('name', '?'))}</b>")
+                box.add(nm)
+                for n in ct.get("numbers", [])[:4]:
+                    line = Gtk.Box(spacing=8, margin_start=22)
+                    nl = Gtk.Label(xalign=0, hexpand=True)
+                    nl.set_markup(f"<small>{esc(n.get('number', ''))} · {esc(n.get('label', ''))}</small>")
+                    line.pack_start(nl, True, True, 0)
+                    line.add(call_btn(n.get("number", ""), f"Call {ct.get('name')} ({n.get('label', '')})"))
+                    box.add(line)
+                    self._shown_numbers.append(n.get("number", ""))
                 row.add(box)
                 self.k_list.add(row)
-            self.k_list.show_all()
-        self._ask("/t/phone/calls", {}, done)
+        calls = [it for it in (getattr(self, "_calls", None) or [])
+                 if self._matches(q, it.get("name"), [it.get("number", "")])]
+        if q and calls:
+            header(f"Recent calls ({len(calls)})")
+        icons = {"in": "↙", "out": "↗", "missed": "✗", "declined": "⊘"}
+        for it in calls[:150]:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(spacing=8, margin=5)
+            ic = Gtk.Label()
+            colour = "#e01b24" if it.get("type") in ("missed", "declined") else skin_color("ok")
+            ic.set_markup(f"<span foreground='{colour}' size='large'><b>{icons.get(it.get('type'), '•')}</b></span>")
+            box.add(ic)
+            t = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+            dur = int(it.get("duration") or 0)
+            t.set_markup(f"<b>{esc(it.get('name') or it.get('number') or 'Unknown')}</b>\n<small>"
+                         f"{time.strftime('%d %b %H:%M', time.localtime(it.get('ts', 0)))}"
+                         f"{f' · {dur // 60}:{dur % 60:02d}' if dur else ''} · {esc(it.get('type', ''))}</small>")
+            box.pack_start(t, True, True, 0)
+            if it.get("number"):
+                box.add(call_btn(it["number"]))
+                self._shown_numbers.append(it["number"])
+            row.add(box)
+            self.k_list.add(row)
+        if q and not self._shown_numbers and not self._digits(q):
+            nothing = Gtk.Label(label=f"No contact or call matches “{q}”.", margin=12)
+            nothing.get_style_context().add_class("dim-label")
+            self.k_list.add(nothing)
+        self.k_list.show_all()
+
+    def _dial_entered(self):
+        """Enter / 📞 Call: a typed number is called; otherwise the first match."""
+        q = self.dial_entry.get_text().strip()
+        letters = any(ch.isalpha() for ch in q)
+        if q and not letters and len(self._digits(q)) >= 3:
+            self.dial(q)
+        elif getattr(self, "_shown_numbers", None):
+            self.dial(self._shown_numbers[0])
 
     def show_call(self, call):
         """The live call card: ringing (Answer / Decline), on a call (timer, End), or hidden."""
@@ -15837,6 +15920,243 @@ class LockScreen(Gtk.EventBox):
         d.destroy()
 
 
+# ---------------------------------------------------------------- Default file manager
+# Ubuntu: folders open in Arckad-D (inode/directory), and browsers' "Show in folder" asks Arckad-D through the
+# standard org.freedesktop.FileManager1 service (the file is selected). Windows: folders and drives open in
+# Arckad-D (your user only, no administrator rights). Browsers on Windows always open Explorer for "Show in
+# folder" (a Windows function no app can redirect), so Arckad-D also offers its own "Download finished" pop-up.
+def parse_open_args(argv):
+    """(folder to open, file to select) from command-line arguments: paths or file:// addresses."""
+    for a in argv:
+        if a.startswith("-"):
+            continue
+        p = Gio.File.new_for_uri(a).get_path() if a.startswith("file://") else os.path.expanduser(a)
+        if not p:
+            continue
+        p = os.path.abspath(p)
+        if os.path.isdir(p):
+            return p, None
+        if os.path.exists(p):
+            return os.path.dirname(p), p
+    return None, None
+
+
+def launch_command():
+    """How the system should start Arckad-D (Windows: the installed program, or pythonw + this script)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    if INSTALLED and not IS_WIN:
+        return ["/usr/bin/arckad-d"]
+    exe = sys.executable
+    if IS_WIN and exe.lower().endswith("python.exe") and os.path.exists(exe[:-10] + "pythonw.exe"):
+        exe = exe[:-10] + "pythonw.exe"
+    return [exe, os.path.abspath(__file__)]
+
+
+DBUS_FM = "org.freedesktop.FileManager1"
+DBUS_FM_XML = """<node><interface name="org.freedesktop.FileManager1">
+  <method name="ShowFolders"><arg type="as" name="URIs" direction="in"/><arg type="s" name="StartupId" direction="in"/></method>
+  <method name="ShowItems"><arg type="as" name="URIs" direction="in"/><arg type="s" name="StartupId" direction="in"/></method>
+  <method name="ShowItemProperties"><arg type="as" name="URIs" direction="in"/><arg type="s" name="StartupId" direction="in"/></method>
+</interface></node>"""
+
+
+def _desktop_file():
+    return Path(GLib.get_user_data_dir()) / "applications" / f"{APP_SLUG}.desktop"
+
+
+def _dbus_service_file():
+    return Path(GLib.get_user_data_dir()) / "dbus-1" / "services" / f"{DBUS_FM}.service"
+
+
+def linux_default_status():
+    try:
+        r = subprocess.run(["xdg-mime", "query", "default", "inode/directory"], capture_output=True, text=True, timeout=5)
+        return r.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def linux_set_default(on, cfg):
+    """Folders open in Arckad-D (and browsers' Show in folder asks Arckad-D), or back to the previous file manager."""
+    me = f"{APP_SLUG}.desktop"
+    if on:
+        current = linux_default_status()
+        if current and current != me:
+            cfg["previous_file_manager"] = current           # to put back later
+        if not INSTALLED or not Path("/usr/share/applications", me).exists():
+            d = _desktop_file()                              # a launcher that says “I open folders”
+            d.parent.mkdir(parents=True, exist_ok=True)
+            d.write_text(f"[Desktop Entry]\nType=Application\nName={APP_NAME}\nComment=File manager\n"
+                         f"Exec={' '.join(shlex.quote(x) for x in launch_command())} %U\n"
+                         f"Icon={custom_logo() or (APP_SLUG if INSTALLED else logo_path()) or 'system-file-manager'}\n"
+                         f"Terminal=false\nCategories=Utility;FileManager;GTK;\nMimeType=inode/directory;\n"
+                         f"StartupWMClass={APP_SLUG}\n")
+        subprocess.run(["xdg-mime", "default", me, "inode/directory"], capture_output=True, timeout=10)
+        s = _dbus_service_file()                             # browsers' “Show in folder” starts Arckad-D if needed
+        s.parent.mkdir(parents=True, exist_ok=True)
+        s.write_text(f"[D-BUS Service]\nName={DBUS_FM}\nExec={' '.join(shlex.quote(x) for x in launch_command())} --background\n")
+    else:
+        prev = cfg.pop("previous_file_manager", "") or "org.gnome.Nautilus.desktop"
+        subprocess.run(["xdg-mime", "default", prev, "inode/directory"], capture_output=True, timeout=10)
+        _dbus_service_file().unlink(missing_ok=True)
+
+
+class FileManagerService:
+    """Answers org.freedesktop.FileManager1 on the session bus (what browsers call for “Show in folder”)."""
+
+    def __init__(self, win):
+        self.win, self.owner, self.reg, self.conn = win, 0, 0, None
+        self.node = Gio.DBusNodeInfo.new_for_xml(DBUS_FM_XML)
+
+    def start(self):
+        if self.owner:
+            return
+        self.owner = Gio.bus_own_name(Gio.BusType.SESSION, DBUS_FM,
+                                      Gio.BusNameOwnerFlags.REPLACE | Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT,
+                                      self._bus_acquired, None, None)
+
+    def stop(self):
+        if self.owner:
+            Gio.bus_unown_name(self.owner)
+            self.owner = 0
+        if self.reg and self.conn:
+            self.conn.unregister_object(self.reg)
+            self.reg = 0
+
+    def _bus_acquired(self, conn, _name):
+        self.conn = conn
+        try:
+            self.reg = conn.register_object("/org/freedesktop/FileManager1", self.node.interfaces[0], self._call, None, None)
+        except Exception:
+            self.reg = 0
+
+    def _call(self, _conn, _sender, _path, _iface, method, params, invocation):
+        uris = list(params.unpack()[0]) if params else []
+        paths = [Gio.File.new_for_uri(u).get_path() if u.startswith("file:") else u for u in uris]
+        paths = [p for p in paths if p]
+        if paths:
+            if method == "ShowFolders":
+                GLib.idle_add(lambda: self.win.show_from_tray(folder=paths[0]) or False)
+            else:                                            # ShowItems / ShowItemProperties: the folder, file selected
+                p = paths[0]
+                folder = p if os.path.isdir(p) and method == "ShowFolders" else os.path.dirname(p)
+                GLib.idle_add(lambda: self.win.show_from_tray(folder=folder, select=p) or False)
+        invocation.return_value(None)
+
+
+# ---------- Windows: folders and drives open in Arckad-D (your user only)
+_WIN_KEYS = (r"Software\Classes\Directory\shell", r"Software\Classes\Drive\shell")
+
+
+def win_default_status():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_KEYS[0]) as k:
+            return winreg.QueryValueEx(k, "")[0] == "arckad"
+    except OSError:
+        return False
+
+
+def win_set_default(on):
+    import winreg
+    cmd = " ".join(f'"{x}"' for x in launch_command()) + ' "%1"'
+    for base in _WIN_KEYS:
+        if on:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as k:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "arckad")             # the default action for folders
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\arckad") as k:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "Open in Arckad-D")
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\arckad\command") as k:
+                winreg.SetValueEx(k, "", 0, winreg.REG_SZ, cmd)
+        else:
+            for sub in (base + r"\arckad\command", base + r"\arckad"):
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+                except OSError:
+                    pass
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, base, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.DeleteValue(k, "")                                   # Explorer is the default again
+            except OSError:
+                pass
+    try:                                                     # tell Explorer the associations changed
+        import ctypes
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+    except Exception:
+        pass
+
+
+def is_default_file_manager():
+    if IS_WIN:
+        return win_default_status()
+    return linux_default_status() == f"{APP_SLUG}.desktop"
+
+
+def set_default_file_manager(on, cfg):
+    if IS_WIN:
+        win_set_default(on)
+    else:
+        linux_set_default(on, cfg)
+    cfg["default_fm"] = bool(on)
+
+
+# ---------- "Download finished" pop-ups (every browser, Windows and Ubuntu)
+_PARTIAL = (".crdownload", ".part", ".partial", ".download", ".tmp", ".opdownload", ".!ut", ".aria2")
+
+
+class DownloadWatcher:
+    """Notices files that appear in Downloads (once they've finished: no .crdownload, size steady) and offers
+    “Show in Arckad-D”."""
+
+    def __init__(self, win):
+        self.win, self.mon, self.seen = win, None, {}
+
+    def start(self):
+        if self.mon:
+            return
+        try:
+            d = Gio.File.new_for_path(str(downloads_dir()))
+            self.mon = d.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+            self.mon.connect("changed", self._changed)
+        except GLib.Error:
+            self.mon = None
+
+    def stop(self):
+        if self.mon:
+            self.mon.cancel()
+            self.mon = None
+
+    def _changed(self, _m, f, other, ev):
+        if ev in (Gio.FileMonitorEvent.RENAMED, Gio.FileMonitorEvent.MOVED_IN):
+            f = other if ev == Gio.FileMonitorEvent.RENAMED and other else f
+        elif ev != Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+            return
+        path = f.get_path() if f else None
+        if not path or os.path.basename(path).startswith(".") or path.lower().endswith(_PARTIAL):
+            return
+        if time.time() - self.seen.get(path, 0) < 30:
+            return
+        self.seen[path] = time.time()
+        GLib.timeout_add(1500, self._check, path, -1)
+
+    def _check(self, path, last):
+        try:
+            if not os.path.isfile(path):
+                return False
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size != last:                                     # still being written: look again shortly
+            GLib.timeout_add(1500, self._check, path, size)
+            return False
+        if self.win.cfg.get("download_popups", True):
+            name = os.path.basename(path)
+            self.win.show_toast(f"⬇ {name}", f"Downloaded · {human_size(size)} · click to show it in {APP_NAME}", None,
+                                lambda: self.win.show_from_tray(folder=os.path.dirname(path), select=path))
+        return False
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -16023,6 +16343,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(30, self._chat_lock_tick)
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
         self.start_freeze_watch()
+        GLib.idle_add(self._default_fm_start)
         self.connect("configure-event", lambda *_: GLib.idle_add(self._check_compact) and False)
         self.connect("window-state-event", lambda *_: GLib.idle_add(self._check_compact) and False)
         GLib.idle_add(self._check_compact)
@@ -16242,6 +16563,7 @@ class MainWindow(Gtk.ApplicationWindow):
             None,
         ] + ([] if INSTALLED or IS_WIN else [(f"Add {APP_NAME} to app menu", self.on_install)]) + [
             ("Keyboard shortcuts", lambda: self.info(SHORTCUTS, mono=True)),
+            ("Default file manager…", self.default_fm_dialog),
             ("Change logo…", self.choose_logo),
             ("Use the default logo", self.reset_logo),
             ("Check for updates…", lambda: self.check_updates(manual=True)),
@@ -19643,15 +19965,111 @@ class MainWindow(Gtk.ApplicationWindow):
                             for side, nb in (("left", self.left_nb), ("right", self.right_nb))}
         write_json(CONFIG_FILE, self.cfg)
 
-    def show_from_tray(self, chat=False, folder=None):
+    def show_from_tray(self, chat=False, folder=None, select=None):
         self.show()
         self.deiconify()
         self.present()
         if folder and os.path.isdir(folder):
             self.new_tab(self.left_nb, folder)
+            if select:
+                self.select_in_active(select)
         if chat:
             self.show_right("chat")
         return False
+
+    def select_in_active(self, path):
+        """Select a file in the open folder (when the system or a browser asked to show it)."""
+        p = self.active
+        if p is None:
+            return
+        p.pending_select = [path]
+        if p.location != os.path.dirname(path):
+            p.go(os.path.dirname(path))
+        else:
+            p.reload() if hasattr(p, "reload") else p.go(p.location)
+
+    # ---------- default file manager
+    def _default_fm_start(self):
+        if not IS_WIN and self.cfg.get("default_fm"):
+            if not getattr(self, "fm_service", None):
+                self.fm_service = FileManagerService(self)
+            self.fm_service.start()
+        if not getattr(self, "downloads_watch", None):
+            self.downloads_watch = DownloadWatcher(self)
+        self.downloads_watch.start()
+        if not self.cfg.get("default_fm_asked") and not is_default_file_manager():
+            GLib.timeout_add_seconds(25, self._ask_default_fm)
+        return False
+
+    def _ask_default_fm(self):
+        if self.cfg.get("default_fm_asked") or not self.get_visible():
+            return False
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text=f"Make {APP_NAME} your default file manager?")
+        d.format_secondary_text(
+            "Folders you open from other apps, desktop icons and shortcuts will open here" +
+            (". On Windows, browsers' “Show in folder” still opens Explorer (Windows decides that), so "
+             f"{APP_NAME} shows its own pop-up when a download finishes." if IS_WIN else
+             ", and so will your browser's “Show in folder” (with the file selected).") +
+            "\n\nYou can change this anytime: ☰ → Default file manager…")
+        d.add_buttons("Don't ask again", Gtk.ResponseType.REJECT, "Not now", Gtk.ResponseType.CANCEL,
+                      f"Use {APP_NAME}", Gtk.ResponseType.ACCEPT)
+        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+
+        def respond(dlg, r):
+            dlg.destroy()
+            if r == Gtk.ResponseType.ACCEPT:
+                self._set_default_fm(True)
+            if r in (Gtk.ResponseType.ACCEPT, Gtk.ResponseType.REJECT):
+                self.cfg["default_fm_asked"] = True
+                write_json(CONFIG_FILE, self.cfg)
+        d.connect("response", respond)
+        d.show_all()
+        return False
+
+    def _set_default_fm(self, on):
+        try:
+            set_default_file_manager(on, self.cfg)
+        except Exception as ex:
+            self.error(f"That didn't work: {ex}")
+            return
+        write_json(CONFIG_FILE, self.cfg)
+        if not IS_WIN:
+            if on:
+                self._default_fm_start()
+            elif getattr(self, "fm_service", None):
+                self.fm_service.stop()
+        self.flash_all(f"{APP_NAME} is now your default file manager" if on else
+                       "Your system's file manager is the default again")
+
+    def default_fm_dialog(self):
+        d = Gtk.Dialog(title="Default file manager", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        on = is_default_file_manager()
+        st = Gtk.Label(xalign=0, wrap=True, max_width_chars=58)
+        st.set_markup((f"✓ <b>{APP_NAME} is your default file manager.</b>" if on else
+                       "Your system's own file manager is the default.") + "\n\n<small>" +
+                      ("Folders from other apps, desktop icons and shortcuts open here. Browsers' “Show in folder” on "
+                       "Windows still opens Explorer (Windows decides that); the download pop-up below covers it."
+                       if IS_WIN else "Folders from other apps open here, and so does your browser's “Show in "
+                       "folder”, with the file selected.") + "</small>")
+        box.add(st)
+        b = Gtk.Button(label="Use the system's file manager again" if on else f"Make {APP_NAME} the default")
+        if not on:
+            b.get_style_context().add_class("suggested-action")
+        b.connect("clicked", lambda *_: (self._set_default_fm(not on), d.response(Gtk.ResponseType.CLOSE)))
+        box.add(b)
+        pop = Gtk.CheckButton(label=f"Show a pop-up when a download finishes (click it to see the file in {APP_NAME})")
+        pop.set_active(self.cfg.get("download_popups", True))
+        pop.connect("toggled", lambda c: (self.cfg.__setitem__("download_popups", c.get_active()),
+                                          write_json(CONFIG_FILE, self.cfg)))
+        box.add(pop)
+        d.show_all()
+        d.run()
+        d.destroy()
 
     def toggle_from_tray(self):
         if self.get_visible() and self.is_active():
@@ -19797,10 +20215,9 @@ def main():
     if "--update-failed" in sys.argv:
         i = sys.argv.index("--update-failed")
         failed = sys.argv[i + 1] if len(sys.argv) > i + 1 else "?"
-    start = next((os.path.abspath(os.path.expanduser(a)) for a in sys.argv[1:]
-                  if os.path.isdir(os.path.expanduser(a))), None)
+    start, select = parse_open_args(sys.argv[1:])
     background = "--background" in sys.argv
-    if not failed and hand_over_to_running(start, background):
+    if not failed and hand_over_to_running(start, background, select):
         return                                     # already running (maybe in the tray): it shows itself
     fix_user_launcher()
     GLib.set_prgname(APP_SLUG)
@@ -19810,6 +20227,8 @@ def main():
     def activate(a):
         try:
             win = MainWindow(a, start)
+            if select:
+                GLib.idle_add(lambda: win.select_in_active(select) or False)
             if background:                         # started at log-in: just the tray icon
                 a.hold()
                 win.hide()
