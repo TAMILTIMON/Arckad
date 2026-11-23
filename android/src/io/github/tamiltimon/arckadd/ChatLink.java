@@ -404,6 +404,40 @@ final class ChatLink {
         });
     }
 
+    /** Local = a private range, the same network as one of this phone's own addresses (e.g. 128.128.x.x), never the internet. */
+    static boolean isLocal(String ip) {
+        String[] p = ip == null ? new String[0] : ip.split("\\.");
+        if (p.length != 4) return false;
+        int a, b;
+        try {
+            a = Integer.parseInt(p[0]);
+            b = Integer.parseInt(p[1]);
+        } catch (NumberFormatException ex) {
+            return false;
+        }
+        if (a == 10 || a == 127 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 169 && b == 254)) return true;
+        for (String own : Net.lanAddresses()) {
+            String[] o = own.split("\\.");
+            if (o.length == 4 && o[0].equals(p[0]) && o[1].equals(p[1])) return true;
+        }
+        return false;
+    }
+
+    /** A new or removed phone notification goes to the linked PC (only while Phone link is on). */
+    void pushPhone(JSONObject ev) {
+        if (key() == null || e.phone == null || !e.phone.enabled()) return;
+        bg(() -> {
+            for (String inst : list(twins().keys())) {
+                JSONObject t = twins().optJSONObject(inst);
+                if (!twinOnline(inst) || t == null || !isLocal(t.optString("ip"))) continue;
+                try {
+                    call(inst, "/t/phone/notify", ev, 6000);
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
     void pushRead(String gid) {
         if (key() == null) return;
         bg(() -> {
@@ -688,6 +722,19 @@ final class ChatLink {
         byte[] raw = n > 0 ? readStream(r.body, (int) Math.min(n, 50_000_000)) : new byte[0];
         JSONObject req = raw.length > 0 ? new JSONObject(new String(unseal(k, raw), StandardCharsets.UTF_8)) : new JSONObject();
         JSONObject res = new Obj().putOpt("ok", true);
+        if (path.startsWith("/t/phone/")) {                // the PC's 📱 Phone panel: linked + local + switched on
+            if (!isLocal(r.client)) res = err("not on a local network");
+            else if (e.phone == null || !e.phone.enabled()) res = err("Phone link is off on the phone (Chat → ⋮ → 📱 Phone link)");
+            else {
+                try {
+                    res = e.phone.handle(path, req);
+                } catch (Exception ex) {
+                    res = err(String.valueOf(ex.getMessage()));
+                }
+            }
+            r.send(200, "application/octet-stream", seal(k, utf8(res.toString())));
+            return;
+        }
         switch (path) {
             case "/t/state":
                 if (req.optJSONObject("state") != null) merge(req.optJSONObject("state"), inst);

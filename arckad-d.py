@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.32.0"
+APP_VERSION = "3.33.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -9681,6 +9681,39 @@ class LinkedDevices:
         c.ui("on_chat_changed", None)
         c.ui("on_pair_event", "This device was unlinked: the shared chat account was removed from it.")
 
+    # ---------- phone link (the 📱 Phone panel): local networks only
+    def is_local(self, ip):
+        """Local = a private range, or the same network as one of this computer's own addresses (e.g. an office
+        using 128.128.x.x), or a network you added. Internet addresses are refused."""
+        try:
+            parts = [int(x) for x in ip.split(".")]
+            if len(parts) != 4:
+                return False
+        except ValueError:
+            return False
+        a, b = parts[0], parts[1]
+        if a == 10 or a == 127 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or (a == 169 and b == 254):
+            return True
+        for own in lan_addresses():
+            o = own.split(".")
+            if len(o) == 4 and o[0] == str(a) and o[1] == str(b):        # same /16 as this computer
+                return True
+        return any(ip.startswith(pfx.rstrip("*").rstrip(".") + ".") or ip == pfx
+                   for pfx in self.chat.win.cfg.get("local_networks", []))
+
+    def phone_twin(self):
+        """The linked phone (online, on a local network), or None."""
+        for inst, t in self.twins().items():
+            if (t.get("os") or "").lower().startswith("android") and self.twin_online(inst) and self.is_local(t.get("ip", "")):
+                return inst
+        return None
+
+    def phone_call(self, path, obj=None, timeout=20):
+        inst = self.phone_twin()
+        if not inst:
+            raise OSError("Your phone isn't connected (link it, open Arckad-D on it, same network)")
+        return self._call(inst, path, obj or {}, timeout=timeout)
+
     # ---------- server side
     def _auth(self, h):
         k = self.key()
@@ -9751,6 +9784,10 @@ class LinkedDevices:
                         m["r_sent"] = True
                 c._schedule_rewrite(gid)
                 c.ui("on_chat_changed", None)
+            return reply({"ok": True})
+        if path == "/t/phone/notify":                 # the phone pushes a new notification (or a removal)
+            if self.is_local(h.client_address[0]):
+                c.ui("on_phone_event", req)
             return reply({"ok": True})
         if path == "/t/unlink":
             reply({"ok": True})
@@ -14593,6 +14630,408 @@ class MusicBar(Gtk.EventBox):
             self.win._music_guard = False
 
 
+# ---------------------------------------------------------------- 📱 Phone panel (phone link, stage 1)
+# The linked phone's notifications, SMS and files, in the right-hand panel. Everything travels over the linked-
+# devices connection (paired with a code, encrypted, local networks only); the phone also has its own on/off switch.
+# Every request runs in the background, so a slow phone never freezes Arckad-D.
+class PhonePanel(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.win = win
+        self.set_border_width(8)
+        self._poll = None
+        self.thread = None
+        self.fpath = None
+        head = Gtk.Box(spacing=8)
+        self.title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        self.title.set_markup("<b>📱 Phone</b>")
+        head.pack_start(self.title, True, True, 0)
+        rb = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        rb.set_tooltip_text("Refresh")
+        rb.connect("clicked", lambda *_: self.refresh(force=True))
+        head.add(rb)
+        self.add(head)
+        self.status = Gtk.Label(xalign=0, wrap=True)
+        self.status.get_style_context().add_class("dim-label")
+        self.add(self.status)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        sw = Gtk.StackSwitcher(stack=self.stack, halign=Gtk.Align.CENTER)
+        self.add(sw)
+        self.pack_start(self.stack, True, True, 0)
+        # notifications
+        nb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        top = Gtk.Box(spacing=6)
+        self.n_count = Gtk.Label(xalign=0, hexpand=True)
+        top.pack_start(self.n_count, True, True, 0)
+        clear = Gtk.Button(label="Clear all")
+        clear.connect("clicked", lambda *_: self._dismiss_all())
+        top.add(clear)
+        nb.add(top)
+        self.n_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        nsw = Gtk.ScrolledWindow(vexpand=True)
+        nsw.add(self.n_list)
+        nb.pack_start(nsw, True, True, 0)
+        self.stack.add_titled(nb, "notifs", "🔔 Notifications")
+        # messages (SMS): threads page and conversation page
+        self.sms = Gtk.Stack(transition_type=Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        tp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        nm = Gtk.Button(label="✉ New message")
+        nm.connect("clicked", lambda *_: self._new_sms())
+        tp.add(nm)
+        self.t_list = Gtk.ListBox()
+        self.t_list.connect("row-activated", lambda _l, r: self.open_thread(r.thread))
+        tsw = Gtk.ScrolledWindow(vexpand=True)
+        tsw.add(self.t_list)
+        tp.pack_start(tsw, True, True, 0)
+        self.sms.add_named(tp, "threads")
+        cp = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        ch = Gtk.Box(spacing=6)
+        back = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
+        back.connect("clicked", lambda *_: (self.sms.set_visible_child_name("threads"), self.load_threads()))
+        ch.add(back)
+        self.c_title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        ch.pack_start(self.c_title, True, True, 0)
+        cp.add(ch)
+        self.c_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        self.c_scroll = Gtk.ScrolledWindow(vexpand=True)
+        self.c_scroll.add(self.c_list)
+        cp.pack_start(self.c_scroll, True, True, 0)
+        comp = Gtk.Box(spacing=6)
+        self.c_entry = Gtk.Entry(hexpand=True, placeholder_text="Text message")
+        self.c_entry.connect("activate", lambda *_: self._send_sms())
+        sb = Gtk.Button(label="Send")
+        sb.get_style_context().add_class("suggested-action")
+        sb.connect("clicked", lambda *_: self._send_sms())
+        comp.pack_start(self.c_entry, True, True, 0)
+        comp.add(sb)
+        cp.add(comp)
+        self.sms.add_named(cp, "conv")
+        self.stack.add_titled(self.sms, "sms", "💬 Messages")
+        # files
+        fb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        fh = Gtk.Box(spacing=6)
+        up = Gtk.Button.new_from_icon_name("go-up-symbolic", Gtk.IconSize.BUTTON)
+        up.set_tooltip_text("Up one folder")
+        up.connect("clicked", lambda *_: self.load_files(self._parent))
+        fh.add(up)
+        self.f_path = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.START)
+        fh.pack_start(self.f_path, True, True, 0)
+        fb.add(fh)
+        self.f_list = Gtk.ListBox()
+        self.f_list.connect("row-activated", lambda _l, r: self._file_clicked(r))
+        fsw = Gtk.ScrolledWindow(vexpand=True)
+        fsw.add(self.f_list)
+        fb.pack_start(fsw, True, True, 0)
+        self.f_progress = Gtk.ProgressBar(show_text=True)
+        self.f_progress.get_style_context().add_class("arckad-transfer")
+        self.f_progress.set_no_show_all(True)
+        fb.add(self.f_progress)
+        self.stack.add_titled(fb, "files", "📁 Files")
+        self._parent = None
+        self.stack.connect("notify::visible-child-name", lambda *_: self.refresh())
+        self.show_all()
+
+    # ---------- talking to the phone (always in the background)
+    def _ask(self, path, obj, done, timeout=20):
+        def work():
+            try:
+                r = self.win.chat.linked.phone_call(path, obj, timeout=timeout)
+                err = None if r.get("ok", True) else r.get("reason", "the phone refused")
+            except Exception as ex:
+                r, err = {}, str(ex)
+            GLib.idle_add(lambda: done(r, err) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def refresh(self, force=False):
+        L = self.win.chat.linked
+        inst = L.phone_twin()
+        if not inst:
+            t = next((t for t in L.twins().values() if (t.get("os") or "").lower().startswith("android")), None)
+            self.title.set_markup("<b>📱 Phone</b>")
+            self.status.set_markup(
+                "No phone connected. To use this panel:\n1. Link your phone: Chat → ⋯ → Linked devices → <b>Add my "
+                "phone to this PC's account</b>.\n2. On the phone: Chat → ⋮ → <b>📱 Phone link</b> → turn it on and "
+                "allow notifications / SMS.\n3. Keep Arckad-D open on the phone, on the same network."
+                if not t else f"<b>{esc(t.get('name', 'Your phone'))}</b> is linked but not reachable right now: open "
+                "Arckad-D on it (same network).")
+            return
+        t = L.twins()[inst]
+        self.title.set_markup(f"<b>📱 {esc(t.get('name', 'Phone'))}</b>")
+        page = self.stack.get_visible_child_name()
+        if page == "notifs":
+            self.load_notifs()
+        elif page == "sms":
+            if self.sms.get_visible_child_name() == "conv" and self.thread:
+                self.open_thread(self.thread)
+            else:
+                self.load_threads()
+        elif page == "files" and (force or not self.f_list.get_children()):
+            self.load_files(self.fpath)
+        self._info()
+        if not self._poll:
+            self._poll = GLib.timeout_add_seconds(8, self._tick)
+
+    def _info(self):
+        def done(r, err):
+            if err:
+                self.status.set_text("⚠ " + err)
+                return
+            bits = []
+            if r.get("battery") is not None:
+                bits.append(f"🔋 {r['battery']}%" + (" charging" if r.get("charging") else ""))
+            if not r.get("notif_ok"):
+                bits.append("notifications not allowed on the phone")
+            if not r.get("sms_ok"):
+                bits.append("SMS not allowed on the phone")
+            self.status.set_text(" · ".join(bits) or "Connected")
+        self._ask("/t/phone/info", {}, done, timeout=8)
+
+    def _tick(self):
+        if not self.get_mapped() or self.win._right != "phone":
+            self._poll = None
+            return False
+        if self.stack.get_visible_child_name() == "notifs":
+            self.load_notifs()
+        return True
+
+    # ---------- notifications
+    def load_notifs(self):
+        def done(r, err):
+            for c in self.n_list.get_children():
+                self.n_list.remove(c)
+            if err:
+                self.n_count.set_text("⚠ " + err)
+                return
+            items = r.get("items", [])
+            self.n_count.set_markup(f"<b>{len(items)}</b> notification{'s' if len(items) != 1 else ''}")
+            for it in items:
+                self.n_list.add(self._notif_row(it))
+            self.n_list.show_all()
+        self._ask("/t/phone/notifs", {}, done)
+
+    def _notif_row(self, it):
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin=6)
+        top = Gtk.Box(spacing=6)
+        app = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+        app.set_markup(f"<small><b>{esc(it.get('app', '?'))}</b> · "
+                       f"{time.strftime('%H:%M', time.localtime(it.get('ts', 0)))}</small>")
+        top.pack_start(app, True, True, 0)
+        x = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.MENU)
+        x.set_relief(Gtk.ReliefStyle.NONE)
+        x.set_tooltip_text("Dismiss on the phone")
+        x.connect("clicked", lambda *_: self._ask("/t/phone/dismiss", {"key": it["key"]},
+                                                  lambda r, e: self.load_notifs()))
+        top.add(x)
+        box.add(top)
+        if it.get("title"):
+            t = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+            t.set_markup(f"<b>{esc(it['title'])}</b>")
+            box.add(t)
+        if it.get("text"):
+            box.add(Gtk.Label(label=it["text"][:400], xalign=0, wrap=True, max_width_chars=40, selectable=True))
+        if it.get("reply"):
+            rr = Gtk.Box(spacing=4)
+            e = Gtk.Entry(hexpand=True, placeholder_text="Reply…")
+            b = Gtk.Button(label="↩ Reply")
+
+            def send(*_):
+                text = e.get_text().strip()
+                if text:
+                    b.set_sensitive(False)
+                    self._ask("/t/phone/reply", {"key": it["key"], "text": text},
+                              lambda r, err: (self.win.flash_all("✗ " + err if err else "↩ Replied"), self.load_notifs()))
+            e.connect("activate", send)
+            b.connect("clicked", send)
+            rr.pack_start(e, True, True, 0)
+            rr.add(b)
+            box.add(rr)
+        row.add(box)
+        return row
+
+    def _dismiss_all(self):
+        self._ask("/t/phone/dismiss", {"all": True}, lambda r, e: self.load_notifs())
+
+    # ---------- SMS
+    def load_threads(self):
+        def done(r, err):
+            for c in self.t_list.get_children():
+                self.t_list.remove(c)
+            if err:
+                self.t_list.add(Gtk.Label(label="⚠ " + err, wrap=True, margin=10))
+                self.t_list.show_all()
+                return
+            for th in r.get("threads", []):
+                row = Gtk.ListBoxRow()
+                row.thread = th
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6)
+                top = Gtk.Box()
+                n = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+                weight = "heavy" if th.get("unread") else "bold"
+                n.set_markup(f"<span weight='{weight}'>{esc(th.get('name') or th.get('address', '?'))}</span>")
+                top.pack_start(n, True, True, 0)
+                tl = Gtk.Label()
+                tl.set_markup(f"<small>{time.strftime('%d %b %H:%M', time.localtime(th.get('ts', 0)))}</small>")
+                top.add(tl)
+                box.add(top)
+                s = Gtk.Label(label=(th.get("snippet") or "")[:80], xalign=0, ellipsize=Pango.EllipsizeMode.END)
+                s.get_style_context().add_class("dim-label")
+                box.add(s)
+                row.add(box)
+                self.t_list.add(row)
+            self.t_list.show_all()
+        self._ask("/t/phone/sms/threads", {}, done)
+
+    def open_thread(self, th):
+        self.thread = th
+        self.c_title.set_markup(f"<b>{esc(th.get('name') or th.get('address', '?'))}</b>  "
+                                f"<small>{esc(th.get('address', ''))}</small>")
+        self.sms.set_visible_child_name("conv")
+
+        def done(r, err):
+            for c in self.c_list.get_children():
+                self.c_list.remove(c)
+            if err:
+                self.c_list.add(Gtk.Label(label="⚠ " + err, wrap=True))
+            for m in r.get("messages", []):
+                row = Gtk.ListBoxRow(activatable=False)
+                outer = Gtk.Box(margin=3)
+                b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                b.get_style_context().add_class("chat-mine" if m.get("out") else "chat-theirs")
+                b.get_style_context().add_class("chat-bubble")
+                b.add(Gtk.Label(label=m.get("body", ""), xalign=0, wrap=True, max_width_chars=34, selectable=True))
+                t = Gtk.Label(xalign=1)
+                t.set_markup(f"<small>{time.strftime('%d %b %H:%M', time.localtime(m.get('ts', 0)))}</small>")
+                b.add(t)
+                (outer.pack_end if m.get("out") else outer.pack_start)(b, False, False, 0)
+                row.add(outer)
+                self.c_list.add(row)
+            self.c_list.show_all()
+            GLib.idle_add(lambda: self.c_scroll.get_vadjustment().set_value(
+                self.c_scroll.get_vadjustment().get_upper()) or False)
+        self._ask("/t/phone/sms/messages", {"thread": th.get("id"), "address": th.get("address")}, done)
+
+    def _send_sms(self):
+        text = self.c_entry.get_text().strip()
+        if not text or not self.thread:
+            return
+        self.c_entry.set_text("")
+        self._ask("/t/phone/sms/send", {"address": self.thread.get("address"), "text": text},
+                  lambda r, err: (self.win.flash_all("✗ " + err) if err else None,
+                                  GLib.timeout_add(1500, lambda: self.open_thread(self.thread) or False)))
+
+    def _new_sms(self):
+        d = Gtk.Dialog(title="New text message", transient_for=self.get_toplevel(), modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Send", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(12)
+        num = Gtk.Entry(placeholder_text="Phone number")
+        txt = Gtk.Entry(placeholder_text="Message")
+        box.add(num)
+        box.add(txt)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK and num.get_text().strip() and txt.get_text().strip():
+            self._ask("/t/phone/sms/send", {"address": num.get_text().strip(), "text": txt.get_text().strip()},
+                      lambda r, err: (self.win.flash_all("✗ " + err if err else "✉ Sent from your phone"),
+                                      self.load_threads()))
+        d.destroy()
+
+    # ---------- files
+    def load_files(self, path):
+        def done(r, err):
+            for c in self.f_list.get_children():
+                self.f_list.remove(c)
+            if err:
+                self.f_list.add(Gtk.Label(label="⚠ " + err, wrap=True, margin=10))
+                self.f_list.show_all()
+                return
+            self.fpath, self._parent = r.get("path"), r.get("parent")
+            self.f_path.set_text(r.get("path", ""))
+            for it in r.get("items", []):
+                row = Gtk.ListBoxRow()
+                row.item = it
+                box = Gtk.Box(spacing=8, margin=4)
+                box.add(Gtk.Image.new_from_icon_name("folder" if it.get("dir") else "text-x-generic",
+                                                     Gtk.IconSize.LARGE_TOOLBAR))
+                n = Gtk.Label(label=it["name"], xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+                box.pack_start(n, True, True, 0)
+                if not it.get("dir"):
+                    s = Gtk.Label(label=human_size(it.get("size", 0)))
+                    s.get_style_context().add_class("dim-label")
+                    box.add(s)
+                    dl = Gtk.Button.new_from_icon_name("document-save-symbolic", Gtk.IconSize.BUTTON)
+                    dl.set_tooltip_text("Download to this PC")
+                    dl.connect("clicked", lambda _b, it=it: self.download(it))
+                    box.add(dl)
+                row.add(box)
+                self.f_list.add(row)
+            self.f_list.show_all()
+        self._ask("/t/phone/files", {"path": path}, done)
+
+    def _file_clicked(self, row):
+        it = getattr(row, "item", None)
+        if not it:
+            return
+        if it.get("dir"):
+            self.load_files(it["path"])
+        else:
+            self.download(it)
+
+    def download(self, it):
+        """Copy a phone file to Downloads/Arckad-D Phone, in encrypted pieces, with progress."""
+        dest_dir = downloads_dir() / "Arckad-D Phone"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = unique_target(dest_dir / os.path.basename(it["name"]))
+        self.f_progress.show()
+        self.f_progress.set_fraction(0)
+        self.f_progress.set_text(f"Downloading {it['name']}…")
+
+        def work():
+            L = self.win.chat.linked
+            offset, total, err = 0, it.get("size", 0), None
+            tmp = Path(str(dest) + ".part")
+            try:
+                with open(tmp, "wb") as f:
+                    while True:
+                        r = L.phone_call("/t/phone/read", {"path": it["path"], "offset": offset, "size": 1_000_000},
+                                         timeout=60)
+                        if not r.get("ok", True):
+                            raise OSError(r.get("reason", "the phone refused"))
+                        data = base64.b64decode(r.get("data", ""))
+                        f.write(data)
+                        offset += len(data)
+                        total = r.get("total", total) or 1
+                        GLib.idle_add(lambda o=offset, t=total: (self.f_progress.set_fraction(min(1, o / t)),
+                                                                 self.f_progress.set_text(
+                                                                     f"{human_size(o)} of {human_size(t)}")) and False)
+                        if r.get("eof") or not data:
+                            break
+                tmp.replace(dest)
+            except Exception as ex:
+                err = str(ex)
+                tmp.unlink(missing_ok=True)
+
+            def done():
+                self.f_progress.hide()
+                if err:
+                    self.win.error(f"The file couldn't be downloaded: {err}")
+                else:
+                    self.win.flash_all(f"📥 Saved to {dest}")
+                    self.win.active.go(str(dest_dir))
+                return False
+            GLib.idle_add(done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- the phone pushed something
+    def phone_event(self, ev):
+        if self.get_mapped():
+            if ev.get("type") in ("posted", "removed") and self.stack.get_visible_child_name() == "notifs":
+                self.load_notifs()
+            elif ev.get("type") == "sms" and self.stack.get_visible_child_name() == "sms":
+                self.refresh()
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -14970,6 +15409,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self.chat_btn.connect("toggled", lambda b: None if self._right_guard else
                               self.show_right("chat" if b.get_active() else None))
         hb.pack_end(self.chat_btn)
+        self.phone_btn = Gtk.ToggleButton(label="📱")
+        self.phone_btn.set_tooltip_text("Your phone: notifications, messages and files (click again to close)")
+        self.phone_btn.connect("toggled", lambda b: None if self._right_guard else
+                               self.show_right("phone" if b.get_active() else None))
+        hb.pack_end(self.phone_btn)
         self.music_btn = Gtk.ToggleButton(label="🎵")
         self.music_btn.set_tooltip_text("Music player with clock: on / off (it sits at the bottom of this window)")
         self._music_guard = False
@@ -15040,6 +15484,8 @@ class MainWindow(Gtk.ApplicationWindow):
                                      vhomogeneous=False)
         self.right_stack.add_named(self.preview, "preview")
         self.right_stack.add_named(self.chat_panel, "chat")
+        self.phone_panel = PhonePanel(self)
+        self.right_stack.add_named(self.phone_panel, "phone")
         self.right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.right_box.pack_start(self.right_stack, True, True, 0)
         self.right_box.set_no_show_all(True)
@@ -15842,6 +16288,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._right_guard = True
         self.preview_btn.set_active(page == "preview")
         self.chat_btn.set_active(page == "chat")
+        self.phone_btn.set_active(page == "phone")
         self._right_guard = False
         self.cfg["preview"] = page == "preview"
         if page:
@@ -15857,6 +16304,8 @@ class MainWindow(Gtk.ApplicationWindow):
             self._update_preview()
         elif page == "chat":
             self.chat_panel.refresh()
+        elif page == "phone":
+            self.phone_panel.refresh(force=True)
         self.update_chat_button()
 
     def update_organize_hint(self):
@@ -17768,6 +18217,15 @@ class MainWindow(Gtk.ApplicationWindow):
     def on_chat_presence(self):
         for p in self.chat_panels():
             p.update_info()
+        return False
+
+    def on_phone_event(self, ev):
+        """The linked phone pushed a notification (or a new SMS)."""
+        self.phone_panel.phone_event(ev)
+        it = ev.get("item") or {}
+        if ev.get("type") in ("posted", "sms") and self._right != "phone" and it.get("title"):
+            self.show_toast(f"📱 {it.get('app', 'Phone')} · {it.get('title', '')}", (it.get("text") or "")[:120], None,
+                            lambda: self.show_right("phone"))
         return False
 
     def on_chat_typing(self, gid):

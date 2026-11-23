@@ -1223,7 +1223,7 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         String[] items0 = {"Your profile (name and photo)", "Keep chat connected (battery settings)", "Notification settings",
                 "Chat wallpaper", "Chat lock (PIN)", "Linked devices (phone + PC, one account)",
                 "Restore my profile from before a link", "☁ Back up chats (Google Drive or anywhere)", "Restore from a backup",
-                "🔋 Background connection"};
+                "🔋 Background connection", "📱 Phone link (PC panel)"};
         String[] items = new String[items0.length + 1];
         items[0] = "⭐ Saved Messages";
         System.arraycopy(items0, 0, items, 1, items0.length);
@@ -1235,6 +1235,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             int w = w0 - 1;
             if (w == 9) {
                 backgroundSettings();
+                return;
+            }
+            if (w == 10) {
+                phoneLinkSettings();
                 return;
             }
             if (w == 7) {
@@ -1928,6 +1932,29 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
                 .setPositiveButton("💻 Join my PC's account", (x, w) -> linkThisPhone())
                 .setNeutralButton("Add my PC to this phone", (x, w) -> showLinkCode())
                 .setNegativeButton("Close", null).show();
+    }
+
+    private void phoneLinkSettings() {
+        PhoneLink pl = new PhoneLink(a);
+        LinearLayout box = new LinearLayout(a);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(Ui.dp(a, 20), Ui.dp(a, 8), Ui.dp(a, 20), 0);
+        box.addView(Ui.text(a, "Show this phone's notifications, text messages and files in Arckad-D on your linked PC "
+                + "(📱 button). Only your linked PC, only on your local network, encrypted.", 13, Ui.DIM, false));
+        Switch on = new Switch(a);
+        on.setText("Phone link on");
+        on.setTextColor(Ui.TEXT);
+        on.setChecked(pl.enabled());
+        on.setOnCheckedChangeListener((v, c) -> Ui.prefs(a).edit().putBoolean("phone_link", c).apply());
+        box.addView(on, Ui.matchWrap(a, 10));
+        box.addView(Ui.button(a, (pl.notifAllowed() ? "✓ " : "") + "Allow notifications", !pl.notifAllowed(),
+                v -> a.startActivity(new Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))), Ui.matchWrap(a, 6));
+        box.addView(Ui.button(a, (pl.smsAllowed() ? "✓ " : "") + "Allow text messages (SMS) and contact names", !pl.smsAllowed(),
+                v -> a.requestPermissions(new String[]{android.Manifest.permission.READ_SMS, android.Manifest.permission.SEND_SMS,
+                        android.Manifest.permission.READ_CONTACTS}, 7310)), Ui.matchWrap(a, 6));
+        if (e.link.twins().length() == 0)
+            box.addView(Ui.text(a, "This phone isn't linked to a PC yet: ⋮ → Linked devices → Join my PC's account.", 13, 0xffe01b24, false));
+        Ui.dialog(a).setTitle("📱 Phone link").setView(box).setPositiveButton("Done", null).show();
     }
 
     private void backgroundSettings() {

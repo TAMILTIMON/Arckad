@@ -95,6 +95,15 @@ final class ChatEngine {
     private String tagStamp = "";
     int port;
     String inst = "phone";                        // this install (linked devices tell each other apart by it)
+
+    /** Answers the PC's 📱 Phone panel (notifications, SMS, files); set by the app, absent in tests. */
+    interface PhoneHandler {
+        boolean enabled();
+
+        JSONObject handle(String path, JSONObject req) throws Exception;
+    }
+
+    volatile PhoneHandler phone;
     volatile boolean linking;                     // joining an account: run the service even without a profile
     final ChatLink link;
 

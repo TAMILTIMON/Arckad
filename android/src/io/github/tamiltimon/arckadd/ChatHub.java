@@ -76,6 +76,7 @@ final class ChatHub implements ChatEngine.Ui {
         File dl = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
         ChatEngine e = new ChatEngine(new File(app.getFilesDir(), "chat"), dl, deviceId, name, Net.OS, this);
         e.inst = Ui.prefs(app).getString("chat_inst", "phone");
+        e.phone = new PhoneLink(app);                      // answers the PC's 📱 Phone panel (when switched on)
         return e;
     }
 
