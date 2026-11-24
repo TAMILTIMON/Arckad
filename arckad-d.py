@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.39.0"
+APP_VERSION = "3.39.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2476,7 +2476,9 @@ class FilePane(Gtk.Box):
         """Show this file: filters cleared, the file on its own first (with a lime banner), glowing lime."""
         self.spotlight, self.spot_only = path, True
         self.clear_filters()                                 # a filter (e.g. “.mp3”) must not hide the file
-        self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(path))}</b>  <small>shown on its own</small>")
+        fresh = time.time() - os.path.getmtime(path) < 600 if os.path.exists(path) else False
+        self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(path))}</b>  <small>"
+                                   f"{'latest download · ' if fresh else ''}shown on its own</small>")
         self.spot_bar.set_no_show_all(False)
         self.spot_bar.show_all()
         self.pending_select = [path]
@@ -16308,13 +16310,42 @@ class FileManagerService:
         self.node = Gio.DBusNodeInfo.new_for_xml(DBUS_FM_XML)
 
     def start(self):
+        """Own “Show in folder” (and keep owning it: the Files app starting in the background used to take it)."""
         if self.owner:
             return
-        self.owner = Gio.bus_own_name(Gio.BusType.SESSION, DBUS_FM,
-                                      Gio.BusNameOwnerFlags.REPLACE | Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT,
-                                      self._bus_acquired, None, None)
+        self.has_name = False
+        self.owner = Gio.bus_own_name(Gio.BusType.SESSION, DBUS_FM, Gio.BusNameOwnerFlags.REPLACE,
+                                      self._bus_acquired, self._name_acquired, self._name_lost)
+        if not getattr(self, "_watch", None):
+            self._watch = GLib.timeout_add_seconds(30, self._keep)
+
+    def _name_acquired(self, *_):
+        self.has_name = True
+
+    def _name_lost(self, *_):
+        self.has_name = False
+
+    def _keep(self):
+        """Every 30 s: if another file manager took “Show in folder”, take it back."""
+        if not self.win.cfg.get("default_fm"):
+            self._watch = None
+            return False
+        if self.owner and not self.has_name:
+            Gio.bus_unown_name(self.owner)
+            self.owner = 0
+            if self.reg and self.conn:
+                try:
+                    self.conn.unregister_object(self.reg)
+                except Exception:
+                    pass
+                self.reg = 0
+            self.start()
+        return True
 
     def stop(self):
+        if getattr(self, "_watch", None):
+            GLib.source_remove(self._watch)
+            self._watch = None
         if self.owner:
             Gio.bus_unown_name(self.owner)
             self.owner = 0
@@ -16620,6 +16651,22 @@ def skin_color(key):
 def skin_css(name):
     from string import Template
     return Template(_SKIN_TEMPLATE).safe_substitute(SKINS[name]).encode()
+
+
+def recent_download_in(folder, minutes=10):
+    """The newest file in a folder if it arrived in the last few minutes (browsers that open only the folder)."""
+    best, newest = None, time.time() - minutes * 60
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                if e.name.startswith(".") or e.name.lower().endswith(_PARTIAL) or not e.is_file(follow_symlinks=False):
+                    continue
+                t = e.stat(follow_symlinks=False).st_mtime
+                if t > newest:
+                    best, newest = e.path, t
+    except OSError:
+        return None
+    return best
 
 
 class TabWindow(Gtk.Window):
@@ -20394,7 +20441,19 @@ class MainWindow(Gtk.ApplicationWindow):
         self.deiconify()
         self.present()
         if folder and os.path.isdir(folder):
-            self.new_tab(self.left_nb, folder)
+            folder = os.path.abspath(folder)
+            existing = next((p for p in self.all_panes() if p.location == folder and p.mode == "folder"), None)
+            if existing is not None:                         # that folder is open already: go to its tab
+                nb = existing.get_parent()
+                nb.set_current_page(nb.page_num(existing))
+                top = existing.get_toplevel()
+                if top is not self and hasattr(top, "present"):
+                    top.present()
+                self.set_active(existing)
+            else:
+                self.new_tab(self.left_nb, folder)
+            if not select:                                   # a browser that only opens the folder
+                select = recent_download_in(folder)
             if select:
                 self.select_in_active(select)
         if chat:
