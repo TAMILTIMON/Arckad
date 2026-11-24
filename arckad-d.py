@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.41.0"
+APP_VERSION = "3.42.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1922,6 +1922,30 @@ class Journey:
         except sqlite3.Error:
             pass
 
+    def created_live(self, path):
+        """Another app made a new file or folder (or a download finished): its journey starts, exact time."""
+        try:
+            with self.lock:
+                dev, ino, is_dir, _s = self._stat(path)
+                if dev is None or self._find(str(path), dev, ino):
+                    return
+                self._new(path, dev, ino, is_dir, kind="created", how="live")
+                self._commit()
+        except sqlite3.Error:
+            pass
+
+    def appeared(self, path):
+        """Arrived from a folder that isn't watched: if we know it (same file number), it's a move."""
+        dev, ino, is_dir, _s = self._stat(path)
+        try:
+            with self.lock:
+                iid = self._find(None, dev, ino) if dev is not None else None
+                old = self._db().execute("SELECT path FROM items WHERE id=?", (iid,)).fetchone() if iid else None
+        except sqlite3.Error:
+            return
+        if old and old[0] != str(path):
+            self.moved(old[0], path, how="live")
+
     def follow(self, path):
         """Make sure a file or folder has a journey (opening its map starts one)."""
         try:
@@ -2045,6 +2069,12 @@ class Journey:
         except sqlite3.Error:
             return
         name, size = os.path.basename(path), (last[0] if last else None)
+        near = os.path.dirname(os.path.dirname(path))       # most moves are nearby: around the old place first
+        if near and os.path.isdir(near):
+            hit = _find_by_name(near, name, size, depth=3)
+            if hit:
+                self.moved(path, hit, how="scan", ts=t_new, ts_from=t_old)
+                return
         for root in [r for r in drive_roots() if not path.startswith(r)][:12]:
             hit = _find_by_name(root, name, size, depth=4)
             if hit:
@@ -2108,11 +2138,302 @@ def _find_by_name(root, name, size, depth=4):
     return None
 
 
+def _find_by_ino(root, dev, ino, depth=3):
+    """A file with this drive and file number under root (a few levels deep), or None."""
+    stack, seen = [(root, 0)], 0
+    while stack and seen < 30000:
+        folder, d = stack.pop()
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    seen += 1
+                    try:
+                        if e.inode() == ino and e.stat(follow_symlinks=False).st_dev == dev:
+                            return e.path
+                        if d < depth and e.is_dir(follow_symlinks=False) and e.name not in SKIP_DIRS:
+                            stack.append((e.path, d + 1))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return None
+
+
 def stat_isdir(st):
     return statmod.S_ISDIR(st.st_mode)
 
 
 JOURNEY = Journey()
+
+
+# ---------- watching other apps everywhere (Ubuntu Files, Explorer, the terminal…), not only open folders
+_JW_SKIP_PREFIX = ("~$", ".~lock", ".goutputstream")
+
+
+def _jw_ignored(path):
+    name = os.path.basename(path)
+    low = name.lower()
+    return (not name or name.startswith(".") or name.startswith(_JW_SKIP_PREFIX)
+            or low.rsplit(".", 1)[-1] in PARTIAL_EXTS or any(part in SKIP_DIRS for part in Path(path).parts))
+
+
+def _trash_dirs():
+    return [str(Path(GLib.get_user_data_dir()) / "Trash" / "files")]
+
+
+class JourneyWatcher:
+    """Watches your folders in the background (while Arckad-D runs, also in the tray) so the journey map records
+    what other apps do, with the exact time. Ubuntu: one watch per folder, within a share of the system's limit,
+    nearest folders first (new folders are added as they appear). Windows: one watch covers a whole folder tree.
+    Folders that can't be watched get a quick check every 10 minutes for files that have a journey."""
+
+    def __init__(self):
+        self.mons = {}                                      # folder -> Gio.FileMonitor (Ubuntu)
+        self.roots, self.budget, self.running = [], 0, False
+        self.win_threads = []
+
+    def covers(self, folder):
+        if IS_WIN:
+            f = os.path.normcase(os.path.abspath(folder))
+            return any(f == os.path.normcase(r) or f.startswith(os.path.normcase(r) + os.sep) for r in self.roots)
+        return folder in self.mons
+
+    def start(self, roots):
+        if self.running:
+            return
+        self.running = True
+        self.roots = [r for r in dict.fromkeys(os.path.abspath(r) for r in roots) if os.path.isdir(r)]
+        if IS_WIN:
+            for r in self.roots:
+                t = threading.Thread(target=self._win_watch, args=(r,), daemon=True)
+                t.start()
+                self.win_threads.append(t)
+        else:
+            try:
+                limit = int(Path("/proc/sys/fs/inotify/max_user_watches").read_text().strip())
+            except (OSError, ValueError):
+                limit = 8192
+            self.budget = max(500, min(30000, limit // 2))       # leave plenty for other apps
+            threading.Thread(target=self._plan, daemon=True).start()
+        GLib.timeout_add_seconds(600, self._quick_check)
+
+    # ---------- Ubuntu: a watch per folder
+    def _plan(self):
+        """Folders to watch, nearest first (and folders holding files with a journey before others)."""
+        first = []
+        try:
+            with JOURNEY.lock:
+                first = [os.path.dirname(r[0]) for r in JOURNEY._db().execute(
+                    "SELECT path FROM items WHERE gone_ts IS NULL ORDER BY id DESC LIMIT 2000")]
+        except sqlite3.Error:
+            pass
+        order, seen = [], set()
+        for d in first:
+            if os.path.isdir(d) and d not in seen and any(d == r or d.startswith(r + os.sep) for r in self.roots):
+                seen.add(d)
+                order.append(d)
+        queue = list(self.roots)
+        while queue and len(order) < self.budget:
+            d = queue.pop(0)
+            if d in seen and d not in self.roots:
+                pass
+            if d not in seen:
+                seen.add(d)
+                order.append(d)
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and e.name not in SKIP_DIRS:
+                            queue.append(e.path)
+            except OSError:
+                continue
+        order = order[: self.budget]
+        for i in range(0, len(order), 400):                  # create the watches in small batches (no UI pause)
+            GLib.idle_add(self._add_batch, order[i:i + 400])
+
+    def _add_batch(self, folders):
+        for d in folders:
+            self._watch(d)
+        return False
+
+    def _watch(self, d):
+        if d in self.mons or len(self.mons) >= self.budget or not os.path.isdir(d):
+            return
+        try:
+            m = Gio.File.new_for_path(d).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+            m.connect("changed", self._changed)
+            self.mons[d] = m
+        except GLib.Error:
+            pass
+
+    def _unwatch_tree(self, d):
+        for k in [k for k in self.mons if k == d or k.startswith(d + os.sep)]:
+            self.mons.pop(k).cancel()
+
+    def _changed(self, _m, f, other, ev):
+        p = f.get_path() if f else None
+        q = other.get_path() if other else None
+        if not p:
+            return
+        E = Gio.FileMonitorEvent
+        if ev in (E.RENAMED, E.MOVED_OUT) and q:
+            if any(q.startswith(t + os.sep) for t in _trash_dirs()):        # put in the Trash by another app
+                if not JOURNEY._ours("rm", p):
+                    threading.Thread(target=JOURNEY.removed, args=(p, True, "live"), daemon=True).start()
+                self._unwatch_tree(p)
+                return
+            if os.path.isdir(q):                             # a folder moved: watch it where it is now
+                self._unwatch_tree(p)
+                GLib.idle_add(lambda: self._watch_tree(q) or False)
+            if JOURNEY._ours("move", p, q):
+                return
+            if p.lower().rsplit(".", 1)[-1] in PARTIAL_EXTS:  # a download finished (.crdownload → name)
+                if not _jw_ignored(q):
+                    threading.Thread(target=JOURNEY.created_live, args=(q,), daemon=True).start()
+                return
+            if not _jw_ignored(q) or JOURNEY._find(p):
+                threading.Thread(target=JOURNEY.moved, args=(p, q, "live"), daemon=True).start()
+        elif ev == E.MOVED_OUT and not q:                    # moved, but the system didn't say where
+            if JOURNEY._find(p):
+                threading.Timer(1.2, self._resolve_move, args=(p,)).start()
+        elif ev == E.MOVED_IN and not q:                     # came from somewhere not watched
+            if os.path.isdir(p):
+                GLib.idle_add(lambda: self._watch_tree(p) or False)
+            if not _jw_ignored(p):
+                threading.Thread(target=JOURNEY.appeared, args=(p,), daemon=True).start()
+        elif ev == E.CREATED:
+            if os.path.isdir(p):
+                self._watch(p)
+            if not _jw_ignored(p) and not JOURNEY._ours("new", p):
+                threading.Thread(target=JOURNEY.created_live, args=(p,), daemon=True).start()
+        elif ev == E.CHANGES_DONE_HINT:
+            if not JOURNEY._ours("new", p):
+                threading.Thread(target=JOURNEY.size_check, args=(p, "live"), daemon=True).start()
+        elif ev == E.DELETED:
+            self._unwatch_tree(p)
+            if not JOURNEY._ours("rm", p) and JOURNEY._find(p):
+                threading.Thread(target=JOURNEY.removed, args=(p, False, "live"), daemon=True).start()
+
+    def _resolve_move(self, old):
+        """Find a moved file by its file number around the old place (e.g. a folder created a moment ago)."""
+        try:
+            with JOURNEY.lock:
+                r = JOURNEY._db().execute("SELECT dev, ino FROM items WHERE path=? AND gone_ts IS NULL ORDER BY id DESC "
+                                          "LIMIT 1", (old,)).fetchone()
+        except sqlite3.Error:
+            return
+        if not r or os.path.lexists(old):
+            return
+        dev, ino = r
+        for t in _trash_dirs():                             # put in the Trash by another app
+            if os.path.isdir(t) and _find_by_ino(t, dev, ino, depth=1):
+                JOURNEY.removed(old, trash=True, how="live")
+                return
+        here = os.path.dirname(old)
+        for root in (here, os.path.dirname(here)):
+            hit = _find_by_ino(root, dev, ino, depth=3)
+            if hit:
+                if os.path.isdir(hit):
+                    GLib.idle_add(lambda: self._watch_tree(hit) or False)
+                JOURNEY.moved(old, hit, how="live")
+                return
+
+    def _watch_tree(self, d):
+        self._watch(d)
+        try:
+            for root, dirs, _files in os.walk(d):
+                dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP_DIRS]
+                for x in dirs:
+                    self._watch(os.path.join(root, x))
+                    if len(self.mons) >= self.budget:
+                        return
+        except OSError:
+            pass
+
+    # ---------- Windows: one watch for a whole folder tree
+    def _win_watch(self, root):
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        h = k32.CreateFileW(root, 0x0001, 0x7, None, 3, 0x02000000, None)
+        if not h or h == wintypes.HANDLE(-1).value:
+            return
+        buf = ctypes.create_string_buffer(64 * 1024)
+        got = wintypes.DWORD()
+        pending = []                                        # (time, path) removed: may be half of a move
+        while self.running:
+            ok = k32.ReadDirectoryChangesW(h, buf, len(buf), True, 0x1 | 0x2 | 0x8 | 0x10, ctypes.byref(got), None, None)
+            if not ok:
+                break
+            for action, rel in parse_dir_changes(buf.raw[: got.value]):
+                self._win_event(root, action, rel, pending)
+        k32.CloseHandle(h)
+
+    def _win_event(self, root, action, rel, pending):
+        p = os.path.join(root, rel)
+        if _jw_ignored(p) or rel.lower().startswith(("appdata" + os.sep, "appdata")):
+            return
+        now = time.time()
+        pending[:] = [x for x in pending if now - x[0] < 2]
+        if action == 4:                                     # renamed: old name (the new one follows)
+            self._win_old = p
+        elif action == 5 and getattr(self, "_win_old", None):
+            old, self._win_old = self._win_old, None
+            if not JOURNEY._ours("move", old, p):
+                JOURNEY.moved(old, p, how="live")
+        elif action == 2:                                   # removed: a move shows up as removed + added
+            pending.append((now, p))
+            threading.Timer(2.2, lambda: (any(x[1] == p for x in pending) and not JOURNEY._ours("rm", p)
+                                          and JOURNEY._find(p) and JOURNEY.removed(p, False, "live"))).start()
+        elif action == 1:                                   # added: the second half of a move, or new
+            twin = next((x for x in pending if os.path.basename(x[1]) == os.path.basename(p)), None)
+            if twin:
+                pending.remove(twin)
+                if not JOURNEY._ours("move", twin[1], p):
+                    JOURNEY.moved(twin[1], p, how="live")
+            elif not JOURNEY._ours("new", p):
+                JOURNEY.created_live(p)
+        elif action == 3:
+            JOURNEY.size_check(p, how="live")
+
+    # ---------- every 10 minutes: files with a journey in places that aren't watched
+    def _quick_check(self):
+        if not self.running:
+            return False
+
+        def work():
+            try:
+                with JOURNEY.lock:
+                    items = JOURNEY._db().execute("SELECT id, path FROM items WHERE gone_ts IS NULL").fetchall()
+            except sqlite3.Error:
+                return
+            for iid, path in items:
+                folder = os.path.dirname(path)
+                if self.covers(folder):
+                    continue
+                if os.path.lexists(path):
+                    JOURNEY.size_check(path, how="scan", ts=time.time(), ts_from=time.time() - 600)
+                else:
+                    JOURNEY.find_elsewhere(iid, path, time.time() - 600, time.time())
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+
+def parse_dir_changes(data):
+    """Windows ReadDirectoryChangesW records: [(action, relative path)]."""
+    out, pos = [], 0
+    while pos + 12 <= len(data):
+        nxt, action, n = struct.unpack_from("<III", data, pos)
+        name = data[pos + 12: pos + 12 + n].decode("utf-16-le", "replace")
+        out.append((action, name))
+        if not nxt:
+            break
+        pos += nxt
+    return out
+
+
+JOURNEY_WATCH = JourneyWatcher()
 
 
 # ---------------------------------------------------------------- one browsing pane (= one tab)
@@ -2972,7 +3293,7 @@ class FilePane(Gtk.Box):
                 self.monitor = None
 
     def on_folder_changed(self, _mon=None, f=None, other=None, ev=None):
-        if ev is not None:                                   # other apps' changes go into the journeys (exact time)
+        if ev is not None and not JOURNEY_WATCH.covers(self.location):   # (the background watcher records it)
             threading.Thread(target=JOURNEY.live, args=(ev, f, other), daemon=True).start()
         if self.refresh_id is None:
             self.refresh_id = GLib.timeout_add(600, self.auto_refresh)
@@ -17872,6 +18193,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.timeout_add_seconds(90, self._auto_backup_tick)
         self.start_freeze_watch()
         GLib.idle_add(self._default_fm_start)
+        GLib.timeout_add_seconds(6, self._start_journey_watch)
         self.connect("configure-event", lambda *_: GLib.idle_add(self._check_compact) and False)
         self.connect("window-state-event", lambda *_: GLib.idle_add(self._check_compact) and False)
         GLib.idle_add(self._check_compact)
@@ -21618,6 +21940,14 @@ class MainWindow(Gtk.ApplicationWindow):
         p.spotlight_file(path)
 
     # ---------- default file manager
+    def _start_journey_watch(self):
+        """Record other apps' changes (file managers, the terminal…) in the journey maps, while Arckad-D runs."""
+        if self.cfg.get("journey_watch", True):
+            roots = [str(HOME)] + list(self.cfg.get("library_places", [])) + \
+                    [p for p in self.cfg.get("pinned", []) if not p.startswith(str(HOME) + os.sep)]
+            JOURNEY_WATCH.start(roots)
+        return False
+
     def _default_fm_start(self):
         if not IS_WIN and self.cfg.get("default_fm"):
             if not getattr(self, "fm_service", None):
