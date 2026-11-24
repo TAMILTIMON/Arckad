@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.50.0"
+APP_VERSION = "3.51.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20396,6 +20396,522 @@ class VaultUI:
         self.win.flash_all(f"🔐 Moved {moved} item{'s' if moved != 1 else ''} into the vault")
 
 
+# ---------------------------------------------------------------- 🗑 Trash: see, restore, delete permanently
+# Ubuntu: the freedesktop Trash (your home Trash, plus the Trash folder on other drives, e.g. a big data volume).
+# Windows: the Recycle Bin (through PowerShell).
+def _trash_dirs_all():
+    out = [Path(GLib.get_user_data_dir()) / "Trash"]
+    if IS_WIN:
+        return out
+    uid = os.getuid()
+    for root in drive_roots():
+        for cand in (Path(root) / f".Trash-{uid}", Path(root) / ".Trash" / str(uid)):
+            if (cand / "files").is_dir():
+                out.append(cand)
+    return out
+
+
+def trash_items():
+    """[{key, name, orig, when, size, is_dir}] newest first."""
+    if IS_WIN:
+        return _win_trash_items()
+    items = []
+    for t in _trash_dirs_all():
+        info_dir, files_dir = t / "info", t / "files"
+        try:
+            names = os.listdir(files_dir)
+        except OSError:
+            continue
+        top = t.parent if t.name.startswith(".Trash-") else (t.parent.parent if t.parent.name == ".Trash" else None)
+        for n in names:
+            f = files_dir / n
+            orig, when = "", 0.0
+            try:
+                for line in (info_dir / (n + ".trashinfo")).read_text(encoding="utf-8", errors="replace").splitlines():
+                    if line.startswith("Path="):
+                        orig = urllib.parse.unquote(line[5:])
+                        if top is not None and not orig.startswith("/"):
+                            orig = str(top / orig)         # other drives keep paths relative to the drive
+                    elif line.startswith("DeletionDate="):
+                        try:
+                            when = time.mktime(time.strptime(line[13:].strip()[:19], "%Y-%m-%dT%H:%M:%S"))
+                        except ValueError:
+                            pass
+            except OSError:
+                pass
+            try:
+                st = os.lstat(f)
+                is_dir = statmod.S_ISDIR(st.st_mode)
+                size = 0 if is_dir else st.st_size
+            except OSError:
+                continue
+            items.append({"key": str(f), "name": n, "orig": orig or n, "when": when or st.st_mtime, "size": size,
+                          "is_dir": is_dir, "info": str(info_dir / (n + ".trashinfo"))})
+    items.sort(key=lambda i: -i["when"])
+    return items
+
+
+def trash_restore(item):
+    """Back to where it came from (a taken name gets “ (1)”). Returns the new path."""
+    if IS_WIN:
+        return _win_trash_call("restore", item)
+    dest = unique_target(item["orig"])
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.move(item["key"], dest)
+    Path(item["info"]).unlink(missing_ok=True)
+    return str(dest)
+
+
+def trash_delete(item):
+    if IS_WIN:
+        return _win_trash_call("delete", item)
+    p = item["key"]
+    if os.path.isdir(p) and not os.path.islink(p):
+        shutil.rmtree(p, ignore_errors=True)
+    else:
+        Path(p).unlink(missing_ok=True)
+    Path(item["info"]).unlink(missing_ok=True)
+
+
+def _ps(script, timeout=60):
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
+                       text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return r.stdout
+
+
+def _win_trash_items():
+    try:
+        out = _ps("$s=New-Object -ComObject Shell.Application; @($s.NameSpace(10).Items() | ForEach-Object { "
+                  "[pscustomobject]@{n=$_.Name; p=$_.Path; f=$_.ExtendedProperty('System.Recycle.DeletedFrom'); "
+                  "d=(Get-Item -LiteralPath $_.Path).LastWriteTime.ToString('s'); s=$_.Size; dir=$_.IsFolder } }) | "
+                  "ConvertTo-Json -Compress")
+        data = json.loads(out or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    items = []
+    for d in data:
+        try:
+            when = time.mktime(time.strptime(str(d.get("d", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
+        except ValueError:
+            when = 0
+        items.append({"key": d.get("p", ""), "name": d.get("n", "?"), "orig": os.path.join(d.get("f") or "", d.get("n", "")),
+                      "when": when, "size": int(d.get("s") or 0), "is_dir": bool(d.get("dir")), "info": ""})
+    items.sort(key=lambda i: -i["when"])
+    return items
+
+
+def _win_trash_call(what, item):
+    path = item["key"].replace("'", "''")
+    verb = "undelete" if what == "restore" else "delete"
+    if what == "delete":
+        _ps(f"Remove-Item -LiteralPath '{path}' -Recurse -Force; "
+            f"Remove-Item -LiteralPath ('{path}' -replace '\\\\\\$R([^\\\\]*)$','\\$I$1') -Force -ErrorAction SilentlyContinue")
+        return None
+    _ps(f"$s=New-Object -ComObject Shell.Application; $s.NameSpace(10).Items() | Where-Object {{ $_.Path -eq '{path}' }} | "
+        f"ForEach-Object {{ $_.InvokeVerb('{verb}') }}")
+    return item["orig"]
+
+
+class TrashView(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.win = win
+        self.set_border_width(10)
+        top = Gtk.Box(spacing=8)
+        self.title = Gtk.Label(xalign=0, hexpand=True)
+        top.pack_start(self.title, True, True, 0)
+        for label, cb, cls in (("↩ Restore", self.restore, "suggested-action"),
+                               ("Delete permanently", self.delete, None), ("Empty Trash", self.empty, "destructive-action")):
+            b = Gtk.Button(label=label)
+            if cls:
+                b.get_style_context().add_class(cls)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            top.add(b)
+        self.add(top)
+        self.hint = Gtk.Label(xalign=0)
+        self.hint.get_style_context().add_class("dim-label")
+        self.add(self.hint)
+        self.store = Gtk.ListStore(str, str, str, str, str, float, GObject.TYPE_INT64, int)   # icon name, cols, idx
+        self.tv = Gtk.TreeView(model=self.store)
+        self.tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        ic = Gtk.TreeViewColumn("", Gtk.CellRendererPixbuf(), icon_name=0)
+        self.tv.append_column(ic)
+        for i, (t, sort) in enumerate((("Name", 1), ("Was in", 2), ("Deleted", 5), ("Size", 6)), start=1):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
+            c = Gtk.TreeViewColumn(t, r, text=i if i < 4 else 4)
+            c.set_resizable(True)
+            c.set_expand(i in (1, 2))
+            c.set_sort_column_id(sort)
+            self.tv.append_column(c)
+        self.tv.connect("row-activated", lambda *_: self.restore())
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(self.tv)
+        self.pack_start(sw, True, True, 0)
+        self.items = []
+
+    def refresh(self):
+        def work():
+            items = trash_items()
+            GLib.idle_add(lambda: self._show(items) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show(self, items):
+        self.items = items
+        self.store.clear()
+        total = 0
+        for i, it in enumerate(items):
+            total += it["size"]
+            self.store.append(["folder" if it["is_dir"] else "text-x-generic", it["name"],
+                               short(os.path.dirname(it["orig"])), time.strftime("%d %b %Y, %H:%M",
+                                                                                 time.localtime(it["when"])),
+                               "—" if it["is_dir"] else human_size(it["size"]), it["when"], it["size"], i])
+        self.title.set_markup(f"<span size='x-large'><b>🗑 Trash</b></span>  <small>{len(items)} item"
+                              f"{'s' if len(items) != 1 else ''} · {human_size(total)}</small>")
+        self.hint.set_text("Select items and click Restore (or double-click) to put them back where they were." if items
+                           else "The Trash is empty.")
+        self.win.update_trash_count(len(items))
+
+    def _selected(self):
+        model, rows = self.tv.get_selection().get_selected_rows()
+        return [self.items[model[r][7]] for r in rows]
+
+    def restore(self):
+        sel = self._selected()
+        if not sel:
+            return self.win.flash_all("Select what to restore first")
+        back = []
+        for it in sel:
+            try:
+                back.append(trash_restore(it))
+            except (OSError, subprocess.SubprocessError) as ex:
+                self.win.error(f"Couldn't restore {it['name']}: {getattr(ex, 'strerror', None) or ex}")
+        self.refresh()
+        self.win.refresh_all()
+        if back:
+            self.win.flash_all(f"↩ Restored {len(back)} item{'s' if len(back) != 1 else ''}"
+                               + (f" to {short(os.path.dirname(back[0]))}" if back[0] else ""))
+
+    def delete(self):
+        sel = self._selected()
+        if sel and self.win.confirm(f"Delete {len(sel)} item{'s' if len(sel) != 1 else ''} permanently?\n\n"
+                                    "This can't be undone."):
+            for it in sel:
+                trash_delete(it)
+            self.refresh()
+
+    def empty(self):
+        if self.items and self.win.confirm(f"Empty the Trash ({len(self.items)} items)?\n\nThis can't be undone."):
+            if IS_WIN:
+                _ps("Clear-RecycleBin -Force -ErrorAction SilentlyContinue")
+            else:
+                for it in self.items:
+                    trash_delete(it)
+            self.refresh()
+
+
+# ---------- the crumple-and-throw animation
+def _paper_svg(t, angle, count, size):
+    """A sheet of paper crumpling into a ball (t: 0 = flat sheet … 1 = tight ball)."""
+    s = size
+    w = s * (0.72 - 0.30 * t)
+    h = s * (0.92 - 0.50 * t)
+    r = min(w, h) * (0.06 + 0.44 * t)
+    x, y = (s - w) / 2, (s - h) / 2
+    creases = ""
+    if t > 0.15:
+        import random as _r
+        rnd = _r.Random(7)
+        for _ in range(int(3 + 6 * t)):
+            x1, y1 = x + rnd.random() * w, y + rnd.random() * h
+            x2, y2 = x + rnd.random() * w, y + rnd.random() * h
+            creases += f'<path d="M{x1:.1f},{y1:.1f} L{x2:.1f},{y2:.1f}" stroke="#9aa3ad" stroke-width="1" opacity="{0.3 + 0.5 * t:.2f}"/>'
+    lines = "" if t > 0.4 else "".join(
+        f'<rect x="{x + w * 0.15:.1f}" y="{y + h * (0.2 + i * 0.14):.1f}" width="{w * 0.7:.1f}" height="{max(1, h * 0.04):.1f}" '
+        f'fill="#c9ced6" opacity="{1 - t * 2.5:.2f}"/>' for i in range(5))
+    badge = (f'<circle cx="{s * 0.78:.1f}" cy="{s * 0.22:.1f}" r="{s * 0.16:.1f}" fill="#ff7a1a" stroke="#fff" stroke-width="2"/>'
+             f'<text x="{s * 0.78:.1f}" y="{s * 0.28:.1f}" text-anchor="middle" font-size="{s * 0.18:.1f}" font-weight="800" '
+             f'fill="#fff" font-family="Segoe UI, Ubuntu, Arial, sans-serif">{count}</text>') if count > 1 else ""
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}"><g transform="rotate({angle:.1f} {s / 2} {s / 2})">'
+            f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{r:.1f}" fill="#f8f9fb" stroke="#aab2bd" '
+            f'stroke-width="1.5"/>{lines}{creases}</g>{badge}</svg>')
+
+
+def _svg_pixbuf(svg):
+    loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+    loader.write(svg.encode())
+    loader.close()
+    return loader.get_pixbuf()
+
+
+def fly_to_trash(win, start, count):
+    """The paper ball: crumple at the file (0.25 s), then an arc into the sidebar's Trash, which jumps (0.6 s)."""
+    target_row = getattr(win, "trash_row", None)
+    if target_row is None or not target_row.get_mapped():
+        return
+    tx, ty = target_row.translate_coordinates(win.overlay, 18, target_row.get_allocated_height() // 2) or (0, 0)
+    sx, sy = start
+    size = 60
+    img = Gtk.Image(halign=Gtk.Align.START, valign=Gtk.Align.START)
+    win.overlay.add_overlay(img)
+    win.overlay.set_overlay_pass_through(img, True)
+    img.show()
+    t0 = time.time()
+    crumple, fly = 0.25, 0.6
+    arc = max(30, min(140, min(sy, ty) - size))                     # stays inside the window
+
+    def frame():
+        t = time.time() - t0
+        if t < crumple:
+            k = t / crumple
+            pb = _svg_pixbuf(_paper_svg(k, k * 40, count, size))
+            x, y = sx, sy
+        elif t < crumple + fly:
+            k = (t - crumple) / fly
+            ease = k * k * (3 - 2 * k)
+            x = sx + (tx - sx) * ease
+            y = sy + (ty - sy) * ease - math.sin(math.pi * ease) * arc       # the arc
+            pb = _svg_pixbuf(_paper_svg(1, 40 + k * 540, count, int(size * (1 - 0.45 * k))))
+        else:
+            win.overlay.remove(img)
+            _bounce(target_row)
+            return False
+        img.set_from_pixbuf(pb)
+        img.set_margin_start(max(0, int(x - pb.get_width() / 2)))
+        img.set_margin_top(max(0, int(y - pb.get_height() / 2)))
+        return True
+    GLib.timeout_add(16, frame)
+
+
+def _bounce(row):
+    """The Trash jumps as the ball lands."""
+    box = row.get_child()
+    icon = box.get_children()[0] if box and box.get_children() else None
+    if icon is None:
+        return
+    steps = [-7, -10, -6, 0, -3, 0]
+
+    def step():
+        if not steps:
+            icon.set_margin_top(0)
+            icon.set_margin_bottom(0)
+            return False
+        d = steps.pop(0)
+        icon.set_margin_top(max(0, 0 + d) if d > 0 else 0)
+        icon.set_margin_bottom(-d if d < 0 else 0)
+        return True
+    GLib.timeout_add(45, step)
+
+
+# ---------------------------------------------------------------- ⚙ Settings: everything in one place
+SETTINGS_CATS = [("appearance", "🎨", "Appearance", "How Arckad-D looks"),
+                 ("files", "📁", "Files & folders", "Opening, tidying and cleaning up files"),
+                 ("search", "🔎", "Search & index", "Finding files by name and by what's inside them"),
+                 ("safety", "🛡", "Safety & history", "Versions, the vault, the Trash and journeys"),
+                 ("chat", "💬", "Chat, phone & sharing", "Team chat, your phone and sending files"),
+                 ("org", "🏢", "Organisation", "Your organisation and Arckad-D Pro"),
+                 ("system", "⚙", "Updates & system", "Updates, extras, shortcuts and version")]
+
+_SETTINGS_CSS = b"""
+.settings-card { background-color: alpha(currentColor, 0.05); border-radius: 12px; padding: 12px 14px; }
+.settings-nav row { padding: 7px 10px; border-radius: 8px; }
+"""
+
+
+def settings_entries(win):
+    """(category, title, description, kind, *spec): kind = switch (get, set) · choice (options, get, set) ·
+    button (label, action) · info."""
+    E = []
+    themes = [(k, f"{i}  {label}") for k, i, label in win.THEMES]
+    E += [("appearance", "Theme", "Colours of the whole app (Ctrl+Shift+D switches).", "choice", themes,
+           lambda: win.cfg.get("theme", "midnight"), lambda k: win.theme_items[k].set_active(True)),
+          ("appearance", "Title bar", "How many buttons the title bar shows.", "choice",
+           [("full", "Full"), ("compact", "Compact"), ("minimal", "Minimal (like Files)"),
+            ("autohide", "Minimal + auto-hide")],
+           lambda: win.cfg.get("titlebar", "full"), lambda k: win.set_titlebar_style(k)),
+          ("appearance", "Colourful file icons", "Coloured icons for each file type.", "switch",
+           lambda: win.icons_item.get_active(), lambda v: win.icons_item.set_active(v)),
+          ("appearance", "Show hidden files", "Files whose names start with a dot (Ctrl+H).", "switch",
+           lambda: win.hidden_item.get_active(), lambda v: win.hidden_item.set_active(v)),
+          ("appearance", "Animations", "The paper ball that flies into the Trash, and other small motions.", "switch",
+           lambda: win.cfg.get("animations", True),
+           lambda v: (win.cfg.__setitem__("animations", v), write_json(CONFIG_FILE, win.cfg))),
+          ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
+           "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
+          ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
+          ("appearance", "Default logo", "Go back to Arckad-D's own logo.", "button", "Use the default", win.reset_logo)]
+    E += [("files", "Default file manager", "Open folders from other apps (and browsers' “Show in folder”) here.",
+           "button", "Open…", win.default_fm_dialog),
+          ("files", "Download pop-ups", "A pop-up when a download finishes, to show it here.", "switch",
+           lambda: win.cfg.get("download_popups", True),
+           lambda v: (win.cfg.__setitem__("download_popups", v), write_json(CONFIG_FILE, win.cfg))),
+          ("files", "Folder rules", "Move, copy, tag or bin files automatically when they arrive or get old.",
+           "button", "Open…", lambda: (lambda d: (d.run(), d.destroy()))(RulesDialog(win))),
+          ("files", "Auto-sort Downloads", "Keep Downloads tidy by file type.", "button", "Open…", win.autosort_dialog),
+          ("files", "Organize this folder", "Sort the open folder's loose files into sub-folders.", "button",
+           "Organize…", lambda: win.organize(win.active)),
+          ("files", "Find duplicate files", "Identical files in the open folder and below.", "button", "Find…",
+           lambda: win.duplicates(win.active.location if is_folder_loc(win.active.location) else str(HOME))),
+          ("files", "Compare selected files", "Side by side, line by line.", "button", "Compare…", win.compare_selected),
+          ("files", "Disk usage map", "What's filling the open folder or drive.", "button", "Open…",
+           lambda: DiskUsageWindow(win, win.active.location if is_folder_loc(win.active.location) else str(HOME))),
+          ("files", "Batch rename", "Select several files and press F2 (or right-click → Rename these items).", "info")]
+    E += [("search", "Search index", "How often Arckad-D lists your files in the background.", "button", "Settings…",
+           win.index_settings),
+          ("search", "Update the index now", "List all files again right away.", "button", "Update", INDEX.rebuild),
+          ("search", "Search inside files", "Read documents now (PDF, Office, text) so “🔎 Inside files” finds them.",
+           "button", "Read now", lambda: (CONTENT.update_async(), win.flash_all("Reading documents in the background…")))]
+    if not IS_WIN:
+        E += [("search", "Ubuntu search (Tracker)", "Keep Ubuntu's own indexer from filling the disk.", "button",
+               "Open…", win.tracker_dialog)]
+    E += [("safety", "Version history", "Keep earlier versions of files in folders you choose.", "button", "Open…",
+           win.version_settings),
+          ("safety", "Private vault", "An encrypted folder for sensitive files.", "button", "Open the vault",
+           lambda: win.vault_ui.open()),
+          ("safety", "Vault password", "Change the private vault's password.", "button", "Change…", win.vault_password),
+          ("safety", "Trash", "See and restore deleted files.", "button", "Open the Trash",
+           lambda: (win.lib_stack.set_visible_child_name("trash"), win.trash_view.refresh())),
+          ("safety", "Journey map", "Right-click any file or folder → 🗺 Journey map: where it has been.", "info"),
+          ("safety", "Freeze report", "If Arckad-D ever stops responding: what it was doing.", "button", "Open…",
+           win.freeze_report)]
+    E += [("chat", "Keep running in the tray", "Closing the window keeps chat and transfers going.", "switch",
+           lambda: win.tray_item.get_active(), lambda v: win.tray_item.set_active(v)),
+          ("chat", "Start when I log in", "Arckad-D starts in the tray when you log in.", "switch",
+           lambda: win.login_item.get_active(), lambda v: win.login_item.set_active(v)),
+          ("chat", "Chat profile", "Your name, photo and work card.", "button", "Edit…",
+           lambda: win.chat_panel.edit_profile()),
+          ("chat", "Chat in its own window", "Team chat as a separate window.", "button", "Open", win.open_chat_window),
+          ("chat", "Phone", "Your linked phone's notifications, messages, calls, files and screen.", "button", "Open",
+           lambda: win.show_right("phone")),
+          ("chat", "Music player", "The music bar at the bottom of the window.", "button", "On / off", win.music_toggle),
+          ("chat", "Send files", "To nearby PCs and phones.", "button", "Send…",
+           lambda: win.open_share(win.active.selected_paths() or None, "nearby")),
+          ("chat", "Receive files", "From nearby PCs and phones.", "button", "Receive…",
+           lambda: win.open_share(None, "receive"))]
+    E += [("org", "Organisation", "Organisations this PC trusts (their admin can add you directly).", "button",
+           "Open…", win.org_dialog),
+          ("org", "Arckad-D Pro", "The organisation admin panel (needs activation).", "button", "Open…", win.open_pro)]
+    E += [("system", "Check for updates", f"You have Arckad-D {APP_VERSION}.", "button", "Check now",
+           lambda: win.check_updates(manual=True))]
+    if not IS_WIN:
+        E += [("system", "Optional features", "Extras for music, video thumbnails, PDFs, archives…", "button",
+               "Install…", win.features_dialog)]
+    E += [("system", "Keyboard shortcuts", "Every shortcut on one page.", "button", "Show",
+           lambda: win.info(SHORTCUTS, mono=True)),
+          ("system", "About Arckad-D", "Version, credits and licence.", "button", "About", win.show_about)]
+    return E
+
+
+class SettingsWindow(Gtk.Window):
+    def __init__(self, win):
+        super().__init__(title="Settings")
+        self.win = win
+        self.set_transient_for(win)
+        self.set_default_size(980, 640)
+        if not getattr(SettingsWindow, "_css", None):
+            SettingsWindow._css = Gtk.CssProvider()
+            SettingsWindow._css.load_from_data(_SETTINGS_CSS)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), SettingsWindow._css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 8)
+        self.entries = settings_entries(win)
+        paned = Gtk.Box()
+        self.add(paned)
+        nav = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        nav.set_size_request(240, -1)
+        head = Gtk.Label(xalign=0)
+        head.set_markup(f"<span size='large'><b>⚙ Settings</b></span>  <small>{esc(APP_NAME)} {APP_VERSION}</small>")
+        nav.add(head)
+        self.search = Gtk.SearchEntry(placeholder_text="Search settings")
+        self.search.connect("search-changed", lambda *_: self.filter())
+        nav.add(self.search)
+        self.cats = Gtk.ListBox()
+        self.cats.get_style_context().add_class("settings-nav")
+        for key, icon, name, _desc in SETTINGS_CATS:
+            row = Gtk.ListBoxRow()
+            row.key = key
+            row.add(Gtk.Label(label=f"{icon}   {name}", xalign=0))
+            self.cats.add(row)
+        self.cats.connect("row-selected", lambda _l, r: r and (self.search.set_text(""), self.show(r.key)))
+        nav.add(self.cats)
+        paned.pack_start(nav, False, False, 0)
+        paned.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, hexpand=True)
+        for key, icon, name, desc in SETTINGS_CATS:
+            self.stack.add_named(self._page(f"{icon} {name}", desc, [e for e in self.entries if e[0] == key]), key)
+        self.results = Gtk.Box()
+        self.stack.add_named(self.results, "search")
+        paned.pack_start(self.stack, True, True, 0)
+        self.connect("key-press-event", lambda _w, ev: (self.search.grab_focus(), False)[1]
+                     if Gdk.keyval_to_unicode(ev.keyval) and not self.search.has_focus() and
+                     chr(Gdk.keyval_to_unicode(ev.keyval)).isprintable() else False)
+        self.show_all()
+        self.cats.select_row(self.cats.get_row_at_index(0))
+
+    def _page(self, title, desc, entries, show_cat=False):
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=20)
+        sw.add(box)
+        h = Gtk.Label(xalign=0)
+        h.set_markup(f"<span size='x-large'><b>{esc(title)}</b></span>\n<span alpha='70%'>{esc(desc)}</span>")
+        box.add(h)
+        for e in entries:
+            box.add(self._card(e, show_cat))
+        if not entries:
+            box.add(Gtk.Label(label="Nothing matches.", xalign=0))
+        sw.show_all()
+        return sw
+
+    def _card(self, e, show_cat=False):
+        cat, title, desc, kind = e[:4]
+        card = Gtk.Box(spacing=12)
+        card.get_style_context().add_class("settings-card")
+        lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        catname = next((n for k, _i, n, _d in SETTINGS_CATS if k == cat), "")
+        lbl.set_markup(f"<b>{esc(title)}</b>" + (f"  <small>· {esc(catname)}</small>" if show_cat else "") +
+                       f"\n<small><span alpha='75%'>{esc(desc)}</span></small>")
+        card.pack_start(lbl, True, True, 0)
+        try:
+            if kind == "switch":
+                sw = Gtk.Switch(valign=Gtk.Align.CENTER)
+                sw.set_active(bool(e[4]()))
+                sw.connect("notify::active", lambda s, _p, setter=e[5]: setter(s.get_active()))
+                card.add(sw)
+            elif kind == "choice":
+                c = Gtk.ComboBoxText(valign=Gtk.Align.CENTER)
+                for k, label in e[4]:
+                    c.append(k, label)
+                c.set_active_id(e[5]())
+                c.connect("changed", lambda cb, setter=e[6]: cb.get_active_id() and setter(cb.get_active_id()))
+                card.add(c)
+            elif kind == "button":
+                b = Gtk.Button(label=e[4], valign=Gtk.Align.CENTER)
+                b.connect("clicked", lambda _b, act=e[5]: act())
+                card.add(b)
+        except Exception:
+            pass
+        return card
+
+    def show(self, key):
+        self.stack.set_visible_child_name(key)
+
+    def filter(self):
+        q = self.search.get_text().strip().lower()
+        if not q:
+            row = self.cats.get_selected_row()
+            self.show(row.key if row else "appearance")
+            return
+        words = q.split()
+        hits = [e for e in self.entries if all(w in (e[1] + " " + e[2]).lower() for w in words)]
+        old = self.stack.get_child_by_name("search")
+        if old:
+            self.stack.remove(old)
+        page = self._page(f"Search: {self.search.get_text()}", f"{len(hits)} matching setting"
+                          f"{'s' if len(hits) != 1 else ''}", hits, show_cat=True)
+        self.stack.add_named(page, "search")
+        self.stack.set_visible_child_name("search")
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -21081,6 +21597,7 @@ class MainWindow(Gtk.ApplicationWindow):
         tb_item.set_submenu(tb_menu)
         tb_menu.show_all()
         hb.pack_end(self._menu_button(None, "open-menu-symbolic", [
+            ("⚙ Settings… (Ctrl+,)", self.open_settings), None,
             tb_item, None,
             self.hidden_item, self.icons_item, None, self.tray_item, self.login_item, None,
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
@@ -21275,6 +21792,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.lib_stack.add_named(self.dual_paned, "files")          # your folders, or the Library
         self.library = LibraryView(self)
         self.lib_stack.add_named(self.library, "library")
+        self.trash_view = TrashView(self)
+        self.lib_stack.add_named(self.trash_view, "trash")
         self.content_paned.pack1(self.lib_stack, True, True)     # both sides may get narrow: the window never
         self.content_paned.pack2(self.right_box, False, True)     # grows past the screen when a panel opens
         content.pack_start(self.content_paned, True, True, 0)
@@ -21766,6 +22285,9 @@ class MainWindow(Gtk.ApplicationWindow):
             if path and os.path.isdir(path) and Path(path) != HOME:
                 self._side_row(Path(path).name, icon, path)
         self._side_row("Private vault", "channel-secure-symbolic", "vault:")
+        self.trash_row = self._side_row("Trash", "user-trash-symbolic", "trash:")
+        GLib.idle_add(lambda: threading.Thread(target=lambda: GLib.idle_add(
+            lambda n=len(trash_items()): self.update_trash_count(n) or False), daemon=True).start() or False)
         self._side_header("Library")
         lib_icons = {"pictures": "image-x-generic-symbolic", "movies": "video-x-generic-symbolic",
                      "music": "audio-x-generic-symbolic", "documents": "x-office-document-symbolic",
@@ -21929,6 +22451,42 @@ class MainWindow(Gtk.ApplicationWindow):
                 label = f"Drive {path[:2]}"
         return label, text
 
+    def open_settings(self):
+        """Every setting and tool in one window."""
+        w = getattr(self, "_settings_win", None)
+        if w is not None and w.get_visible():
+            w.present()
+            return
+        self._settings_win = SettingsWindow(self)
+        self._settings_win.connect("destroy", lambda *_: setattr(self, "_settings_win", None))
+
+    def update_trash_count(self, n):
+        row = getattr(self, "trash_row", None)
+        if row is None:
+            return
+        try:
+            label = row.get_child().get_children()[1].get_children()[0]
+            label.set_text(f"Trash ({n})" if n else "Trash")
+        except (IndexError, AttributeError):
+            pass
+
+    def _trash_start_point(self, pane):
+        """Where the deleted file is on screen (for the paper-ball animation), in the window's overlay."""
+        try:
+            if pane.view_mode == "grid":
+                items = pane.icons.get_selected_items()
+                ok, rect = pane.icons.get_cell_rect(items[0], None)
+                x, y = pane.icons.translate_coordinates(self.overlay, rect.x + rect.width // 2, rect.y + rect.height // 2)
+            else:
+                _m, rows = pane.tree.get_selection().get_selected_rows()
+                rect = pane.tree.get_cell_area(rows[0], pane.tree.get_column(0))
+                bx, by = pane.tree.convert_bin_window_to_widget_coords(rect.x + 60, rect.y + rect.height // 2)
+                x, y = pane.tree.translate_coordinates(self.overlay, bx, by)
+            return x, y
+        except Exception:
+            a = pane.get_allocation()
+            return pane.translate_coordinates(self.overlay, a.width // 2, a.height // 3) or (200, 200)
+
     def show_library(self, section):
         self.lib_stack.set_visible_child_name("library")
         self.library.show(section)
@@ -21950,6 +22508,10 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         if key == "vault:":
             self.vault_ui.open()
+            return
+        if key == "trash:":
+            self.lib_stack.set_visible_child_name("trash")
+            self.trash_view.refresh()
             return
         self.show_files()
         volume = getattr(row, "volume", None)
@@ -22894,6 +23456,8 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.refresh()
 
     def trash(self, pane, paths):
+        if paths and self.cfg.get("animations", True) and Gtk.Settings.get_default().get_property("gtk-enable-animations"):
+            fly_to_trash(self, self._trash_start_point(pane), len(paths))     # crumple, fly into the Trash
         done = 0
         for p in paths:
             try:
@@ -22904,7 +23468,9 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.error(f"Couldn't move {os.path.basename(p)} to Trash: {ex.message}")
                 break
         pane.refresh()
-        pane.flash(f"Moved {done} item{'s' if done != 1 else ''} to Trash (restore from Trash in the Files app)")
+        pane.flash(f"🗑 Moved {done} item{'s' if done != 1 else ''} to the Trash (restore it from Trash in the sidebar)")
+        threading.Thread(target=lambda: GLib.idle_add(lambda n=len(trash_items()): self.update_trash_count(n) or False),
+                         daemon=True).start()
 
     def new_file(self, pane):
         if pane.mode != "folder":
@@ -24558,6 +25124,9 @@ class MainWindow(Gtk.ApplicationWindow):
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
         shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
         typing = isinstance((getattr(self, "_key_window", None) or self).get_focus(), (Gtk.Entry, Gtk.TextView))
+        if (event.state & Gdk.ModifierType.CONTROL_MASK) and Gdk.keyval_name(event.keyval) == "comma":
+            self.open_settings()                                # Ctrl+,  all settings in one place
+            return True
         pane = self.active
         if ctrl and low == "t":
             self.new_tab()
