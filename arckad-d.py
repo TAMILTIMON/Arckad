@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.48.0"
+APP_VERSION = "3.49.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2758,6 +2758,314 @@ class ContentIndex:
 CONTENT = ContentIndex()
 
 
+# ---------------------------------------------------------------- 🕘 Version history (folders you choose)
+# Every saved version of the files in protected folders is kept (identical content stored once; rapid autosaves
+# thinned to one version per 5 minutes). Changes are noticed live (a few seconds after saving) and by a check every
+# 5 minutes (which also catches changes made while Arckad-D was closed). Restore, save a copy, or bring back files
+# deleted from a protected folder.
+VERSIONS_DIR = Path(GLib.get_user_data_dir()) / APP_SLUG / "versions"
+_V_SKIP_EXT = {"tmp", "temp", "part", "crdownload", "download", "partial", "swp", "lock", "lck", "bak~"}
+
+
+def _v_skip(path):
+    name = os.path.basename(path)
+    return (name.startswith((".", "~$", ".~lock")) or name.endswith("~") or ext_of(name) in _V_SKIP_EXT
+            or any(part in SKIP_DIRS for part in Path(path).parts))
+
+
+class VersionKeeper:
+    THIN = 300                                          # at most one version per 5 minutes per file
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.con = None
+        self.mons = {}
+        self.pending = set()
+        self.timer = None
+        self.running = False
+
+    # ---------- settings and storage
+    def settings(self):
+        s = read_json(VERSIONS_DIR / "settings.json", {}) if (VERSIONS_DIR / "settings.json").exists() else {}
+        s.setdefault("folders", [])
+        s.setdefault("days", 90)
+        s.setdefault("max_gb", 10)
+        s.setdefault("max_file_mb", 500)
+        return s
+
+    def save_settings(self, s):
+        VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        write_json(VERSIONS_DIR / "settings.json", s)
+
+    def _db(self):
+        if self.con is None:
+            (VERSIONS_DIR / "blobs").mkdir(parents=True, exist_ok=True)
+            self.con = sqlite3.connect(str(VERSIONS_DIR / "versions.db"), check_same_thread=False, timeout=10)
+            self.con.execute("PRAGMA journal_mode=WAL")
+            self.con.executescript("""
+                CREATE TABLE IF NOT EXISTS versions (id INTEGER PRIMARY KEY, path TEXT, ts REAL, mtime REAL,
+                    size INTEGER, hash TEXT, deleted INTEGER DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS v_path ON versions(path, ts);
+                CREATE INDEX IF NOT EXISTS v_hash ON versions(hash);""")
+        return self.con
+
+    def _blob(self, h):
+        return VERSIONS_DIR / "blobs" / h[:2] / h
+
+    def protected(self, path):
+        p = os.path.abspath(str(path))
+        return any(p == f or p.startswith(f + os.sep) for f in self.settings()["folders"])
+
+    def protect(self, folder, on=True):
+        s = self.settings()
+        folder = os.path.abspath(folder)
+        if on and folder not in s["folders"]:
+            s["folders"].append(folder)
+        elif not on and folder in s["folders"]:
+            s["folders"].remove(folder)
+        self.save_settings(s)
+        if on:
+            threading.Thread(target=self.scan_folder, args=(folder,), daemon=True).start()   # the first copies
+            GLib.idle_add(lambda: self._watch_tree(folder) or False)
+        else:
+            for d in [d for d in self.mons if d == folder or d.startswith(folder + os.sep)]:
+                self.mons.pop(d).cancel()
+
+    # ---------- keeping versions
+    def snapshot(self, path, thin=True):
+        """Keep the file's current content as a version (if it changed). Returns True when one was added.
+        thin=False always adds a new version (restores: the version being replaced must never be overwritten)."""
+        path = os.path.abspath(str(path))
+        if _v_skip(path) or not os.path.isfile(path) or os.path.islink(path):
+            return False
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        if st.st_size > self.settings()["max_file_mb"] * 1024 * 1024:
+            return False
+        with self.lock:
+            last = self._db().execute("SELECT id, ts, mtime, size, hash, deleted FROM versions WHERE path=? "
+                                      "ORDER BY ts DESC, id DESC LIMIT 1", (path,)).fetchone()
+            if last and not last[5] and last[2] == st.st_mtime and last[3] == st.st_size:
+                return False                                # nothing changed
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError:
+            return False
+        h = h.hexdigest()
+        with self.lock:
+            if last and not last[5] and last[4] == h:       # same content (only the date changed)
+                self._db().execute("UPDATE versions SET mtime=? WHERE id=?", (st.st_mtime, last[0]))
+                self._db().commit()
+                return False
+            blob = self._blob(h)
+            if not blob.exists():
+                blob.parent.mkdir(parents=True, exist_ok=True)
+                tmp = blob.with_name(blob.name + ".tmp")
+                try:
+                    shutil.copyfile(path, tmp)
+                    os.replace(tmp, blob)
+                except OSError:
+                    tmp.unlink(missing_ok=True)
+                    return False
+            now = time.time()
+            prev = self._db().execute("SELECT id, ts FROM versions WHERE path=? AND deleted=0 ORDER BY ts DESC LIMIT 2",
+                                      (path,)).fetchall()
+            if thin and len(prev) == 2 and now - prev[1][1] < self.THIN and now - prev[0][1] < self.THIN:
+                # rapid saves: replace the newest one instead of piling up autosaves
+                self._db().execute("UPDATE versions SET ts=?, mtime=?, size=?, hash=? WHERE id=?",
+                                   (now, st.st_mtime, st.st_size, h, prev[0][0]))
+            else:
+                self._db().execute("INSERT INTO versions (path, ts, mtime, size, hash) VALUES (?,?,?,?,?)",
+                                   (path, now, st.st_mtime, st.st_size, h))
+            self._db().commit()
+        return True
+
+    def scan_folder(self, folder):
+        """Keep versions of changed files, and note files that were deleted (they can be brought back)."""
+        added = 0
+        seen = set()
+        for p, st, is_dir in walk_entries(Path(folder), False):
+            if is_dir:
+                continue
+            seen.add(str(p))
+            if self.snapshot(p):
+                added += 1
+        with self.lock:
+            live = [r[0] for r in self._db().execute(
+                "SELECT path FROM versions v WHERE path LIKE ? ESCAPE '\\' AND deleted=0 AND id=(SELECT MAX(id) FROM "
+                "versions WHERE path=v.path)", (like_escape(folder.rstrip(os.sep)) + like_escape(os.sep) + "%",))]
+            for p in live:
+                if p not in seen and not os.path.exists(p):
+                    self._db().execute("INSERT INTO versions (path, ts, mtime, size, hash, deleted) SELECT path, ?, "
+                                       "mtime, size, hash, 1 FROM versions WHERE path=? ORDER BY id DESC LIMIT 1",
+                                       (time.time(), p))
+            self._db().commit()
+        return added
+
+    def scan_all(self):
+        for f in self.settings()["folders"]:
+            if os.path.isdir(f):
+                self.scan_folder(f)
+        self.cleanup()
+
+    # ---------- live: a few seconds after a file is saved
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        for f in self.settings()["folders"]:
+            self._watch_tree(f)
+        threading.Thread(target=self.scan_all, daemon=True).start()     # catches changes made while closed
+        GLib.timeout_add_seconds(300, lambda: threading.Thread(target=self.scan_all, daemon=True).start() or True)
+
+    def _watch_tree(self, folder):
+        if not os.path.isdir(folder):
+            return
+        for root, dirs, _files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS]
+            if len(self.mons) >= 3000:
+                return
+            if root in self.mons:
+                continue
+            try:
+                m = Gio.File.new_for_path(root).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+                m.connect("changed", self._changed)
+                self.mons[root] = m
+            except GLib.Error:
+                pass
+
+    def _changed(self, _m, f, other, ev):
+        E = Gio.FileMonitorEvent
+        for g in (f, other):
+            p = g.get_path() if g else None
+            if not p:
+                continue
+            if ev == E.CREATED and os.path.isdir(p):
+                self._watch_tree(p)
+            elif ev in (E.CHANGES_DONE_HINT, E.CREATED, E.MOVED_IN, E.RENAMED, E.DELETED, E.MOVED_OUT):
+                self.pending.add(os.path.dirname(p) if ev in (E.DELETED, E.MOVED_OUT) else p)
+        if self.pending and not self.timer:
+            self.timer = GLib.timeout_add_seconds(4, self._flush)
+
+    def _flush(self):
+        self.timer = None
+        items, self.pending = self.pending, set()
+
+        def work():
+            for p in items:
+                if os.path.isfile(p):
+                    self.snapshot(p)
+                elif os.path.isdir(p) or not os.path.exists(p):
+                    folder = p if os.path.isdir(p) else os.path.dirname(p)
+                    with self.lock:                          # files that were deleted here
+                        rows = self._db().execute(
+                            "SELECT DISTINCT path FROM versions WHERE path LIKE ? ESCAPE '\\'",
+                            (like_escape(folder.rstrip(os.sep)) + like_escape(os.sep) + "%",)).fetchall()
+                    for (q,) in rows:
+                        if os.path.dirname(q) == folder and not os.path.exists(q) and not self.is_deleted(q):
+                            with self.lock:
+                                self._db().execute("INSERT INTO versions (path, ts, mtime, size, hash, deleted) SELECT "
+                                                   "path, ?, mtime, size, hash, 1 FROM versions WHERE path=? ORDER BY "
+                                                   "id DESC LIMIT 1", (time.time(), q))
+                                self._db().commit()
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    # ---------- reading, restoring
+    def versions(self, path):
+        """[(id, ts, size, hash, deleted)] newest first."""
+        with self.lock:
+            return self._db().execute("SELECT id, ts, size, hash, deleted FROM versions WHERE path=? ORDER BY ts DESC, "
+                                      "id DESC", (os.path.abspath(str(path)),)).fetchall()
+
+    def count(self, path):
+        return sum(1 for v in self.versions(path) if not v[4])
+
+    def is_deleted(self, path):
+        v = self.versions(path)
+        return bool(v and v[0][4])
+
+    def deleted_in(self, folder):
+        """Files deleted from a protected folder (and its subfolders) that can be brought back."""
+        with self.lock:
+            rows = self._db().execute(
+                "SELECT path, ts, size, hash FROM versions v WHERE path LIKE ? ESCAPE '\\' AND deleted=1 AND "
+                "id=(SELECT MAX(id) FROM versions WHERE path=v.path) ORDER BY ts DESC",
+                (like_escape(folder.rstrip(os.sep)) + like_escape(os.sep) + "%",)).fetchall()
+        return [r for r in rows if not os.path.exists(r[0])]
+
+    def blob_of(self, vid):
+        with self.lock:
+            r = self._db().execute("SELECT hash FROM versions WHERE id=?", (vid,)).fetchone()
+        return self._blob(r[0]) if r else None
+
+    def restore(self, path, vid):
+        """Put a version back. The current content is kept as a version first, so a restore can be undone."""
+        path = os.path.abspath(str(path))
+        blob = self.blob_of(vid)
+        if not blob or not blob.exists():
+            raise OSError("that version's copy is missing")
+        if os.path.exists(path):
+            self.snapshot(path, thin=False)              # the current content is kept first
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".arckad-restore"
+        shutil.copyfile(blob, tmp)
+        os.replace(tmp, path)
+        self.snapshot(path, thin=False)
+
+    def storage(self):
+        total = 0
+        for root, _d, files in os.walk(VERSIONS_DIR / "blobs"):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+        return total
+
+    def cleanup(self):
+        """Keep versions for the chosen number of days and under the storage limit (oldest go first). The newest
+        version of every file is always kept."""
+        s = self.settings()
+        cutoff = time.time() - s["days"] * 86400
+        with self.lock:
+            db = self._db()
+            newest = {r[0] for r in db.execute("SELECT MAX(id) FROM versions GROUP BY path")}
+            old = [r[0] for r in db.execute("SELECT id FROM versions WHERE ts < ?", (cutoff,)) if r[0] not in newest]
+            for i in old:
+                db.execute("DELETE FROM versions WHERE id=?", (i,))
+            db.commit()
+            limit = s["max_gb"] * 1024 ** 3
+            used = self.storage()
+            if used > limit:
+                for vid, h, size in db.execute("SELECT id, hash, size FROM versions ORDER BY ts").fetchall():
+                    if used <= limit:
+                        break
+                    if vid in newest:
+                        continue
+                    db.execute("DELETE FROM versions WHERE id=?", (vid,))
+                    if not db.execute("SELECT 1 FROM versions WHERE hash=?", (h,)).fetchone():
+                        used -= size or 0
+                        self._blob(h).unlink(missing_ok=True)
+                db.commit()
+            used_hashes = {r[0] for r in db.execute("SELECT DISTINCT hash FROM versions")}
+        for root, _d, files in os.walk(VERSIONS_DIR / "blobs"):        # copies nothing refers to any more
+            for f in files:
+                if f not in used_hashes and not f.endswith(".tmp"):
+                    try:
+                        os.remove(os.path.join(root, f))
+                    except OSError:
+                        pass
+
+
+VERSIONS = VersionKeeper()
+
+
 # ---------------------------------------------------------------- one browsing pane (= one tab)
 def make_row(path, is_dir, size, mtime):
     path = str(path)
@@ -3890,6 +4198,15 @@ class FilePane(Gtk.Box):
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
             if len(paths) == 1:
                 add("🗺 Journey map (where it has been)", lambda: JourneyWindow(win, paths[0]))
+                one = paths[0]
+                if os.path.isdir(one):
+                    if VERSIONS.protected(one):
+                        add("🕘 Deleted files (from this folder)…", lambda: win.deleted_files(one))
+                        add("🕘 Stop keeping version history here", lambda: win.version_protect(one, False))
+                    else:
+                        add("🕘 Keep version history for this folder", lambda: win.version_protect(one, True))
+                elif VERSIONS.protected(one) or VERSIONS.count(one):
+                    add(f"🕘 Versions… ({VERSIONS.count(one)})", lambda: win.versions_window(one))
             add("Properties (Alt+Enter)", lambda: win.properties(paths))
             menu.append(Gtk.SeparatorMenuItem())
             add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
@@ -3905,6 +4222,10 @@ class FilePane(Gtk.Box):
                 item.set_sensitive(in_folder)
                 menu.append(item)
             add("🗺 Journey map of this folder", lambda: JourneyWindow(win, self.location), in_folder)
+            if in_folder and VERSIONS.protected(self.location):
+                add("🕘 Deleted files (from this folder)…", lambda: win.deleted_files(self.location))
+            elif in_folder:
+                add("🕘 Keep version history for this folder", lambda: win.version_protect(self.location, True))
             add("Properties of this folder", lambda: win.properties([self.location]), in_folder)
             menu.append(Gtk.SeparatorMenuItem())
             add("Organize this folder…", lambda: win.organize(self), in_folder)
@@ -19364,6 +19685,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.start_freeze_watch()
         GLib.idle_add(self._default_fm_start)
         GLib.timeout_add_seconds(6, self._start_journey_watch)
+        GLib.timeout_add_seconds(8, lambda: VERSIONS.start() or False)
         GLib.timeout_add_seconds(90, lambda: (INDEX.available() and not CONTENT.count() and CONTENT.update_async())
                                  and False)
         self.connect("configure-event", lambda *_: GLib.idle_add(self._check_compact) and False)
@@ -19724,6 +20046,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Auto-sort Downloads…", self.autosort_dialog),
             ("Update search index now", INDEX.rebuild),
             ("Search index settings…", self.index_settings),
+            ("🕘 Version history…", self.version_settings),
             ("Freeze report…", self.freeze_report)]
         self._tools_btn = self._menu_button("Tools", None, [
             ("Organize this folder…", lambda: self.organize(self.active)),
@@ -19737,6 +20060,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Update search index now", INDEX.rebuild),
             ("🎵 Music player (on / off)", self.music_toggle),
         ] + ([("Install optional features…", self.features_dialog)] if not IS_WIN else []) + [
+            ("🕘 Version history…", self.version_settings),
             ("Search index settings…", self.index_settings),
             ("Freeze report…", self.freeze_report),
         ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else []))
@@ -23347,6 +23671,201 @@ class MainWindow(Gtk.ApplicationWindow):
         d.connect("response", respond)
         d.show_all()
         return False
+
+    # ---------- 🕘 version history
+    def version_protect(self, folder, on):
+        if on and not self.confirm(f"Keep version history for “{os.path.basename(folder) or folder}”?\n\nEvery saved "
+                                   f"version of the files in this folder (and its subfolders) will be kept, so you can "
+                                   f"restore earlier versions and bring back deleted files.\n\nVersions are kept for "
+                                   f"{VERSIONS.settings()['days']} days, within {VERSIONS.settings()['max_gb']} GB "
+                                   f"(Tools → 🕘 Version history…)."):
+            return
+        VERSIONS.protect(folder, on)
+        self.flash_all(f"🕘 Keeping version history for {short(folder)}" if on else
+                       f"Stopped keeping version history for {short(folder)} (the versions already kept stay)")
+
+    def versions_window(self, path):
+        d = Gtk.Dialog(title=f"Versions · {os.path.basename(path)}", transient_for=self, modal=False)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(620, 460)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        head = Gtk.Label(xalign=0, wrap=True)
+        box.add(head)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        box.pack_start(sw, True, True, 0)
+
+        def fill():
+            for c in lst.get_children():
+                lst.remove(c)
+            vs = [v for v in VERSIONS.versions(path) if not v[4]]
+            head.set_markup(f"<b>🕘 {esc(os.path.basename(path))}</b>  <small>{len(vs)} version"
+                            f"{'s' if len(vs) != 1 else ''} · {esc(short(os.path.dirname(path)))}</small>")
+            cur_hash = vs[0][3] if vs and os.path.exists(path) else None
+            for i, (vid, ts, size, h, _dl) in enumerate(vs):
+                row = Gtk.Box(spacing=8, margin=5)
+                lbl = Gtk.Label(xalign=0, hexpand=True)
+                now = i == 0 and h == cur_hash
+                lbl.set_markup(f"<b>{esc(time.strftime('%a %d %b %Y, %H:%M', time.localtime(ts)))}</b>"
+                               f"{'  · <i>now</i>' if now else ''}\n<small>{human_size(size or 0)}</small>")
+                row.pack_start(lbl, True, True, 0)
+                for label, cb in (("Open", lambda vid=vid, ts=ts: self._open_version(path, vid, ts)),
+                                  ("Save a copy…", lambda vid=vid, ts=ts: self._save_version(path, vid, ts))) + \
+                        ((("Restore", lambda vid=vid, ts=ts: restore(vid, ts)),) if not now else ()):
+                    b = Gtk.Button(label=label)
+                    b.connect("clicked", lambda _b, cb=cb: cb())
+                    row.add(b)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            lst.show_all()
+
+        def restore(vid, ts):
+            if self.confirm(f"Restore the version from {time.strftime('%d %b %Y, %H:%M', time.localtime(ts))}?\n\n"
+                            f"The current version is kept too, so you can switch back."):
+                try:
+                    VERSIONS.restore(path, vid)
+                    self.flash_all(f"🕘 Restored {os.path.basename(path)}")
+                except OSError as ex:
+                    self.error(f"Couldn't restore: {ex}")
+                fill()
+        fill()
+        d.connect("response", lambda dlg, _r: dlg.destroy())
+        d.show_all()
+
+    def _version_name(self, path, ts):
+        base, ext = os.path.splitext(os.path.basename(path))
+        return f"{base} (version {time.strftime('%Y-%m-%d %H.%M', time.localtime(ts))}){ext}"
+
+    def _open_version(self, path, vid, ts):
+        """Look at an old version without changing anything (a temporary copy is opened)."""
+        blob = VERSIONS.blob_of(vid)
+        tmp = Path(tempfile.gettempdir()) / "arckad-d-versions"
+        tmp.mkdir(exist_ok=True)
+        dest = tmp / self._version_name(path, ts)
+        shutil.copyfile(blob, dest)
+        self.open_file(str(dest))
+
+    def _save_version(self, path, vid, ts):
+        fc = Gtk.FileChooserNative(title="Save this version as", transient_for=self, action=Gtk.FileChooserAction.SAVE)
+        fc.set_current_folder(os.path.dirname(path))
+        fc.set_current_name(self._version_name(path, ts))
+        fc.set_do_overwrite_confirmation(True)
+        if fc.run() == Gtk.ResponseType.ACCEPT:
+            shutil.copyfile(VERSIONS.blob_of(vid), fc.get_filename())
+            self.flash_all(f"Saved {os.path.basename(fc.get_filename())}")
+        fc.destroy()
+
+    def deleted_files(self, folder):
+        d = Gtk.Dialog(title=f"Deleted files · {os.path.basename(folder) or folder}", transient_for=self, modal=False)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(640, 460)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        head = Gtk.Label(xalign=0, wrap=True)
+        box.add(head)
+        box.pack_start(sw, True, True, 0)
+
+        def fill():
+            for c in lst.get_children():
+                lst.remove(c)
+            gone = VERSIONS.deleted_in(folder)
+            head.set_markup(f"<b>🕘 Deleted from {esc(short(folder))}</b>  <small>{len(gone)} file"
+                            f"{'s' if len(gone) != 1 else ''} that can be brought back</small>")
+            for p, ts, size, _h in gone:
+                row = Gtk.Box(spacing=8, margin=5)
+                lbl = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+                lbl.set_markup(f"<b>{esc(os.path.relpath(p, folder))}</b>\n<small>deleted "
+                               f"{esc(time.strftime('%d %b %Y, %H:%M', time.localtime(ts)))} · {human_size(size or 0)}</small>")
+                row.pack_start(lbl, True, True, 0)
+                b = Gtk.Button(label="Restore")
+                b.connect("clicked", lambda _b, p=p: bring_back(p))
+                row.add(b)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            if not gone:
+                lst.add(Gtk.Label(label="Nothing has been deleted from this folder since it's been protected.", margin=20))
+            lst.show_all()
+
+        def bring_back(p):
+            last = next((v for v in VERSIONS.versions(p) if not v[4]), None)
+            if last:
+                try:
+                    VERSIONS.restore(p, last[0])
+                    self.flash_all(f"🕘 Brought back {os.path.basename(p)}")
+                    self.show_from_tray(folder=os.path.dirname(p), select=p)
+                except OSError as ex:
+                    self.error(f"Couldn't bring it back: {ex}")
+            fill()
+        fill()
+        d.connect("response", lambda dlg, _r: dlg.destroy())
+        d.show_all()
+
+    def version_settings(self):
+        s = VERSIONS.settings()
+        d = Gtk.Dialog(title="Version history", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        t = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        t.set_markup("<b>🕘 Version history</b>\nEvery saved version of the files in these folders is kept. Add a "
+                     "folder: right-click it → <b>Keep version history for this folder</b>.")
+        box.add(t)
+        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.add(holder)
+
+        def fill():
+            for c in holder.get_children():
+                holder.remove(c)
+            for f in VERSIONS.settings()["folders"]:
+                row = Gtk.Box(spacing=8)
+                row.pack_start(Gtk.Label(label="📁 " + short(f), xalign=0, hexpand=True,
+                                         ellipsize=Pango.EllipsizeMode.MIDDLE), True, True, 0)
+                b = Gtk.Button(label="Stop")
+                b.connect("clicked", lambda _b, f=f: (VERSIONS.protect(f, False), fill()))
+                row.add(b)
+                holder.add(row)
+            if not VERSIONS.settings()["folders"]:
+                holder.add(Gtk.Label(label="No folders yet.", xalign=0))
+            holder.show_all()
+        fill()
+        grid = Gtk.Grid(column_spacing=10, row_spacing=6)
+        days = Gtk.ComboBoxText()
+        for n in (30, 90, 180, 365):
+            days.append(str(n), f"{n} days")
+        days.set_active_id(str(s["days"]))
+        if days.get_active_id() is None:
+            days.set_active(1)
+        gb = Gtk.SpinButton.new_with_range(1, 2000, 1)
+        gb.set_value(s["max_gb"])
+        grid.attach(Gtk.Label(label="Keep versions for", xalign=0), 0, 0, 1, 1)
+        grid.attach(days, 1, 0, 1, 1)
+        grid.attach(Gtk.Label(label="Use at most (GB)", xalign=0), 0, 1, 1, 1)
+        grid.attach(gb, 1, 1, 1, 1)
+        box.add(grid)
+        used = Gtk.Label(xalign=0)
+        used.set_markup(f"<small>Space used now: <b>{human_size(VERSIONS.storage())}</b> in {esc(short(str(VERSIONS_DIR)))}"
+                        f"</small>")
+        box.add(used)
+        clean = Gtk.Button(label="Clean up now")
+        clean.connect("clicked", lambda *_: (VERSIONS.cleanup(), used.set_markup(
+            f"<small>Space used now: <b>{human_size(VERSIONS.storage())}</b></small>")))
+        box.add(clean)
+        d.show_all()
+        d.run()
+        s = VERSIONS.settings()
+        s["days"], s["max_gb"] = int(days.get_active_id() or 90), int(gb.get_value())
+        VERSIONS.save_settings(s)
+        d.destroy()
 
     def org_dialog(self):
         """Organisations this PC trusts: their admin (Arckad-D Pro) can add you as a contact without a request."""
