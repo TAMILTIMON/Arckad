@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.47.2"
+APP_VERSION = "3.48.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -155,7 +155,7 @@ TAGS = OrderedDict([("Important", "#e01b24"), ("To do", "#ff7800"), ("Work", "#3
 KINDS = ["All types", "Folder"] + list(CATEGORIES) + ["Others"]
 DATE_CHOICES = [("Any time", None), ("Today", "today"), ("Last 7 days", 7),
                 ("Last 30 days", 30), ("Last year", 365), ("Custom range…", "custom")]
-SCOPES = ["This folder", "+ Subfolders", "Everywhere"]
+SCOPES = ["This folder", "+ Subfolders", "Everywhere", "🔎 Inside files"]
 THUMB_KINDS = {"Images", "Videos", "Documents", "Presentations", "Spreadsheets"}
 
 # list columns
@@ -1584,6 +1584,10 @@ class FileIndex:
             except Exception as ex:
                 print(f"{APP_NAME}: journey check failed:", ex, file=sys.stderr)
             os.replace(tmp, INDEX_DB)
+            try:
+                CONTENT.update_async()                   # then the words inside new or changed documents
+            except NameError:
+                pass
             self.count, self.updated = n, time.time()
             write_json(INDEX_META, {"count": n, "updated": self.updated})
         except (OSError, sqlite3.Error) as ex:
@@ -2570,6 +2574,190 @@ def parse_dir_changes(data):
 JOURNEY_WATCH = JourneyWatcher()
 
 
+# ---------------------------------------------------------------- 🔎 Search inside files (content index)
+# Words inside documents (Word, Excel, PowerPoint, LibreOffice, PDF, EPUB, text files) are kept in a small full-text
+# index next to the file index, built in the background and updated only for documents that changed. Searching
+# "invoice 4411" with the scope “Inside files” finds the documents that mention it, with the matching line.
+CONTENT_DB = CACHE_DIR / "content.db"
+CONTENT_EXTS = {"txt", "md", "csv", "tsv", "log", "json", "xml", "html", "htm", "rtf", "tex", "ini", "yaml", "yml",
+                "docx", "docm", "xlsx", "xlsm", "pptx", "pptm", "odt", "ods", "odp", "epub", "pdf"}
+CONTENT_MAX_FILE = 25 * 1024 * 1024
+CONTENT_MAX_TEXT = 200_000
+
+
+def _xml_text(xml, para_tags=(b"</w:p>", b"</a:p>", b"</text:p>", b"</text:h>", b"</p>", b"<br")):
+    for t in para_tags:
+        xml = xml.replace(t, b"\n" + t)
+    txt = re.sub(rb"<[^>]+>", b" ", xml)
+    txt = htmlmod.unescape(txt.decode("utf-8", "replace"))
+    return re.sub(r"[ \t\r\f\v]+", " ", txt)
+
+
+def _zip_text(path, members):
+    import zipfile
+    out = []
+    with zipfile.ZipFile(path) as z:
+        names = z.namelist()
+        for pat in members:
+            for n in sorted(x for x in names if re.fullmatch(pat, x)):
+                out.append(_xml_text(z.read(n)))
+                if sum(len(x) for x in out) > CONTENT_MAX_TEXT:
+                    return "\n".join(out)
+    return "\n".join(out)
+
+
+def _pdf_text(path):
+    """PDF text: pdftotext when it's installed (Ubuntu: poppler-utils), else a simple built-in reader that handles
+    most ordinary PDFs (scanned pages without text can't be read)."""
+    exe = shutil.which("pdftotext")
+    if exe:
+        try:
+            r = subprocess.run([exe, "-q", "-enc", "UTF-8", "-l", "60", path, "-"], capture_output=True, timeout=60)
+            if r.returncode == 0:
+                return r.stdout.decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    import zlib
+    with open(path, "rb") as f:
+        data = f.read(CONTENT_MAX_FILE)
+    out = []
+    for m in re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", data, re.S):
+        raw = m.group(1)
+        try:
+            raw = zlib.decompress(raw)
+        except zlib.error:
+            pass
+        for block in re.findall(rb"BT(.*?)ET", raw, re.S):
+            parts = []
+            for s in re.findall(rb"\(((?:\\.|[^\\()])*)\)", block, re.S):
+                s = re.sub(rb"\\([nrtbf()\\])", lambda x: {b"n": b"\n", b"r": b"", b"t": b" ", b"b": b"", b"f": b"",
+                                                           b"(": b"(", b")": b")", b"\\": b"\\"}[x.group(1)], s)
+                s = re.sub(rb"\\([0-7]{1,3})", lambda x: bytes([int(x.group(1), 8) & 255]), s)
+                parts.append(s.decode("latin-1"))
+            if parts:
+                out.append(" ".join(parts))                # separate pieces (lines, words placed apart)
+        if sum(len(x) for x in out) > CONTENT_MAX_TEXT:
+            break
+    return "\n".join(out)
+
+
+def extract_text(path):
+    """The readable text of a document (or "" when there's none)."""
+    ext = ext_of(path)
+    try:
+        if ext in ("docx", "docm"):
+            return _zip_text(path, [r"word/document\.xml", r"word/header\d*\.xml", r"word/footer\d*\.xml"])
+        if ext in ("xlsx", "xlsm"):
+            return _zip_text(path, [r"xl/sharedStrings\.xml", r"xl/worksheets/sheet\d+\.xml"])
+        if ext in ("pptx", "pptm"):
+            return _zip_text(path, [r"ppt/slides/slide\d+\.xml", r"ppt/notesSlides/notesSlide\d+\.xml"])
+        if ext in ("odt", "ods", "odp"):
+            return _zip_text(path, [r"content\.xml"])
+        if ext == "epub":
+            return _zip_text(path, [r".*\.x?html?"])
+        if ext == "pdf":
+            return _pdf_text(path)
+        with open(path, "rb") as f:
+            raw = f.read(CONTENT_MAX_TEXT * 2)
+        if ext in ("html", "htm", "xml"):
+            return _xml_text(raw)
+        if ext == "rtf":
+            return re.sub(r"\\[a-z]+-?\d* ?|[{}]", " ", raw.decode("latin-1", "replace"))
+        return raw.decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+class ContentIndex:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.building = False
+        self.done_count = 0
+
+    def _con(self):
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(CONTENT_DB), timeout=10)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS docs (path TEXT PRIMARY KEY, mtime REAL, size INTEGER);
+            CREATE VIRTUAL TABLE IF NOT EXISTS body USING fts5(path UNINDEXED, text, tokenize='unicode61 remove_diacritics 2');""")
+        return con
+
+    def count(self):
+        try:
+            con = self._con()
+            n = con.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+            con.close()
+            return n
+        except sqlite3.Error:
+            return 0
+
+    def update_async(self):
+        if not self.building:
+            threading.Thread(target=self.update, daemon=True, name="content-index").start()
+
+    def update(self):
+        """Read the documents that are new or changed since last time (a few at a time, gently)."""
+        if self.building or not INDEX_DB.exists():
+            return
+        self.building, self.done_count = True, 0
+        try:
+            lower_my_priority()
+            exts = sorted(CONTENT_EXTS)
+            src = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True)
+            wanted = {p: (m, s) for p, m, s in src.execute(
+                f"SELECT path, mtime, size FROM files WHERE is_dir=0 AND size <= ? AND ext IN "
+                f"({','.join('?' * len(exts))})", [CONTENT_MAX_FILE] + exts)}
+            src.close()
+            con = self._con()
+            have = {p: m for p, m in con.execute("SELECT path, mtime FROM docs")}
+            for p in [p for p in have if p not in wanted]:        # gone: forget
+                con.execute("DELETE FROM docs WHERE path=?", (p,))
+                con.execute("DELETE FROM body WHERE path=?", (p,))
+            todo = [p for p, (m, _s) in wanted.items() if have.get(p) != m]
+            todo.sort(key=lambda p: -wanted[p][0])                 # newest documents first
+            for i, p in enumerate(todo):
+                text = extract_text(p)[:CONTENT_MAX_TEXT]
+                joined = " ".join(set(re.findall(r"\w+(?:-\w+)+", text)))
+                if joined:                                         # “Wi-Fi” also findable as “wifi”, “e-mail” as “email”
+                    text += "\n" + joined.replace("-", "")
+                con.execute("DELETE FROM body WHERE path=?", (p,))
+                if text.strip():
+                    con.execute("INSERT INTO body (path, text) VALUES (?, ?)", (p, text))
+                con.execute("INSERT OR REPLACE INTO docs VALUES (?, ?, ?)", (p, wanted[p][0], wanted[p][1]))
+                self.done_count = i + 1
+                if i % 40 == 39:
+                    con.commit()
+                    time.sleep(0.05)                               # stay out of the way
+            con.commit()
+            con.close()
+        except sqlite3.Error as ex:
+            print(f"{APP_NAME}: content index:", ex, file=sys.stderr)
+        finally:
+            self.building = False
+
+    def search(self, query, root=None, limit=500):
+        """[(path, snippet)] for documents containing all the words (best matches first)."""
+        words = [w for w in re.findall(r"\w+", query.lower()) if w]
+        if not words:
+            return []
+        match = " ".join(f'"{w}"*' for w in words)
+        sql = ("SELECT path, snippet(body, 1, '\u2063', '\u2064', '…', 12) FROM body WHERE body MATCH ? "
+               + ("AND path LIKE ? ESCAPE '\\' " if root else "") + "ORDER BY bm25(body) LIMIT ?")
+        args = [match] + ([like_escape(str(root).rstrip("/\\")) + like_escape(os.sep) + "%"] if root else []) + [limit]
+        try:
+            con = self._con()
+            rows = con.execute(sql, args).fetchall()
+            con.close()
+        except sqlite3.Error:
+            return []
+        return [(p, re.sub(r"\s+", " ", s).strip().replace("\u2063", "«").replace("\u2064", "»"))
+                for p, s in rows if os.path.exists(p)]
+
+
+CONTENT = ContentIndex()
+
+
 # ---------------------------------------------------------------- one browsing pane (= one tab)
 def make_row(path, is_dir, size, mtime):
     path = str(path)
@@ -2992,6 +3180,10 @@ class FilePane(Gtk.Box):
             self.go(str(Path(self.location).parent))
 
     def load_location(self):
+        if self.tree.get_tooltip_column() == C_WHERE:       # back from “Inside files” results
+            self.tree.set_tooltip_column(-1)
+            self.col_where.set_expand(False)
+            self.col_where.set_min_width(-1)
         self.back_btn.set_sensitive(bool(self.back_stack))
         self.fwd_btn.set_sensitive(bool(self.fwd_stack))
         self.up_btn.set_sensitive(is_folder_loc(self.location) and not is_root(self.location))
@@ -3078,6 +3270,8 @@ class FilePane(Gtk.Box):
 
     def wants_search(self):
         scope = self.scope_combo.get_active()
+        if scope == 3:                                   # 🔎 Inside files: words in documents
+            return bool(self.filters.query)
         return self.filters.active and (scope == 2 or (scope == 1 and is_folder_loc(self.location)))
 
     def on_ext_changed(self, *_):
@@ -3168,8 +3362,42 @@ class FilePane(Gtk.Box):
             GLib.idle_add(self.finish_load, gen, rows, err)
         threading.Thread(target=work, daemon=True).start()
 
+    def content_search(self):
+        """🔎 Inside files: documents that contain the words, with the matching line."""
+        self.mode = "search"
+        self.gen += 1
+        gen, q = self.gen, self.filters.query
+        self.watch(None)
+        self.set_busy(True)
+        self.set_rows([])
+        self.status.set_text(f"Searching inside documents for “{q}”…")
+        self.tree.set_tooltip_column(C_WHERE)                # point at a result: the whole matching line
+        self.col_where.set_expand(True)
+        self.col_where.set_min_width(360)
+
+        def work():
+            hits = CONTENT.search(q)
+            rows = []
+            for p, snip in hits:
+                try:
+                    r = stat_row(p)
+                except OSError:
+                    continue
+                r[C_WHERE] = f"“{snip}” · {short(os.path.dirname(p))}"
+                rows.append(r)
+            n = CONTENT.count()
+            note = (f"found in {len(rows)} document{'s' if len(rows) != 1 else ''} · {n} documents read" +
+                    (f" (still reading: {CONTENT.done_count} so far)" if CONTENT.building else ""))
+            if not n and not CONTENT.building:
+                note = "the documents haven't been read yet: starting now (this takes a few minutes the first time)"
+                GLib.idle_add(lambda: CONTENT.update_async() or False)
+            GLib.idle_add(self.append_rows, gen, rows, True, note)
+        threading.Thread(target=work, daemon=True).start()
+
     def start_search(self):
         scope = self.scope_combo.get_active()
+        if scope == 3:
+            return self.content_search()
         root = self.location if (scope == 1 and is_folder_loc(self.location)) else None
         self.mode = "search"
         self.gen += 1
@@ -19136,6 +19364,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.start_freeze_watch()
         GLib.idle_add(self._default_fm_start)
         GLib.timeout_add_seconds(6, self._start_journey_watch)
+        GLib.timeout_add_seconds(90, lambda: (INDEX.available() and not CONTENT.count() and CONTENT.update_async())
+                                 and False)
         self.connect("configure-event", lambda *_: GLib.idle_add(self._check_compact) and False)
         self.connect("window-state-event", lambda *_: GLib.idle_add(self._check_compact) and False)
         GLib.idle_add(self._check_compact)
