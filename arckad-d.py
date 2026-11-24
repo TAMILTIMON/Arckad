@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.42.0"
+APP_VERSION = "3.42.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1390,6 +1390,31 @@ def thumbnail_for(path, size, render=True):
         return render_pdf(path, size)
     if kind == "Videos":
         return render_video(path, size)
+    return office_thumbnail(path, size)
+
+
+def office_thumbnail(path, size):
+    """The preview picture stored inside office files: always in LibreOffice files (ODT, ODS, ODP…), and in Word,
+    Excel and PowerPoint files saved with a preview. Read straight from the file: fast, no extra software."""
+    if ext_of(path) not in ("odt", "ods", "odp", "odg", "docx", "xlsx", "pptx", "docm", "xlsm", "pptm"):
+        return None
+    try:
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            for cand in ("Thumbnails/thumbnail.png", "docProps/thumbnail.jpeg", "docProps/thumbnail.jpg",
+                         "docProps/thumbnail.png"):
+                if cand in names:
+                    data = z.read(cand)
+                    loader = GdkPixbuf.PixbufLoader()
+                    loader.write(data)
+                    loader.close()
+                    pb = loader.get_pixbuf()
+                    s = min(size / pb.get_width(), size / pb.get_height())
+                    return pb.scale_simple(max(1, int(pb.get_width() * s)), max(1, int(pb.get_height() * s)),
+                                           GdkPixbuf.InterpType.BILINEAR)
+    except Exception:
+        return None
     return None
 
 
@@ -17411,6 +17436,60 @@ DOC_COLOURS = {"pdf": "#e01b24", "doc": "#2b579a", "docx": "#2b579a", "odt": "#2
 LIB_PAGE = 240
 
 
+def doc_icon(ext, w=96, h=112):
+    """A coloured page with the type on it (PDF red, DOCX blue, XLSX green…)."""
+    col = DOC_COLOURS.get(ext, "#3b82f6")
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 96 112">'
+           f'<path d="M8 4 H64 L88 28 V104 a4 4 0 0 1 -4 4 H8 a4 4 0 0 1 -4 -4 V8 a4 4 0 0 1 4 -4 Z" fill="{col}"/>'
+           f'<path d="M64 4 V28 H88 Z" fill="#ffffff" opacity="0.45"/>'
+           f'<text x="46" y="76" text-anchor="middle" fill="#ffffff" font-size="{26 if len(ext) <= 3 else 20}" '
+           f'font-weight="800" font-family="Segoe UI, Ubuntu, Arial, sans-serif">{esc(ext.upper()[:5])}</text></svg>')
+    loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+    loader.write(svg.encode())
+    loader.close()
+    return loader.get_pixbuf()
+
+
+_TEXTY = {"txt", "md", "csv", "tsv", "json", "log", "xml", "html", "rtf", "tex", "ini", "yaml", "yml"}
+
+
+def text_thumbnail(path, w=120, h=150):
+    """A small sheet of paper with the file's first lines on it."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [ln.rstrip("\n")[:34] for _, ln in zip(range(14), f)]
+    except OSError:
+        return None
+    ext = ext_of(path)
+    col = DOC_COLOURS.get(ext, "#6b7280")
+    rows = "".join(f'<text x="8" y="{22 + i * 9}" font-size="7" fill="#374151" font-family="DejaVu Sans Mono, '
+                   f'Consolas, monospace">{esc(ln)}</text>' for i, ln in enumerate(lines))
+    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 120 150">'
+           f'<rect x="1" y="1" width="118" height="148" rx="5" fill="#ffffff" stroke="#d1d5db"/>{rows}'
+           f'<rect x="72" y="128" width="42" height="16" rx="4" fill="{col}"/>'
+           f'<text x="93" y="140" text-anchor="middle" font-size="9" font-weight="800" fill="#ffffff" '
+           f'font-family="Segoe UI, Ubuntu, Arial, sans-serif">{esc(ext.upper()[:5])}</text></svg>')
+    try:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+        loader.write(svg.encode())
+        loader.close()
+        return loader.get_pixbuf()
+    except Exception:
+        return None
+
+
+def doc_thumbnail(path, size=150):
+    """The best picture for a document: the system's preview, a PDF's first page, an office file's own preview,
+    the first lines of a text file, or (when none of those exist) its coloured type icon."""
+    try:
+        pb = thumbnail_for(path, size)
+    except Exception:
+        pb = None
+    if pb is None and ext_of(path) in _TEXTY:
+        pb = text_thumbnail(path)
+    return pb
+
+
 def library_rows(exts, limit=5000, query=""):
     """(path, size, mtime) from the index, newest first."""
     if not INDEX_DB.exists():
@@ -17449,6 +17528,10 @@ def library_doc_types():
 class LibraryView(Gtk.Box):
     def __init__(self, win):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        css = Gtk.CssProvider()
+        css.load_from_data(b".lib-page { background-color: rgba(255,255,255,0.06); border-radius: 10px; padding: 6px; "
+                           b"box-shadow: 0 1px 4px rgba(0,0,0,0.25); }")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 12)
         self.win = win
         self.section = None
         self._thumb_gen = 0
@@ -17740,16 +17823,7 @@ class LibraryView(Gtk.Box):
         for ext, n, size in types:
             ev = Gtk.EventBox()
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=6)
-            col = DOC_COLOURS.get(ext, "#3b82f6")
-            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="96" height="112" viewBox="0 0 96 112">'
-                   f'<path d="M8 4 H64 L88 28 V104 a4 4 0 0 1 -4 4 H8 a4 4 0 0 1 -4 -4 V8 a4 4 0 0 1 4 -4 Z" fill="{col}"/>'
-                   f'<path d="M64 4 V28 H88 Z" fill="#ffffff" opacity="0.45"/>'
-                   f'<text x="46" y="76" text-anchor="middle" fill="#ffffff" font-size="{26 if len(ext) <= 3 else 20}" '
-                   f'font-weight="800" font-family="Segoe UI, Ubuntu, Arial, sans-serif">{esc(ext.upper())}</text></svg>')
-            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-            loader.write(svg.encode())
-            loader.close()
-            box.add(Gtk.Image.new_from_pixbuf(loader.get_pixbuf()))
+            box.add(Gtk.Image.new_from_pixbuf(doc_icon(ext)))
             t = Gtk.Label()
             t.set_markup(f"<b>{esc(ext.upper())}</b>\n<small>{n} file{'s' if n != 1 else ''} · {human_size(size or 0)}</small>")
             t.set_justify(Gtk.Justification.CENTER)
@@ -17761,33 +17835,91 @@ class LibraryView(Gtk.Box):
             flow.add(ev)
         self.body.add(flow)
 
-    def _doc_list(self, ext, q):
+    def _doc_list(self, ext, q, shown=LIB_PAGE):
         rows = library_rows({ext}, 5000, q)
         if rows is None:
             return self._no_index()
+        grid = self.win.cfg.get("library_doc_view", "grid") == "grid"
         self.status.set_text(f"{len(rows)} .{ext} files{' matching' if q else ''} · newest first · double-click to open")
-        store = Gtk.ListStore(str, str, str, str, float, str)
+        sw = Gtk.Box(spacing=0, halign=Gtk.Align.START)
+        for key, label in (("grid", "▦ Grid"), ("list", "☰ List")):
+            b = Gtk.ToggleButton(label=label)
+            b.set_active((key == "grid") == grid)
+            b.connect("clicked", lambda _b, k=key: (self.win.cfg.__setitem__("library_doc_view", k), self.refresh()))
+            sw.add(b)
+        self.body.add(sw)
+        icon = doc_icon(ext, 96, 112)
+        if grid:
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
+                               max_children_per_line=10, column_spacing=10, row_spacing=12)
+            todo = []
+            for path, size, mtime in rows[:shown]:
+                ev = Gtk.EventBox()
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+                frame = Gtk.Box(halign=Gtk.Align.CENTER)
+                frame.get_style_context().add_class("lib-page")
+                img = Gtk.Image.new_from_pixbuf(icon)
+                img.set_size_request(150, 150)
+                frame.add(img)
+                box.add(frame)
+                n = Gtk.Label(label=os.path.basename(path), ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=20)
+                box.add(n)
+                d = Gtk.Label(ellipsize=Pango.EllipsizeMode.START, max_width_chars=22)
+                d.set_markup(f"<small>{esc(time.strftime('%d %b %Y', time.localtime(mtime)))} · {human_size(size)}</small>")
+                d.get_style_context().add_class("dim-label")
+                box.add(d)
+                ev.add(box)
+                ev.set_tooltip_text(f"{os.path.basename(path)}\n{short(os.path.dirname(path))}")
+                self._clickable(ev, path)
+                flow.add(ev)
+                todo.append((path, img))
+            self.body.add(flow)
+            if len(rows) > shown:
+                more = Gtk.Button(label=f"Load more ({len(rows) - shown} left)", halign=Gtk.Align.CENTER)
+                more.connect("clicked", lambda *_: (self._clear(), self._doc_list(ext, q, shown + LIB_PAGE),
+                                                    self.body.show_all()))
+                self.body.add(more)
+            gen = self._thumb_gen
+
+            def work():
+                for path, img in todo:
+                    if gen != self._thumb_gen:
+                        return
+                    pb = doc_thumbnail(path, 150)
+                    if pb is not None and max(pb.get_width(), pb.get_height()) > 150:   # same square for every tile
+                        s = 150 / max(pb.get_width(), pb.get_height())
+                        pb = pb.scale_simple(max(1, int(pb.get_width() * s)), max(1, int(pb.get_height() * s)),
+                                             GdkPixbuf.InterpType.BILINEAR)
+                    if pb is not None:
+                        GLib.idle_add(lambda i=img, p=pb: (gen == self._thumb_gen and i.set_from_pixbuf(p)) and False)
+            threading.Thread(target=work, daemon=True).start()
+            return
+        small = doc_icon(ext, 22, 26)
+        store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, str, str, float, str)
         for path, size, mtime in rows:
-            store.append([os.path.basename(path), short(os.path.dirname(path)), human_size(size),
+            store.append([small, os.path.basename(path), short(os.path.dirname(path)), human_size(size),
                           time.strftime("%d %b %Y %H:%M", time.localtime(mtime)), mtime, path])
         tv = Gtk.TreeView(model=store)
-        for i, (title, expand) in enumerate((("Name", True), ("Folder", True), ("Size", False), ("Modified", False))):
-            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE if i < 2 else Pango.EllipsizeMode.NONE)
+        c0 = Gtk.TreeViewColumn("", Gtk.CellRendererPixbuf(), pixbuf=0)
+        tv.append_column(c0)
+        for i, (title, expand) in enumerate((("Name", True), ("Folder", True), ("Size", False), ("Modified", False)),
+                                            start=1):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE if i < 3 else Pango.EllipsizeMode.NONE)
             c = Gtk.TreeViewColumn(title, r, text=i)
             c.set_expand(expand)
             c.set_resizable(True)
-            c.set_sort_column_id(4 if i == 3 else i)
+            c.set_sort_column_id(5 if i == 4 else i)
             tv.append_column(c)
-        tv.connect("row-activated", lambda v, p, c: self.win.open_file(store[p][5]))
+        tv.connect("row-activated", lambda v, p, c: self.win.open_file(store[p][6]))
         tv.connect("cursor-changed", lambda v: v.get_cursor()[0] is not None and
-                   self.win.preview.show_paths([store[v.get_cursor()[0]][5]]))
+                   self.win.preview.show_paths([store[v.get_cursor()[0]][6]]))
 
         def menu(v, ev):
             if ev.button != 3:
                 return False
             hit = v.get_path_at_pos(int(ev.x), int(ev.y))
             if hit:
-                self._menu(store[hit[0]][5], ev)
+                self._menu(store[hit[0]][6], ev)
             return True
         tv.connect("button-press-event", menu)
         self.body.add(tv)
