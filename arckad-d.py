@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.52.0"
+APP_VERSION = "3.53.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -21752,15 +21752,19 @@ class MainWindow(Gtk.ApplicationWindow):
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         # the sidebar's own controls: « shrink / » expand · ⇔ auto-hide · 📌 lock open
         self.side_strip = Gtk.Box(spacing=2, margin=4, halign=Gtk.Align.END)
-        self.side_toggle = Gtk.Button(label="«")
+        self.side_toggle = Gtk.Button()
+        self.side_toggle.add(self.side_glyph("collapse"))
         self.side_toggle.set_tooltip_text("Shrink the sidebar to icons")
         self.side_toggle.connect("clicked", lambda *_: self.set_sidebar_mode(
             "expanded" if self._side_rail else "icons"))
-        self.side_auto = Gtk.ToggleButton(label="⇔")
+        self.side_auto = Gtk.ToggleButton()
+        self.side_auto.add(self.side_glyph("autohide"))
         self.side_auto.set_tooltip_text("Auto-hide: icons only, opens when you point at it")
         self.side_auto.connect("toggled", lambda b: None if self._side_guard else
                                self.set_sidebar_mode("autohide" if b.get_active() else "expanded"))
-        self.side_lock = Gtk.ToggleButton(label="📌")
+        self.side_lock = Gtk.ToggleButton()
+        self.side_lock.add(self.side_glyph("pin"))
+        self.side_lock.get_child().show()                    # the button itself starts hidden (no show_all)
         self.side_lock.set_tooltip_text("Lock the sidebar open (while auto-hide is on)")
         self.side_lock.connect("toggled", lambda b: None if self._side_guard else self._side_lock_toggled(b.get_active()))
         self.side_lock.set_no_show_all(True)
@@ -21771,7 +21775,8 @@ class MainWindow(Gtk.ApplicationWindow):
         side.add(self.side_strip)
         self._side_rail, self._side_guard, self._side_anim = False, False, None
         css = Gtk.CssProvider()
-        css.load_from_data(b"button.side-ctl { min-width: 26px; min-height: 24px; padding: 0 4px; font-size: 12px; }")
+        css.load_from_data(b"button.side-ctl { min-width: 26px; min-height: 24px; padding: 0 4px; font-size: 12px; }"
+                           b" button.side-fold { padding: 2px 6px; min-height: 0; }")
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 9)
         self.sidebar = Gtk.ListBox()
         self.sidebar.get_style_context().add_class("arckad-sidebar")
@@ -22360,6 +22365,7 @@ class MainWindow(Gtk.ApplicationWindow):
                                          gicon=icon_widget)
                     row.volume = obj
         self.sidebar.show_all()
+        self._apply_sections()
         self.sync_sidebar()
 
     # ---------- drives (USB sticks, SD cards, external and extra disks)
@@ -22590,10 +22596,32 @@ class MainWindow(Gtk.ApplicationWindow):
     def _side_header(self, text, dim=False):
         row = Gtk.ListBoxRow(selectable=False, activatable=False)
         row.is_header = True
+        if not dim:
+            self._side_section = text
+        row.section = None if dim else text
         label = Gtk.Label(xalign=0, margin_start=10, margin_top=4 if dim else 10, margin_bottom=2, wrap=True)
         label.set_markup(f"<small>{esc(text)}</small>" if dim else f"<b><small>{esc(text.upper())}</small></b>")
         label.get_style_context().add_class("dim-label")
-        row.add(label)
+        if not dim and text in self._COLLAPSIBLE:
+            btn = Gtk.Button(relief=Gtk.ReliefStyle.NONE)
+            btn.get_style_context().add_class("side-fold")
+            inner = Gtk.Box(spacing=2)
+            label.set_margin_start(0)
+            label.set_margin_top(0)
+            label.set_margin_bottom(0)
+            inner.pack_start(label, True, True, 0)
+            glyph = self.side_glyph("open", 14)
+            glyph.get_style_context().add_class("dim-label")
+            inner.pack_end(glyph, False, False, 0)
+            btn.add(inner)
+            btn.set_margin_start(4)
+            btn.set_margin_end(4)
+            btn.set_margin_top(6)
+            btn.connect("clicked", lambda *_: self._toggle_section(text))
+            row.fold_btn, row.fold_glyph = btn, glyph
+            row.add(btn)
+        else:
+            row.add(label)
         self.sidebar.add(row)
 
     def _side_row(self, text, icon, key, pinned=False, dot=None, sub=None, gicon=None, extra=None):
@@ -22619,6 +22647,7 @@ class MainWindow(Gtk.ApplicationWindow):
             box.pack_end(extra, False, False, 0)
         row.add(box)
         row.key, row.pinned = key, pinned
+        row.section = getattr(self, "_side_section", None)
         row.set_tooltip_text(key if is_folder_loc(key) and not key.startswith("volume:") else None)
         row.side_name, row.side_texts, row.side_box, row.side_extra = text, texts, box, extra
         row.side_tip = row.get_tooltip_text()
@@ -22628,6 +22657,126 @@ class MainWindow(Gtk.ApplicationWindow):
         return row
 
     # ---------- sidebar: expanded · icons only · auto-hide (with lock)
+    # ---------- small drawn icons (they take the theme's text colour, so they match every theme)
+    _GLYPH_TEXT = {"collapse": "«", "expand": "»", "autohide": "⇔", "pin": "📌", "open": "▾", "closed": "▸"}
+
+    @staticmethod
+    def _cairo_ok():
+        if not hasattr(MainWindow, "_cairo_state"):
+            try:
+                gi.require_foreign("cairo")
+                MainWindow._cairo_state = True
+            except Exception:                                # python3-gi-cairo missing: plain characters instead
+                MainWindow._cairo_state = False
+        return MainWindow._cairo_state
+
+    @staticmethod
+    def side_glyph(kind, size=16):
+        """A drawn icon: 'collapse' «, 'expand' », 'autohide', 'pin', 'open' ▾, 'closed' ▸."""
+        if not MainWindow._cairo_ok():
+            lbl = Gtk.Label(label=MainWindow._GLYPH_TEXT[kind])
+            lbl.glyph = kind
+            return lbl
+        area = Gtk.DrawingArea()
+        area.set_size_request(size, size)
+        area.glyph = kind
+
+        def draw(w, cr):
+            a = w.get_allocation()
+            ctx = w.get_style_context()
+            c = ctx.get_color(ctx.get_state())
+            cr.set_source_rgba(c.red, c.green, c.blue, c.alpha)
+            s = min(a.width, a.height) / 16.0
+            cr.translate((a.width - 16 * s) / 2, (a.height - 16 * s) / 2)
+            cr.scale(s, s)
+            cr.set_line_width(1.7)
+            cr.set_line_cap(1)                               # round
+            cr.set_line_join(1)
+            k = w.glyph
+            if k in ("collapse", "expand"):
+                d = -1 if k == "collapse" else 1
+                for x in (6, 10.5):
+                    cr.move_to(x - 2 * d, 4)
+                    cr.line_to(x + 2 * d, 8)
+                    cr.line_to(x - 2 * d, 12)
+                cr.stroke()
+            elif k in ("open", "closed"):
+                if k == "open":
+                    cr.move_to(4.5, 6.5); cr.line_to(8, 10); cr.line_to(11.5, 6.5)
+                else:
+                    cr.move_to(6.5, 4.5); cr.line_to(10, 8); cr.line_to(6.5, 11.5)
+                cr.stroke()
+            elif k == "autohide":                            # a window with a slim side panel and an arrow
+                cr.set_line_width(1.4)
+                cr.rectangle(1.5, 2.5, 13, 11)
+                cr.stroke()
+                cr.rectangle(1.5, 2.5, 3.5, 11)
+                cr.fill()
+                cr.set_line_width(1.6)
+                cr.move_to(7.5, 8); cr.line_to(12, 8)
+                cr.move_to(10, 6); cr.line_to(12, 8); cr.line_to(10, 10)
+                cr.stroke()
+            elif k == "pin":                                 # a push-pin, tilted
+                cr.translate(8, 8)
+                cr.rotate(0.6)
+                cr.translate(-8, -8)
+                cr.rectangle(5.5, 2, 5, 2)
+                cr.fill()
+                cr.move_to(6.3, 4); cr.line_to(5.3, 8); cr.line_to(10.7, 8); cr.line_to(9.7, 4)
+                cr.close_path()
+                cr.fill()
+                cr.rectangle(3.5, 8, 9, 1.6)
+                cr.fill()
+                cr.set_line_width(1.3)
+                cr.move_to(8, 9.6); cr.line_to(8, 14.5)
+                cr.stroke()
+            return False
+        area.connect("draw", draw)
+        return area
+
+    def _set_glyph(self, button, kind):
+        self._set_glyph_area(button.get_child(), kind)
+
+    # ---------- collapsible sections (Library, Tags): click the title to fold or unfold
+    _COLLAPSIBLE = ("Library", "Tags")
+
+    def _toggle_section(self, name):
+        shut = set(self.cfg.get("side_collapsed", []))
+        shut ^= {name}
+        self.cfg["side_collapsed"] = sorted(shut)
+        write_json(CONFIG_FILE, self.cfg)
+        self._apply_sections()
+
+    def _apply_sections(self):
+        """Hide the rows of folded sections (in the icon rail every row shows, as there are no titles there)."""
+        shut = set(self.cfg.get("side_collapsed", []))
+        rail = getattr(self, "_side_rail", False)
+        for row in self.sidebar.get_children():
+            sec = getattr(row, "section", None)
+            if getattr(row, "is_header", False):
+                if getattr(row, "fold_glyph", None) is not None:
+                    self._set_glyph_area(row.fold_glyph, "closed" if sec in shut else "open")
+                    row.fold_btn.set_tooltip_text(("Show " if sec in shut else "Hide ") + sec)
+                continue
+            if sec in self._COLLAPSIBLE:
+                show = rail or sec not in shut
+                row.set_no_show_all(not show)
+                row.set_visible(show)
+                if show:
+                    row.show_all()
+                    if rail and hasattr(row, "side_texts"):
+                        row.side_texts.set_visible(False)
+                        if row.side_extra is not None:
+                            row.side_extra.set_visible(False)
+
+    @staticmethod
+    def _set_glyph_area(area, kind):
+        area.glyph = kind
+        if isinstance(area, Gtk.Label):
+            area.set_label(MainWindow._GLYPH_TEXT[kind])
+        else:
+            area.queue_draw()
+
     def set_sidebar_mode(self, mode, save=True):
         self.side_mode = mode
         if save:
@@ -22666,8 +22815,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.side_footer.set_visible(not rail)
         self.side_strip.set_orientation(Gtk.Orientation.VERTICAL if rail else Gtk.Orientation.HORIZONTAL)
         self.side_strip.set_halign(Gtk.Align.CENTER if rail else Gtk.Align.END)
-        self.side_toggle.set_label("»" if rail else "«")
+        self._set_glyph(self.side_toggle, "expand" if rail else "collapse")
         self.side_toggle.set_tooltip_text("Show names" if rail else "Shrink the sidebar to icons")
+        self._apply_sections()
 
     def _side_slide(self, rail):
         """Smoothly to the slim rail (about 60 px) or back to the full sidebar."""

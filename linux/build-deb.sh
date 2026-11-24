@@ -94,8 +94,8 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: all
-Depends: python3 (>= 3.8), python3-gi, gir1.2-gtk-3.0, gir1.2-gdkpixbuf-2.0, librsvg2-common
-Recommends: qrencode, poppler-utils, ffmpegthumbnailer, 7zip | p7zip-full, gir1.2-gstreamer-1.0, gstreamer1.0-plugins-good, gstreamer1.0-libav, python3-gi-cairo, pulseaudio-utils | pipewire-bin, gir1.2-ayatanaappindicator3-0.1, gnome-shell-extension-appindicator
+Depends: python3 (>= 3.8), python3-gi, python3-gi-cairo, gir1.2-gtk-3.0, gir1.2-gdkpixbuf-2.0, librsvg2-common
+Recommends: qrencode, poppler-utils, ffmpegthumbnailer, 7zip | p7zip-full, gir1.2-gstreamer-1.0, gstreamer1.0-plugins-good, gstreamer1.0-libav, pulseaudio-utils | pipewire-bin, gir1.2-ayatanaappindicator3-0.1, gnome-shell-extension-appindicator
 Installed-Size: $(du -sk "$PKG" --exclude=DEBIAN | cut -f1)
 Maintainer: Arckad-D <arckad-d@users.noreply.local>
 Description: File manager that remembers what you worked on
