@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.40.0"
+APP_VERSION = "3.40.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2266,6 +2266,8 @@ class FilePane(Gtk.Box):
         flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=8,
                            column_spacing=4, row_spacing=4, border_width=4, homogeneous=False)
         self.search = Gtk.SearchEntry(placeholder_text="Filter name or note (Ctrl+F)", width_chars=12)
+        self.search.connect("stop-search", lambda *_: (self.search.set_text(""),
+                                                       (self.icons if self.view_mode == "grid" else self.tree).grab_focus()))
         self.search.connect("search-changed", self.on_filters_changed)
         self.kind_combo = Gtk.ComboBoxText()
         for k in KINDS:
@@ -2815,6 +2817,13 @@ class FilePane(Gtk.Box):
             self.sort["folder" if self.mode == "folder" else "other"] = (col, order)
 
     def sort_func(self, model, a, b, col):
+        spot = getattr(self, "spotlight", None)
+        if spot:                                            # the file another app asked to show comes first
+            sa, sb = model[a][C_PATH] == spot, model[b][C_PATH] == spot
+            if sa != sb:
+                res = -1 if sa else 1
+                _, order = self.sorted.get_sort_column_id() if self.sorted else (None, Gtk.SortType.ASCENDING)
+                return -res if order == Gtk.SortType.DESCENDING else res
         da, db = model[a][C_ISDIR], model[b][C_ISDIR]
         if da != db:   # folders first, whichever direction
             res = -1 if da else 1
@@ -2855,9 +2864,20 @@ class FilePane(Gtk.Box):
                                    f"folder</small>")
         if self.filter is not None:
             self.filter.refilter()
+        self._resort()                                      # re-sort so it sits at the top
         self.select_paths([self.spotlight])
         self._spot_t0 = time.time()
         self._spot_glow()
+        (self.gadj if self.view_mode == "grid" else self.vadj).set_value(0)
+
+    def _resort(self):
+        if self.sorted is None:
+            return
+        col, order = self.sorted.get_sort_column_id()
+        if col is not None and col >= 0:
+            self.sorted.set_sort_column_id(col, Gtk.SortType.DESCENDING if order == Gtk.SortType.ASCENDING
+                                           else Gtk.SortType.ASCENDING)
+            self.sorted.set_sort_column_id(col, order)
 
     def clear_spotlight(self):
         was = self.spot_only
@@ -16695,6 +16715,10 @@ class FileManagerService:
         if not self.win.cfg.get("default_fm"):
             self._watch = None
             return False
+        if self.owner and not self.has_name and self.win.cfg.get("fm_takeover"):
+            owner = fm1_owner()
+            if owner and "nautilus" in owner[1].lower():
+                take_over_from_files()
         if self.owner and not self.has_name:
             Gio.bus_unown_name(self.owner)
             self.owner = 0
@@ -16727,6 +16751,8 @@ class FileManagerService:
 
     def _call(self, _conn, _sender, _path, _iface, method, params, invocation):
         args = params.unpack() if params else ([], "")
+        self.__dict__.setdefault("log", []).append((time.time(), method, (list(args[0]) or [""])[0]))
+        self.log = self.log[-6:]
         uris = list(args[0])
         token = args[1] if len(args) > 1 else ""            # lets Ubuntu bring Arckad-D to the front
         paths = [Gio.File.new_for_uri(u).get_path() if u.startswith("file:") else u for u in uris]
@@ -16739,6 +16765,33 @@ class FileManagerService:
                 folder = os.path.dirname(p)
                 GLib.idle_add(lambda: self.win.show_from_tray(folder=folder, select=p, token=token) or False)
         invocation.return_value(None)
+
+
+def fm1_owner():
+    """(process id, program name) of whoever answers “Show in folder” right now, or None."""
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        name = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetNameOwner",
+                             GLib.Variant("(s)", (DBUS_FM,)), GLib.VariantType("(s)"), 0, 2000, None).unpack()[0]
+        pid = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                            "GetConnectionUnixProcessID", GLib.Variant("(s)", (name,)), GLib.VariantType("(u)"),
+                            0, 2000, None).unpack()[0]
+        try:
+            prog = Path(f"/proc/{pid}/comm").read_text().strip()
+        except OSError:
+            prog = "?"
+        return pid, prog
+    except Exception:
+        return None
+
+
+def take_over_from_files():
+    """Ask the Files app (Nautilus) to quit politely, so Arckad-D can answer “Show in folder”."""
+    try:
+        subprocess.run(["nautilus", "-q"], capture_output=True, timeout=10)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 # ---------- Windows: folders and drives open in Arckad-D (your user only)
@@ -20891,6 +20944,25 @@ class MainWindow(Gtk.ApplicationWindow):
         return value if resp == Gtk.ResponseType.OK and value else None
 
     # ---------- keyboard
+    def _type_to_filter(self, pane, event):
+        """Typing a name while in the file list goes straight into the filter (no need to click it first)."""
+        if pane is None:
+            return False
+        code = Gdk.keyval_to_unicode(event.keyval)
+        ch = chr(code) if code else ""
+        if not ch or not ch.isprintable() or ch == " ":
+            return False
+        focus = (getattr(self, "_key_window", None) or self).get_focus()
+        w = focus
+        while w is not None and not isinstance(w, FilePane):
+            w = w.get_parent()
+        if focus is not None and w is not pane:              # only from the file list (not chat, phone, menus…)
+            return False
+        pane.search.grab_focus_without_selecting()
+        pane.search.set_text(pane.search.get_text() + ch)
+        pane.search.set_position(-1)
+        return True
+
     def on_key(self, _w, event):
         key = Gdk.keyval_name(event.keyval) or ""
         low = key.lower()
@@ -20925,6 +20997,8 @@ class MainWindow(Gtk.ApplicationWindow):
         elif ctrl and low == "v" and not typing:
             self.paste_into(pane)
         elif pane.handle_key(key, ctrl, alt, typing):
+            pass
+        elif not ctrl and not alt and not typing and self._type_to_filter(pane, event):
             pass
         else:
             return False
@@ -21081,6 +21155,52 @@ class MainWindow(Gtk.ApplicationWindow):
             b.get_style_context().add_class("suggested-action")
         b.connect("clicked", lambda *_: (self._set_default_fm(not on), d.response(Gtk.ResponseType.CLOSE)))
         box.add(b)
+        if not IS_WIN and on:
+            owner = fm1_owner()
+            mine = owner and owner[0] == os.getpid()
+            who = Gtk.Label(xalign=0, wrap=True, max_width_chars=58)
+            who.set_markup("<b>Browsers' “Show in folder”:</b> " + (
+                f"✓ answered by {APP_NAME}" if mine else
+                f"⚠ answered by <b>{esc(owner[1])}</b> (process {owner[0]}), so your files aren't highlighted" if owner
+                else "nobody is answering right now"))
+            box.add(who)
+            if owner and not mine:
+                take = Gtk.Button(label="Take it over now (closes the Files app's windows)")
+                take.get_style_context().add_class("suggested-action")
+
+                def do_take(*_):
+                    take.set_sensitive(False)
+                    take.set_label("Taking it over…")
+                    take_over_from_files()
+                    if getattr(self, "fm_service", None):
+                        self.fm_service.stop()
+                        GLib.timeout_add(800, lambda: self.fm_service.start() or False)
+
+                    def show_result():                      # update this window in place
+                        now = fm1_owner()
+                        ok = bool(now) and now[0] == os.getpid()
+                        who.set_markup("<b>Browsers' “Show in folder”:</b> " + (
+                            f"✓ answered by {APP_NAME}" if ok else
+                            f"⚠ still answered by <b>{esc(now[1])}</b>; log out and back in" if now else
+                            "nobody is answering yet; try again in a moment"))
+                        take.set_visible(not ok)
+                        take.set_sensitive(True)
+                        take.set_label("Take it over now (closes the Files app's windows)")
+                        return False
+                    GLib.timeout_add(2500, show_result)
+                take.connect("clicked", do_take)
+                box.add(take)
+            always = Gtk.CheckButton(label="Always take it over (if the Files app grabs it again, it's asked to close)")
+            always.set_active(self.cfg.get("fm_takeover", False))
+            always.connect("toggled", lambda c: (self.cfg.__setitem__("fm_takeover", c.get_active()),
+                                                 write_json(CONFIG_FILE, self.cfg)))
+            box.add(always)
+            log = getattr(getattr(self, "fm_service", None), "log", [])
+            lines = "\n".join(f"{time.strftime('%H:%M:%S', time.localtime(t))}  {m}  {esc(os.path.basename(u) or u)}"
+                              for t, m, u in reversed(log)) or "none yet (since Arckad-D started)"
+            got = Gtk.Label(xalign=0, wrap=True)
+            got.set_markup(f"<small><b>Last requests received:</b>\n<tt>{lines}</tt></small>")
+            box.add(got)
         pop = Gtk.CheckButton(label=f"Show a pop-up when a download finishes (click it to see the file in {APP_NAME})")
         pop.set_active(self.cfg.get("download_popups", True))
         pop.connect("toggled", lambda c: (self.cfg.__setitem__("download_popups", c.get_active()),
