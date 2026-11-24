@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.38.1"
+APP_VERSION = "3.39.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -16551,7 +16551,13 @@ treeview.view header button { background-image: none; background-color: $surface
 notebook > header { background-color: $bg2; border-color: $border; }
 notebook > header tab { color: $dim; border-radius: 9px 9px 0 0; padding: 4px 14px; }
 notebook > header tab:hover { color: $text; background-color: $glow_soft; }
-notebook > header tab:checked { color: $text; background-color: $surface; box-shadow: inset 0 -3px $accent; }
+notebook > header tab:checked { color: $text; background-image: none; background-color: alpha($accent, 0.22);
+  box-shadow: inset 0 -4px $accent, 0 0 10px alpha($accent, 0.25); }
+notebook > header tab:checked label { color: $text; font-weight: 800; }
+notebook > header tab label { color: $dim; }
+notebook.arckad-active-nb > header { box-shadow: inset 0 -2px alpha($accent, 0.6); }
+notebook:not(.arckad-active-nb) > header tab:checked { background-color: alpha($accent, 0.10);
+  box-shadow: inset 0 -3px alpha($accent, 0.55); }
 notebook > stack { background-color: $surface; }
 .arckad-sidebar, .arckad-sidebar row { background-color: $side; }
 .arckad-sidebar row:selected { background-color: $accent_mid; background-image: linear-gradient(to right, $accent_mid, $accent);
@@ -16614,6 +16620,87 @@ def skin_color(key):
 def skin_css(name):
     from string import Template
     return Template(_SKIN_TEMPLATE).safe_substitute(SKINS[name]).encode()
+
+
+class TabWindow(Gtk.Window):
+    """A tab pulled out of Arckad-D (like Chrome): its own window, with its own tab bar. Tabs drag back and forth
+    between windows; shortcuts work here too; the window closes when its last tab leaves."""
+
+    def __init__(self, main, x=None, y=None):
+        super().__init__(title=APP_NAME)
+        self.main = main
+        app = main.get_application()
+        if app:
+            self.set_application(app)
+        self.set_icon_name(APP_SLUG)
+        w, h = main.get_size()
+        self.set_default_size(max(640, int(w * 0.7)), max(460, int(h * 0.8)))
+        if x is not None and y is not None:
+            self.move(max(0, x - 80), max(0, y - 20))
+        self.hb = Gtk.HeaderBar(show_close_button=True, title=APP_NAME)
+        back = Gtk.Button(label="⇤ Back to the main window")
+        back.set_tooltip_text("Move these tabs back into the main Arckad-D window")
+        back.connect("clicked", lambda *_: self.tabs_back())
+        self.hb.pack_start(back)
+        self.set_titlebar(self.hb)
+        self.nb = main._notebook()
+        self.nb.connect("page-removed", self._removed)
+        self.add(self.nb)
+        main.__dict__.setdefault("_tab_windows", []).append(self)
+        self.connect("key-press-event", self._key)
+        self.connect("set-focus", main.on_set_focus)
+        self.connect("focus-in-event", lambda *_: self._activate_current())
+        self.connect("delete-event", lambda *_: self._cleanup() or False)
+        self.connect("destroy", self._gone)
+        self.show_all()
+
+    def _cleanup(self):
+        for i in range(self.nb.get_n_pages()):            # closing the window: its folders stop being watched
+            page = self.nb.get_nth_page(i)
+            if hasattr(page, "cleanup"):
+                page.cleanup()
+
+    def _activate_current(self):
+        n = self.nb.get_current_page()
+        if n >= 0:
+            self.main.set_active(self.nb.get_nth_page(n))
+            self.main.update_title()
+        return False
+
+    def _key(self, _w, ev):
+        """The main window's shortcuts (copy, paste, rename, delete…) for the tabs in this window."""
+        self._activate_current()
+        self.main._key_window = self
+        try:
+            return self.main.on_key(self, ev)
+        finally:
+            self.main._key_window = None
+
+    def _removed(self, nb, page, num):
+        if nb.get_n_pages() == 0:                          # its last tab went elsewhere: close
+            GLib.idle_add(lambda: self.destroy() or False)
+
+    def tabs_back(self):
+        main = self.main
+        while self.nb.get_n_pages():
+            page = self.nb.get_nth_page(0)
+            label = self.nb.get_tab_label(page)
+            self.nb.detach_tab(page)
+            idx = main.left_nb.append_page(page, label)
+            main.left_nb.set_tab_reorderable(page, True)
+            main.left_nb.set_tab_detachable(page, True)
+            main.left_nb.set_current_page(idx)
+        main.present()
+
+    def _gone(self, *_):
+        main = self.main
+        if self in getattr(main, "_tab_windows", []):
+            main._tab_windows.remove(self)
+        if main.active is not None and main.active.get_toplevel() is self:
+            nb = main.left_nb
+            main.active = None
+            main.set_active(nb.get_nth_page(nb.get_current_page()))
+        main.update_tab_closers()
 
 
 class MainWindow(Gtk.ApplicationWindow):
@@ -17023,6 +17110,9 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _notebook(self):
         nb = Gtk.Notebook(scrollable=True)
+        nb.set_group_name("arckad-tabs")                     # tabs move between all Arckad-D tab bars
+        nb.connect("create-window", self._tab_to_window)     # dropped outside: a window of its own
+        nb.connect("page-added", self._tab_arrived)
         add = self.icon_btn("list-add-symbolic", "New tab (Ctrl+T)", lambda *_: self.new_tab(nb))
         add.set_relief(Gtk.ReliefStyle.NONE)
         add.show()
@@ -17331,6 +17421,7 @@ class MainWindow(Gtk.ApplicationWindow):
         tab.show_all()
         idx = nb.append_page(pane, tab)
         nb.set_tab_reorderable(pane, True)
+        nb.set_tab_detachable(pane, True)
         pane.show_all()
         if switch:
             nb.set_current_page(idx)
@@ -17344,17 +17435,33 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.tab_label.set_width_chars(min(len(title), 18))
         pane.tab_label.set_tooltip_text(pane.location)
 
+    def _all_notebooks(self):
+        return [self.left_nb, self.right_nb] + [w.nb for w in getattr(self, "_tab_windows", [])]
+
     def update_tab_closers(self):
-        for nb in (self.left_nb, self.right_nb):
+        for nb in self._all_notebooks():
+            main = nb in (self.left_nb, self.right_nb)
             n = nb.get_n_pages()
             for i in range(n):
                 page = nb.get_nth_page(i)
                 if hasattr(page, "tab_close"):
-                    page.tab_close.set_visible(n > 1)
+                    page.tab_close.set_visible(n > 1 or not main)
+                nb.set_tab_detachable(page, n > 1 or not main)   # the main window keeps at least one tab
+
+    def _tab_to_window(self, nb, page, x, y):
+        """A tab dropped outside every Arckad-D window: give it a window of its own (like Chrome)."""
+        w = TabWindow(self, x, y)
+        return w.nb
+
+    def _tab_arrived(self, nb, page, num):
+        if hasattr(page, "tab_close"):
+            nb.set_tab_reorderable(page, True)
+        GLib.idle_add(lambda: (self.update_tab_closers(), nb.set_current_page(nb.page_num(page)),
+                               self.set_active(page), self.update_title()) and False)
 
     def close_tab(self, pane):
         nb = pane.get_parent()
-        if nb.get_n_pages() <= 1:
+        if nb.get_n_pages() <= 1 and nb in (self.left_nb, self.right_nb):
             return
         pane.cleanup()
         nb.remove_page(nb.page_num(pane))
@@ -17385,13 +17492,13 @@ class MainWindow(Gtk.ApplicationWindow):
         self.on_selection(pane)
 
     def other_pane(self):
-        if not self.cfg["dual"] or self.active is None:
+        if not self.cfg["dual"] or self.active is None or self.active.get_parent() not in (self.left_nb, self.right_nb):
             return None
         nb = self.right_nb if self.active.get_parent() is self.left_nb else self.left_nb
         return nb.get_nth_page(nb.get_current_page())
 
     def all_panes(self):
-        for nb in (self.left_nb, self.right_nb):
+        for nb in self._all_notebooks():
             for i in range(nb.get_n_pages()):
                 yield nb.get_nth_page(i)
 
@@ -17405,7 +17512,17 @@ class MainWindow(Gtk.ApplicationWindow):
     def update_title(self):
         if self.active:
             loc = self.active.location
-            self.set_title(short(loc) if is_folder_loc(loc) else self.active.title())
+            text = short(loc) if is_folder_loc(loc) else self.active.title()
+            top = self.active.get_toplevel()
+            (top if isinstance(top, TabWindow) else self).set_title(text)
+            if isinstance(top, TabWindow):
+                top.hb.set_title(text)
+        for nb in self._all_notebooks():                     # mark the tab bar you're working in
+            ctx = nb.get_style_context()
+            if self.active is not None and self.active.get_parent() is nb:
+                ctx.add_class("arckad-active-nb")
+            else:
+                ctx.remove_class("arckad-active-nb")
 
     def on_dual_toggled(self, btn):
         on = btn.get_active()
@@ -20194,7 +20311,7 @@ class MainWindow(Gtk.ApplicationWindow):
         ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
         shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
-        typing = isinstance(self.get_focus(), (Gtk.Entry, Gtk.TextView))
+        typing = isinstance((getattr(self, "_key_window", None) or self).get_focus(), (Gtk.Entry, Gtk.TextView))
         pane = self.active
         if ctrl and low == "t":
             self.new_tab()
