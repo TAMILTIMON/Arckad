@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.49.0"
+APP_VERSION = "3.50.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -4192,7 +4192,12 @@ class FilePane(Gtk.Box):
                 add("Pin to sidebar", lambda: win.pin(first))
                 for item in win.terminal_menu_items(first):
                     menu.append(item)
-            add("Rename… (F2)", lambda: win.rename(self, first), len(paths) == 1)
+            if not (VAULT.is_open() and str(self.location).startswith(str(VAULT.work))):
+                add("🔐 Move into the private vault", lambda: win.vault_ui.move_in(paths))
+            if len(paths) > 1:
+                add(f"✏ Rename these {len(paths)} items… (F2)", lambda: BatchRenameDialog(win, paths).run_rename())
+            else:
+                add("Rename… (F2)", lambda: win.rename(self, first), len(paths) == 1)
             add("Duplicate", lambda: win.duplicate(self, paths))
             add("Send to chat 💬", lambda: win.send_to_chat(paths))
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
@@ -4200,6 +4205,7 @@ class FilePane(Gtk.Box):
                 add("🗺 Journey map (where it has been)", lambda: JourneyWindow(win, paths[0]))
                 one = paths[0]
                 if os.path.isdir(one):
+                    add("📊 Disk usage", lambda: DiskUsageWindow(win, one))
                     if VERSIONS.protected(one):
                         add("🕘 Deleted files (from this folder)…", lambda: win.deleted_files(one))
                         add("🕘 Stop keeping version history here", lambda: win.version_protect(one, False))
@@ -4222,6 +4228,7 @@ class FilePane(Gtk.Box):
                 item.set_sensitive(in_folder)
                 menu.append(item)
             add("🗺 Journey map of this folder", lambda: JourneyWindow(win, self.location), in_folder)
+            add("📊 Disk usage of this folder", lambda: DiskUsageWindow(win, self.location), in_folder)
             if in_folder and VERSIONS.protected(self.location):
                 add("🕘 Deleted files (from this folder)…", lambda: win.deleted_files(self.location))
             elif in_folder:
@@ -4271,6 +4278,8 @@ class FilePane(Gtk.Box):
                 self.win.trash(self, self.selected_paths())
         elif key == "F2" and not typing and len(self.selected_paths()) == 1:
             self.win.rename(self, self.selected_paths()[0])
+        elif key == "F2" and not typing and len(self.selected_paths()) > 1:       # several: batch rename
+            BatchRenameDialog(self.win, self.selected_paths()).run_rename()
         else:
             return False
         return True
@@ -19322,6 +19331,1071 @@ class ArckadPro:
         self.win.info(text, mono=True)
 
 
+# ---------------------------------------------------------------- ✏ Batch rename (with preview and undo)
+def photo_date(path):
+    """The camera date inside a JPEG/TIFF photo (EXIF DateTimeOriginal), or None."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(256 * 1024)
+    except OSError:
+        return None
+    i = data.find(b"Exif\x00\x00")
+    if i < 0:
+        return None
+    t = data[i + 6:]
+    if len(t) < 8:
+        return None
+    le = t[:2] == b"II"
+    u16 = (lambda b, o: int.from_bytes(b[o:o + 2], "little" if le else "big"))
+    u32 = (lambda b, o: int.from_bytes(b[o:o + 4], "little" if le else "big"))
+
+    def ifd(off):
+        out = {}
+        if off + 2 > len(t):
+            return out
+        for k in range(u16(t, off)):
+            e = off + 2 + k * 12
+            if e + 12 > len(t):
+                break
+            out[u16(t, e)] = (u16(t, e + 2), u32(t, e + 4), e + 8)
+        return out
+    zero = ifd(u32(t, 4))
+    entries = dict(zero)
+    if 0x8769 in zero:                                  # the Exif sub-directory holds the camera date
+        entries.update(ifd(u32(t, zero[0x8769][2])))
+    for tag in (0x9003, 0x9004, 0x0132):                # taken, digitised, file date
+        if tag in entries:
+            _typ, count, valpos = entries[tag]
+            off = u32(t, valpos) if count > 4 else valpos
+            s = t[off:off + 19].decode("ascii", "replace")
+            try:
+                return time.mktime(time.strptime(s, "%Y:%m:%d %H:%M:%S"))
+            except ValueError:
+                continue
+    return None
+
+
+def batch_names(paths, mode, find="", repl="", case_sensitive=False, pattern="{name}", start=1, case="keep",
+                keep_ext=True):
+    """[(old path, new path)] for a batch rename."""
+    out = []
+    for i, p in enumerate(paths):
+        folder, base = os.path.split(p)
+        is_dir = os.path.isdir(p)
+        stem, ext = (base, "") if is_dir or not keep_ext else os.path.splitext(base)
+        if mode == "replace":
+            new = (stem.replace(find, repl) if case_sensitive else
+                   re.sub(re.escape(find), lambda _m: repl, stem, flags=re.I)) if find else stem
+        else:
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                mt = time.time()
+            n = start + i
+
+            def tok(m):
+                key, fmt = m.group(1), m.group(2) or ""
+                if key == "n":
+                    width = int(fmt[1:]) if fmt.startswith(":0") and fmt[2:].isdigit() else 0
+                    return str(n).zfill(width)
+                if key == "name":
+                    return stem
+                if key == "date":
+                    return time.strftime("%Y-%m-%d", time.localtime(mt))
+                if key == "time":
+                    return time.strftime("%H.%M.%S", time.localtime(mt))
+                if key == "photo_date":
+                    pd = photo_date(p)
+                    return time.strftime("%Y-%m-%d", time.localtime(pd or mt))
+                if key == "folder":
+                    return os.path.basename(folder)
+                return m.group(0)
+            new = re.sub(r"\{(n|name|date|time|photo_date|folder)(:0\d+)?\}", tok, pattern)
+        if case == "lower":
+            new = new.lower()
+        elif case == "upper":
+            new = new.upper()
+        elif case == "title":
+            new = new.title()
+        new = re.sub(r'[\\/:*?"<>|]', "_", new).strip() or stem
+        out.append((p, os.path.join(folder, new + ext)))
+    return out
+
+
+def batch_problems(pairs):
+    """{old path: reason} for names that would clash (with each other, or with files already there)."""
+    bad, seen = {}, {}
+    leaving = {os.path.normcase(a) for a, _b in pairs}
+    for a, b in pairs:
+        key = os.path.normcase(b)
+        if key in seen and seen[key] != a:
+            bad[a] = bad[seen[key]] = "two items would get this name"
+        seen[key] = a
+        if os.path.normcase(a) != key and os.path.exists(b) and key not in leaving:
+            bad[a] = "a file with this name is already there"
+    return bad
+
+
+def batch_apply(pairs):
+    """Rename safely (even swaps like A→B, B→A): first to temporary names, then to the final ones. Undoable."""
+    pairs = [(a, b) for a, b in pairs if a != b]
+    temps = []
+    for a, b in pairs:
+        t = os.path.join(os.path.dirname(a), f".arckad-rename-{secrets.token_hex(4)}")
+        os.rename(a, t)
+        temps.append((a, t, b))
+    done = []
+    for a, t, b in temps:
+        os.rename(t, b)
+        TAG_STORE.moved(a, b)                           # tags, notes and the journey map follow
+        done.append([a, b])
+    if done:
+        history = read_json(UNDO_FILE, [])
+        history.append({"when": time.time(), "moves": done, "what": "rename"})
+        write_json(UNDO_FILE, history[-20:])
+    return done
+
+
+class BatchRenameDialog(Gtk.Dialog):
+    def __init__(self, win, paths):
+        super().__init__(title=f"Rename {len(paths)} items", transient_for=win, modal=True)
+        self.win, self.paths = win, sorted(paths, key=lambda p: os.path.basename(p).casefold())
+        self.set_default_size(760, 560)
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.ok = self.add_button("Rename", Gtk.ResponseType.OK)
+        self.ok.get_style_context().add_class("suggested-action")
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        modes = Gtk.Box(spacing=6)
+        self.m_replace = Gtk.RadioButton.new_with_label(None, "Find & replace")
+        self.m_pattern = Gtk.RadioButton.new_with_label_from_widget(self.m_replace, "New names from a pattern")
+        for m in (self.m_replace, self.m_pattern):
+            m.connect("toggled", lambda *_: self.update())
+            modes.add(m)
+        box.add(modes)
+        self.stack = Gtk.Stack()
+        r = Gtk.Grid(column_spacing=8, row_spacing=6)
+        self.find, self.repl = Gtk.Entry(placeholder_text="Find"), Gtk.Entry(placeholder_text="Replace with")
+        self.case_sens = Gtk.CheckButton(label="Match case")
+        r.attach(self.find, 0, 0, 1, 1)
+        r.attach(self.repl, 1, 0, 1, 1)
+        r.attach(self.case_sens, 2, 0, 1, 1)
+        self.stack.add_named(r, "replace")
+        g = Gtk.Grid(column_spacing=8, row_spacing=6)
+        self.pattern = Gtk.Entry(text="{name} {n:02}", hexpand=True)
+        self.start = Gtk.SpinButton.new_with_range(0, 100000, 1)
+        self.start.set_value(1)
+        g.attach(self.pattern, 0, 0, 2, 1)
+        g.attach(Gtk.Label(label="Start at"), 2, 0, 1, 1)
+        g.attach(self.start, 3, 0, 1, 1)
+        help_ = Gtk.Label(xalign=0, wrap=True)
+        help_.set_markup("<small><tt>{name}</tt> old name · <tt>{n}</tt> number (<tt>{n:03}</tt> = 001) · <tt>{date}</tt> "
+                         "modified date · <tt>{photo_date}</tt> date the photo was taken · <tt>{time}</tt> · "
+                         "<tt>{folder}</tt> folder name</small>")
+        g.attach(help_, 0, 1, 4, 1)
+        self.stack.add_named(g, "pattern")
+        box.add(self.stack)
+        opts = Gtk.Box(spacing=8)
+        self.case = Gtk.ComboBoxText()
+        for k, label in (("keep", "Letters as they are"), ("lower", "lower case"), ("upper", "UPPER CASE"),
+                         ("title", "Title Case")):
+            self.case.append(k, label)
+        self.case.set_active(0)
+        self.keep_ext = Gtk.CheckButton(label="Keep the extension (.jpg, .pdf…)")
+        self.keep_ext.set_active(True)
+        opts.add(self.case)
+        opts.add(self.keep_ext)
+        box.add(opts)
+        self.store = Gtk.ListStore(str, str, str, str)            # old, new, colour, reason
+        tv = Gtk.TreeView(model=self.store)
+        for i, title in ((0, "Now"), (1, "Will be")):
+            rend = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE)
+            col = Gtk.TreeViewColumn(title, rend, text=i, foreground=2)
+            col.set_expand(True)
+            col.set_resizable(True)
+            tv.append_column(col)
+        tv.set_tooltip_column(3)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(tv)
+        box.pack_start(sw, True, True, 0)
+        self.status = Gtk.Label(xalign=0)
+        box.add(self.status)
+        for w in (self.find, self.repl, self.pattern):
+            w.connect("changed", lambda *_: self.update())
+        for w in (self.case_sens, self.keep_ext):
+            w.connect("toggled", lambda *_: self.update())
+        self.case.connect("changed", lambda *_: self.update())
+        self.start.connect("value-changed", lambda *_: self.update())
+        self.show_all()
+        self.m_pattern.set_active(True)
+        self.update()
+
+    def pairs(self):
+        mode = "replace" if self.m_replace.get_active() else "pattern"
+        return batch_names(self.paths, mode, self.find.get_text(), self.repl.get_text(), self.case_sens.get_active(),
+                           self.pattern.get_text(), int(self.start.get_value()), self.case.get_active_id(),
+                           self.keep_ext.get_active())
+
+    def update(self):
+        self.stack.set_visible_child_name("replace" if self.m_replace.get_active() else "pattern")
+        pairs = self.pairs()
+        bad = batch_problems(pairs)
+        self.store.clear()
+        changed = 0
+        for a, b in pairs:
+            same = a == b
+            changed += 0 if same else 1
+            self.store.append([os.path.basename(a), os.path.basename(b),
+                               "#e01b24" if a in bad else (skin_color("dim") if same else skin_color("text")),
+                               bad.get(a, "unchanged" if same else "")])
+        self.ok.set_sensitive(bool(changed) and not bad)
+        self.status.set_markup(f"<span foreground='#e01b24'>⚠ {len(bad)} name{'s' if len(bad) != 1 else ''} would clash "
+                               f"(point at the red rows)</span>" if bad else f"{changed} of {len(pairs)} will be renamed")
+
+    def run_rename(self):
+        if self.run() == Gtk.ResponseType.OK:
+            try:
+                done = batch_apply(self.pairs())
+                self.win.undo_btn.set_sensitive(True)
+                self.win.refresh_all()
+                self.win.flash_all(f"✏ Renamed {len(done)} items (Undo puts the old names back)")
+            except OSError as ex:
+                self.win.error(f"Renaming stopped: {ex.strerror or ex}")
+        self.destroy()
+
+
+# ---------------------------------------------------------------- 📊 Disk usage map
+_DU_FILE_COLOURS = {"Videos": "#e5484d", "Images": "#30a46c", "Audio": "#d6409f", "Archives": "#f5a623",
+                    "Documents": "#3e63dd", "Spreadsheets": "#29a383", "Presentations": "#e5733f", "Code": "#7c66dc",
+                    "Disk images": "#a1662f"}
+
+
+def squarify(items, x, y, w, h):
+    """Treemap layout: [(item, x, y, w, h)] with rectangles as close to squares as possible."""
+    items = [it for it in items if it[1] > 0]
+    total = sum(s for _n, s, *_ in items)
+    if not items or total <= 0 or w <= 0 or h <= 0:
+        return []
+    scale = w * h / total
+    sizes = [(it, it[1] * scale) for it in items]
+    out = []
+
+    def worst(row, side):
+        s = sum(a for _i, a in row)
+        mx, mn = max(a for _i, a in row), min(a for _i, a in row)
+        return max(side * side * mx / (s * s), (s * s) / (side * side * mn))
+    while sizes:
+        side = min(w, h)
+        row = [sizes.pop(0)]
+        while sizes and worst(row + [sizes[0]], side) <= worst(row, side):
+            row.append(sizes.pop(0))
+        s = sum(a for _i, a in row)
+        if w >= h:                                         # a column on the left
+            cw = s / h
+            yy = y
+            for it, a in row:
+                hh = a / cw
+                out.append((it, x, yy, cw, hh))
+                yy += hh
+            x, w = x + cw, w - cw
+        else:                                              # a row at the top
+            rh = s / w
+            xx = x
+            for it, a in row:
+                ww = a / rh
+                out.append((it, xx, y, ww, rh))
+                xx += ww
+            y, h = y + rh, h - rh
+    return out
+
+
+class DiskUsageWindow(Gtk.Window):
+    """What's filling a folder or drive, as coloured blocks (click a folder to zoom in), with the largest and oldest
+    files beside it for quick clean-up."""
+
+    def __init__(self, win, folder):
+        super().__init__(title=f"Disk usage · {short(folder)}")
+        self.win, self.root, self.current = win, os.path.abspath(folder), os.path.abspath(folder)
+        self.set_transient_for(win)
+        self.set_default_size(1180, 720)
+        self.sizes, self.kids, self.files = {}, {}, []      # folder → size, folder → [(name, size, is_dir)], [(path, size, mtime)]
+        self.rects = []
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+        self.add(outer)
+        top = Gtk.Box(spacing=8)
+        self.up = Gtk.Button(label="↑ Up")
+        self.up.connect("clicked", lambda *_: self.go(os.path.dirname(self.current)))
+        top.add(self.up)
+        self.title = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        top.pack_start(self.title, True, True, 0)
+        dup = Gtk.Button(label="Find duplicates here")
+        dup.connect("clicked", lambda *_: self.win.duplicates(self.current))
+        top.add(dup)
+        outer.add(top)
+        body = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        outer.pack_start(body, True, True, 0)
+        self.area = Gtk.EventBox()
+        self.img = Gtk.Image()
+        self.area.add(self.img)
+        self.area.connect("button-press-event", self._click)
+        self.area.connect("size-allocate", lambda *_: self._queue_draw())
+        self.area.set_size_request(560, 420)
+        body.pack1(self.area, True, False)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=8)
+        self.old_only = Gtk.CheckButton(label="Only files not changed for a year")
+        self.old_only.connect("toggled", lambda *_: self._fill_files())
+        side.add(self.old_only)
+        self.files_box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        fsw = Gtk.ScrolledWindow(vexpand=True)
+        fsw.set_size_request(360, -1)
+        fsw.add(self.files_box)
+        side.pack_start(fsw, True, True, 0)
+        body.pack2(side, False, False)
+        self.status = Gtk.Label(xalign=0)
+        outer.add(self.status)
+        self.show_all()
+        self.status.set_text("Measuring…")
+        threading.Thread(target=self._measure, daemon=True).start()
+
+    # ---------- measuring (once, in the background)
+    def _measure(self):
+        sizes, kids, files, count = {}, {}, [], [0]
+
+        def walk(folder):
+            total, here = 0, []
+            try:
+                with os.scandir(folder) as it:
+                    entries = list(it)
+            except OSError:
+                return 0
+            for e in entries:
+                try:
+                    if e.is_symlink():
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        s = walk(e.path)
+                        here.append((e.name, s, True))
+                    else:
+                        st = e.stat(follow_symlinks=False)
+                        s = st.st_blocks * 512 if hasattr(st, "st_blocks") else st.st_size
+                        here.append((e.name, s, False))
+                        files.append((e.path, s, st.st_mtime))
+                        count[0] += 1
+                        if count[0] % 5000 == 0:
+                            GLib.idle_add(lambda n=count[0]: self.status.set_text(f"Measuring… {n:,} files") and False)
+                    total += s
+                except OSError:
+                    continue
+            sizes[folder] = total
+            kids[folder] = here
+            return total
+        walk(self.root)
+        files.sort(key=lambda f: -f[1])
+        self.sizes, self.kids, self.files = sizes, kids, files[:5000]
+        GLib.idle_add(lambda: self.go(self.root) or False)
+
+    # ---------- showing a folder
+    def go(self, folder):
+        if folder not in self.kids or not (folder == self.root or folder.startswith(self.root + os.sep)):
+            return
+        self.current = folder
+        self.up.set_sensitive(folder != self.root)
+        self.title.set_markup(f"<b>{esc(short(folder))}</b>  ·  {human_size(self.sizes.get(folder, 0))}")
+        self.status.set_text(f"{len(self.kids[folder])} items · click a folder to look inside · the biggest blocks "
+                             f"take the most space")
+        self._queue_draw()
+        self._fill_files()
+
+    def _queue_draw(self):
+        if getattr(self, "_draw_id", None) is None:
+            self._draw_id = GLib.timeout_add(80, self._draw)
+
+    def _draw(self):
+        self._draw_id = None
+        if self.current not in self.kids:
+            return False
+        W, H = max(200, self.area.get_allocated_width()), max(150, self.area.get_allocated_height())
+        items = sorted(self.kids[self.current], key=lambda k: -k[1])
+        big, rest = items[:60], items[60:]
+        if rest:
+            big.append((f"{len(rest)} smaller items", sum(r[1] for r in rest), None))
+        self.rects = squarify(big, 0, 0, W, H)
+        fg = "#ffffff"
+        parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">']
+        for (name, size, is_dir), x, y, w, h in self.rects:
+            if is_dir:
+                hue = int(hashlib.md5(name.encode()).hexdigest()[:2], 16)
+                col = f"hsl({210 + hue % 60}, 55%, {38 + hue % 14}%)"
+            elif is_dir is None:
+                col = "#5f6670"
+            else:
+                col = _DU_FILE_COLOURS.get(category_of(name), "#6b7280")
+            parts.append(f'<rect x="{x + 1:.1f}" y="{y + 1:.1f}" width="{max(0, w - 2):.1f}" height="{max(0, h - 2):.1f}" '
+                         f'rx="6" fill="{col}"/>')
+            if w > 70 and h > 34:
+                label = (("📁 " if is_dir else "") + name)[: max(4, int(w / 7.5))]
+                parts.append(f'<text x="{x + 8:.1f}" y="{y + 20:.1f}" fill="{fg}" font-size="13" font-weight="700" '
+                             f'font-family="Segoe UI, Ubuntu, Arial, sans-serif">{esc(label)}</text>'
+                             f'<text x="{x + 8:.1f}" y="{y + 36:.1f}" fill="{fg}" font-size="11" opacity="0.85" '
+                             f'font-family="Segoe UI, Ubuntu, Arial, sans-serif">{human_size(size)}</text>')
+        parts.append("</svg>")
+        try:
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write("".join(parts).encode())
+            loader.close()
+            self.img.set_from_pixbuf(loader.get_pixbuf())
+        except GLib.Error:
+            pass
+        return False
+
+    def _click(self, _w, ev):
+        for (name, size, is_dir), x, y, w, h in self.rects:
+            if x <= ev.x < x + w and y <= ev.y < y + h:
+                path = os.path.join(self.current, name)
+                if is_dir:
+                    self.go(path)
+                elif is_dir is False:
+                    self.win.show_from_tray(folder=self.current, select=path)
+                return True
+        return False
+
+    # ---------- largest (and old) files, for clean-up
+    def _fill_files(self):
+        for c in self.files_box.get_children():
+            self.files_box.remove(c)
+        prefix = self.current + os.sep
+        year_ago = time.time() - 365 * 86400
+        old = self.old_only.get_active()
+        shown = [f for f in self.files if f[0].startswith(prefix) and (not old or f[2] < year_ago)][:40]
+        head = Gtk.Label(xalign=0)
+        head.set_markup(f"<b>{'Largest files not changed for a year' if old else 'Largest files'}</b> here")
+        self.files_box.add(head)
+        for path, size, mtime in shown:
+            row = Gtk.Box(spacing=6, margin=3)
+            lbl = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+            lbl.set_markup(f"<b>{esc(os.path.basename(path))}</b>\n<small>{human_size(size)} · "
+                           f"{esc(time.strftime('%d %b %Y', time.localtime(mtime)))} · "
+                           f"{esc(short(os.path.dirname(path)))}</small>")
+            lbl.set_tooltip_text(path)
+            row.pack_start(lbl, True, True, 0)
+            show = Gtk.Button(label="Show")
+            show.connect("clicked", lambda _b, p=path: self.win.show_from_tray(folder=os.path.dirname(p), select=p))
+            row.add(show)
+            tr = Gtk.Button(label="🗑")
+            tr.set_tooltip_text("Move to Trash")
+            tr.connect("clicked", lambda _b, p=path, r=row: self._trash(p, r))
+            row.add(tr)
+            r = Gtk.ListBoxRow()
+            r.add(row)
+            self.files_box.add(r)
+        if not shown:
+            self.files_box.add(Gtk.Label(label="Nothing here.", margin=12))
+        self.files_box.show_all()
+
+    def _trash(self, path, row):
+        try:
+            JOURNEY.removed(path, trash=True)
+            Gio.File.new_for_path(path).trash(None)
+        except GLib.Error as ex:
+            self.win.error(f"Couldn't move it to the Trash: {ex.message}")
+            return
+        size = next((f[1] for f in self.files if f[0] == path), 0)
+        self.files = [f for f in self.files if f[0] != path]
+        d = os.path.dirname(path)                          # the folders above it are smaller now
+        while d.startswith(self.root):
+            self.sizes[d] = max(0, self.sizes.get(d, 0) - size)
+            if d == self.root:
+                break
+            d = os.path.dirname(d)
+        name = os.path.basename(path)
+        par = os.path.dirname(path)
+        self.kids[par] = [k for k in self.kids.get(par, []) if k[0] != name]
+        p, child = os.path.dirname(par), par
+        while child != self.root and p.startswith(self.root):
+            self.kids[p] = [(n, self.sizes.get(os.path.join(p, n), s) if isdir else s, isdir) for n, s, isdir in self.kids[p]]
+            child, p = p, os.path.dirname(p)
+        self.go(self.current)
+        self.status.set_text(f"🗑 {name} moved to the Trash ({human_size(size)} freed once the Trash is emptied)")
+
+
+# ---------------------------------------------------------------- ⚙ Folder rules
+# “When a PDF arrives in Downloads, move it to Documents/Invoices and tag it Work”, “files in Scans older than
+# 90 days → Archive”. Arriving files are handled a few seconds after they've finished arriving; “older than” rules
+# run at start and every hour. Moves are recorded in the journey maps; names never overwrite (“ (1)” is added).
+RULES_LOG = CONFIG_DIR / "rules-log.json"
+RULE_TYPES = ["Any file"] + list(CATEGORIES)
+RULE_ACTIONS = [("move", "Move to"), ("copy", "Copy to"), ("tag", "Add the tag"), ("trash", "Move to the Trash")]
+
+
+def rule_matches(rule, path, now=None):
+    name = os.path.basename(path)
+    if name.startswith((".", "~$")) or ext_of(name) in PARTIAL_EXTS or not os.path.isfile(path):
+        return False
+    kind = rule.get("type") or "Any file"
+    if kind != "Any file" and category_of(name) != kind:
+        return False
+    exts = [e.strip(". ").lower() for e in re.split(r"[,\s]+", rule.get("exts", "")) if e.strip(". ")]
+    if exts and ext_of(name) not in exts:
+        return False
+    if rule.get("contains") and rule["contains"].lower() not in name.lower():
+        return False
+    if rule.get("when") == "age":
+        try:
+            if (now or time.time()) - os.path.getmtime(path) < int(rule.get("days", 90)) * 86400:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def rule_describe(rule):
+    what = rule.get("type") or "Any file"
+    what = ("files" if what == "Any file" else what.lower()) + (f" (.{rule['exts']})" if rule.get("exts") else "") + \
+        (f" with “{rule['contains']}” in the name" if rule.get("contains") else "")
+    when = (f"older than {rule.get('days', 90)} days" if rule.get("when") == "age" else "as soon as they arrive")
+    act = dict(RULE_ACTIONS).get(rule.get("action"), "?")
+    target = short(rule.get("target", "")) if rule.get("action") in ("move", "copy") else \
+        (rule.get("tag", "") if rule.get("action") == "tag" else "")
+    return f"{short(rule.get('folder', ''))}: {what}, {when} → {act} {target}".strip()
+
+
+class FolderRules:
+    def __init__(self):
+        self.win = None
+        self.mons = {}
+        self.pending = {}
+        self.log = read_json(RULES_LOG, []) if RULES_LOG.exists() else []
+
+    def rules(self):
+        return self.win.cfg.setdefault("rules", []) if self.win else []
+
+    def save(self):
+        write_json(CONFIG_FILE, self.win.cfg)
+        self.rewatch()
+
+    def start(self, win):
+        self.win = win
+        self.rewatch()
+        GLib.timeout_add_seconds(30, lambda: self.run_age_rules() or False)
+        GLib.timeout_add_seconds(3600, lambda: self.run_age_rules() or True)
+
+    def rewatch(self):
+        want = {os.path.abspath(r["folder"]) for r in self.rules()
+                if r.get("enabled", True) and r.get("when") != "age" and os.path.isdir(r.get("folder", ""))}
+        for f in [f for f in self.mons if f not in want]:
+            self.mons.pop(f).cancel()
+        for f in want - set(self.mons):
+            try:
+                m = Gio.File.new_for_path(f).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+                m.connect("changed", self._changed)
+                self.mons[f] = m
+            except GLib.Error:
+                pass
+
+    def _changed(self, _m, f, other, ev):
+        E = Gio.FileMonitorEvent
+        target = other if ev in (E.RENAMED, E.MOVED_IN) and other else f
+        if ev in (E.RENAMED,) and other:
+            target = other
+        p = target.get_path() if target else None
+        if not p or ev not in (E.CREATED, E.MOVED_IN, E.RENAMED, E.CHANGES_DONE_HINT):
+            return
+        if p in self.pending:
+            GLib.source_remove(self.pending.pop(p))
+        self.pending[p] = GLib.timeout_add(2500, self._arrived, p, -1)
+
+    def _arrived(self, path, last_size):
+        """A few seconds after the last change, and only once its size stops growing (finished arriving)."""
+        self.pending.pop(path, None)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size != last_size:
+            self.pending[path] = GLib.timeout_add(1500, self._arrived, path, size)
+            return False
+        folder = os.path.dirname(path)
+        for r in self.rules():
+            if r.get("enabled", True) and r.get("when") != "age" and os.path.abspath(r.get("folder", "")) == folder \
+                    and rule_matches(r, path):
+                threading.Thread(target=self.apply, args=(r, path), daemon=True).start()
+                break                                       # the first matching rule handles it
+        return False
+
+    def run_age_rules(self):
+        def work():
+            for r in self.rules():
+                if r.get("enabled", True) and r.get("when") == "age":
+                    self.run_now(r)
+        threading.Thread(target=work, daemon=True).start()
+
+    def matching(self, rule):
+        folder = rule.get("folder", "")
+        try:
+            return [e.path for e in os.scandir(folder) if rule_matches(rule, e.path)]
+        except OSError:
+            return []
+
+    def run_now(self, rule):
+        done = 0
+        for p in self.matching(rule):
+            if self.apply(rule, p):
+                done += 1
+        return done
+
+    def apply(self, rule, path):
+        act, name = rule.get("action"), os.path.basename(path)
+        try:
+            if act in ("move", "copy"):
+                target = os.path.abspath(rule.get("target", ""))
+                if not target or target == os.path.dirname(os.path.abspath(path)):
+                    return False
+                os.makedirs(target, exist_ok=True)
+                dest = str(unique_target(os.path.join(target, name)))
+                if act == "move":
+                    shutil.move(path, dest)
+                    TAG_STORE.moved(path, dest)
+                else:
+                    shutil.copy2(path, dest)
+                    JOURNEY.copied(path, dest)
+                if rule.get("tag"):
+                    TAG_STORE.set_tags(dest, sorted(set(TAG_STORE.tags(dest)) | {rule["tag"]}))
+                result = f"{'moved' if act == 'move' else 'copied'} to {short(target)}"
+            elif act == "tag":
+                TAG_STORE.set_tags(path, sorted(set(TAG_STORE.tags(path)) | {rule.get("tag", "Important")}))
+                result = f"tagged {rule.get('tag')}"
+            elif act == "trash":
+                JOURNEY.removed(path, trash=True)
+                Gio.File.new_for_path(path).trash(None)
+                result = "moved to the Trash"
+            else:
+                return False
+        except (OSError, GLib.Error) as ex:
+            result = f"✗ {getattr(ex, 'strerror', None) or ex}"
+        self.log.append([time.time(), rule.get("name") or rule_describe(rule), name, result])
+        self.log = self.log[-200:]
+        write_json(RULES_LOG, self.log)
+        if self.win and not result.startswith("✗"):
+            GLib.idle_add(lambda: (self.win.flash_all(f"⚙ {name}: {result}"), self.win.refresh_all()) and False)
+        return not result.startswith("✗")
+
+
+RULES = FolderRules()
+
+
+class RulesDialog(Gtk.Dialog):
+    def __init__(self, win):
+        super().__init__(title="Folder rules", transient_for=win, modal=True)
+        self.win = win
+        self.set_default_size(760, 560)
+        self.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = self.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(12)
+        t = Gtk.Label(xalign=0, wrap=True)
+        t.set_markup("<b>⚙ Folder rules</b>\nArckad-D tidies folders for you: when files <b>arrive</b> (a few seconds after "
+                     "they've finished arriving) or once they're <b>older than</b> a number of days (checked every hour).")
+        box.add(t)
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(self.list)
+        box.pack_start(sw, True, True, 0)
+        add = Gtk.Button(label="＋ New rule")
+        add.get_style_context().add_class("suggested-action")
+        add.connect("clicked", lambda *_: self.edit(None))
+        box.add(add)
+        self.logl = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        box.add(self.logl)
+        self.fill()
+        self.show_all()
+
+    def fill(self):
+        for c in self.list.get_children():
+            self.list.remove(c)
+        rules = RULES.rules()
+        for r in rules:
+            row = Gtk.Box(spacing=8, margin=5)
+            sw = Gtk.Switch(active=r.get("enabled", True), valign=Gtk.Align.CENTER)
+            sw.connect("notify::active", lambda s, _p, r=r: (r.__setitem__("enabled", s.get_active()), RULES.save()))
+            row.add(sw)
+            lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+            lbl.set_markup(f"<b>{esc(r.get('name') or 'Rule')}</b>\n<small>{esc(rule_describe(r))}</small>")
+            row.pack_start(lbl, True, True, 0)
+            for label, cb in (("Run now", lambda r=r: self.run(r)), ("Edit", lambda r=r: self.edit(r)),
+                              ("Delete", lambda r=r: (rules.remove(r), RULES.save(), self.fill()))):
+                b = Gtk.Button(label=label)
+                b.connect("clicked", lambda _b, cb=cb: cb())
+                row.add(b)
+            rr = Gtk.ListBoxRow()
+            rr.add(row)
+            self.list.add(rr)
+        if not rules:
+            self.list.add(Gtk.Label(label="No rules yet. Example: Downloads · PDF documents · as soon as they arrive → "
+                                          "Move to Documents/Invoices", wrap=True, margin=16))
+        self.list.show_all()
+        recent = RULES.log[-6:]
+        self.logl.set_markup("<small><b>Recent activity</b>\n" + ("\n".join(
+            f"{time.strftime('%d %b %H:%M', time.localtime(t))} · {esc(n)} · {esc(res)}" for t, _r, n, res in reversed(recent))
+            or "nothing yet") + "</small>")
+
+    def run(self, r):
+        n = len(RULES.matching(r))
+        if not n:
+            self.win.flash_all("Nothing in that folder matches this rule right now")
+            return
+        if self.win.confirm(f"Apply “{r.get('name') or 'this rule'}” to the {n} matching file{'s' if n != 1 else ''} "
+                            f"already in {short(r['folder'])}?"):
+            done = RULES.run_now(r)
+            self.win.flash_all(f"⚙ Done: {done} file{'s' if done != 1 else ''}")
+            self.fill()
+
+    def edit(self, rule):
+        r = dict(rule or {"enabled": True, "when": "arrive", "type": "Any file", "action": "move", "days": 90})
+        d = Gtk.Dialog(title="Folder rule", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+        g = Gtk.Grid(column_spacing=10, row_spacing=8, margin=14)
+        d.get_content_area().add(g)
+        name = Gtk.Entry(text=r.get("name", ""), placeholder_text="e.g. Invoices from Downloads")
+        folder = Gtk.FileChooserButton(title="Folder to watch", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        if r.get("folder"):
+            folder.set_filename(r["folder"])
+        else:
+            folder.set_filename(str(downloads_dir()))
+        typ = Gtk.ComboBoxText()
+        for k in RULE_TYPES:
+            typ.append(k, k)
+        typ.set_active_id(r.get("type") or "Any file")
+        exts = Gtk.Entry(text=r.get("exts", ""), placeholder_text="optional: pdf docx")
+        contains = Gtk.Entry(text=r.get("contains", ""), placeholder_text="optional: invoice")
+        when = Gtk.ComboBoxText()
+        when.append("arrive", "As soon as they arrive")
+        when.append("age", "Once they're older than…")
+        when.set_active_id(r.get("when", "arrive"))
+        days = Gtk.SpinButton.new_with_range(1, 3650, 1)
+        days.set_value(int(r.get("days", 90)))
+        act = Gtk.ComboBoxText()
+        for k, label in RULE_ACTIONS:
+            act.append(k, label)
+        act.set_active_id(r.get("action", "move"))
+        target = Gtk.FileChooserButton(title="Where to", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        if r.get("target"):
+            target.set_filename(r["target"])
+        tag = Gtk.ComboBoxText()
+        tag.append("", "(no tag)")
+        for t in TAGS:
+            tag.append(t, t)
+        tag.set_active_id(r.get("tag", ""))
+        rows = [("Name", name), ("Folder", folder), ("Files", typ), ("Extensions", exts), ("Name contains", contains),
+                ("When", when), ("Days", days), ("Then", act), ("Destination", target), ("Tag", tag)]
+        for i, (label, w) in enumerate(rows):
+            g.attach(Gtk.Label(label=label, xalign=1), 0, i, 1, 1)
+            w.set_hexpand(True)
+            g.attach(w, 1, i, 1, 1)
+
+        def sync(*_):
+            days.set_sensitive(when.get_active_id() == "age")
+            target.set_sensitive(act.get_active_id() in ("move", "copy"))
+            tag.set_sensitive(act.get_active_id() != "trash")
+        when.connect("changed", sync)
+        act.connect("changed", sync)
+        sync()
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK and folder.get_filename():
+            r.update(name=name.get_text().strip(), folder=folder.get_filename(), type=typ.get_active_id(),
+                     exts=exts.get_text().strip(), contains=contains.get_text().strip(), when=when.get_active_id(),
+                     days=int(days.get_value()), action=act.get_active_id(), target=target.get_filename() or "",
+                     tag=tag.get_active_id() or "")
+            if r["action"] in ("move", "copy") and not r["target"]:
+                self.win.error("Choose where the files should go.")
+            else:
+                rules = RULES.rules()
+                if rule is not None and rule in rules:
+                    rules[rules.index(rule)] = r
+                else:
+                    rules.append(r)
+                RULES.save()
+                self.fill()
+        d.destroy()
+
+
+# ---------------------------------------------------------------- 🔐 Private vault
+# Files are encrypted on disk with a random vault key, itself locked with your password (scrypt). Unlocking decrypts
+# them into a temporary working folder (in memory on Ubuntu: /dev/shm) that opens in a tab; locking encrypts what
+# changed back into the vault and deletes the working folder. Locks itself after 10 minutes without using Arckad-D,
+# when the screen locks (Ubuntu) and when Arckad-D quits. There is no back door: a forgotten password can't be undone.
+VAULT_DIR = Path(GLib.get_user_data_dir()) / APP_SLUG / "vault"
+VAULT_MAX_FILE = 300 * 1024 * 1024
+
+
+def _vault_kek(password, salt):
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+
+
+class Vault:
+    def __init__(self):
+        self.key = None                                   # the vault key while unlocked
+        self.work = None                                  # the working folder while unlocked
+        self.index = {}                                   # relative path → {id, hash}
+        self.lock = threading.RLock()
+
+    def exists(self):
+        return (VAULT_DIR / "vault.json").exists()
+
+    def is_open(self):
+        return self.key is not None and self.work is not None
+
+    def _meta(self):
+        return read_json(VAULT_DIR / "vault.json", {})
+
+    def create(self, password):
+        VAULT_DIR.mkdir(parents=True, exist_ok=True)
+        (VAULT_DIR / "data").mkdir(exist_ok=True)
+        salt, master = secrets.token_bytes(16), secrets.token_bytes(32)
+        meta = {"format": "arckad-vault-1", "salt": salt.hex(),
+                "wrapped": seal(_vault_kek(password, salt), master).hex(), "index": seal(master, b"{}").hex(),
+                "created": time.time()}
+        write_json(VAULT_DIR / "vault.json", meta)
+        try:
+            os.chmod(VAULT_DIR, 0o700)
+        except OSError:
+            pass
+
+    def _unwrap(self, password):
+        meta = self._meta()
+        try:
+            return unseal(_vault_kek(password, bytes.fromhex(meta["salt"])), bytes.fromhex(meta["wrapped"]))
+        except Exception:
+            return None
+
+    def change_password(self, old, new):
+        master = self._unwrap(old)
+        if master is None:
+            return False
+        meta = self._meta()
+        salt = secrets.token_bytes(16)
+        meta.update(salt=salt.hex(), wrapped=seal(_vault_kek(new, salt), master).hex())
+        write_json(VAULT_DIR / "vault.json", meta)
+        return True
+
+    def open(self, password):
+        """Decrypt into a private working folder. Returns its path, or None for a wrong password."""
+        master = self._unwrap(password)
+        if master is None:
+            return None
+        with self.lock:
+            self.key = master
+            self.index = json.loads(unseal(master, bytes.fromhex(self._meta()["index"])))
+            base = Path("/dev/shm") if not IS_WIN and os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) \
+                else Path(tempfile.gettempdir())
+            self.work = Path(tempfile.mkdtemp(prefix="arckad-vault-", dir=str(base))) / "Private vault"
+            self.work.mkdir()
+            os.chmod(self.work.parent, 0o700)
+            for rel, info in self.index.items():
+                dest = self.work / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(unseal(master, (VAULT_DIR / "data" / f"{info['id']}.enc").read_bytes()))
+            return str(self.work)
+
+    def sync(self):
+        """Encrypt new and changed files into the vault (and forget deleted ones). Safe to call any time."""
+        with self.lock:
+            if not self.is_open():
+                return 0
+            changed, seen = 0, set()
+            for root, _dirs, files in os.walk(self.work):
+                for f in files:
+                    p = Path(root) / f
+                    rel = str(p.relative_to(self.work))
+                    try:
+                        if p.stat().st_size > VAULT_MAX_FILE:
+                            continue
+                        data = p.read_bytes()
+                    except OSError:
+                        continue
+                    seen.add(rel)
+                    h = hashlib.sha256(data).hexdigest()
+                    old = self.index.get(rel)
+                    if old and old["hash"] == h:
+                        continue
+                    vid = old["id"] if old else secrets.token_hex(12)
+                    out = VAULT_DIR / "data" / f"{vid}.enc"
+                    tmp = out.with_suffix(".tmp")
+                    tmp.write_bytes(seal(self.key, data))
+                    os.replace(tmp, out)
+                    self.index[rel] = {"id": vid, "hash": h}
+                    changed += 1
+            for rel in [r for r in self.index if r not in seen]:
+                (VAULT_DIR / "data" / f"{self.index[rel]['id']}.enc").unlink(missing_ok=True)
+                del self.index[rel]
+                changed += 1
+            meta = self._meta()
+            meta["index"] = seal(self.key, json.dumps(self.index).encode()).hex()
+            write_json(VAULT_DIR / "vault.json", meta)
+            return changed
+
+    def close(self):
+        """Save everything into the vault, then delete the working folder and forget the key."""
+        with self.lock:
+            if not self.is_open():
+                return
+            self.sync()
+            shutil.rmtree(self.work.parent, ignore_errors=True)
+            self.key, self.work, self.index = None, None, {}
+
+
+VAULT = Vault()
+
+
+class VaultUI:
+    """The vault in Arckad-D: sidebar entry, unlock / create dialogs, the “Vault open” bar, auto-lock."""
+
+    IDLE_LOCK = 600
+
+    def __init__(self, win):
+        self.win = win
+        self.last_use = time.time()
+        win.connect("event", self._activity)
+        self.bar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("🔓 <b>Private vault is open</b> · it locks itself after 10 minutes without use")
+        self.bar.get_content_area().add(lbl)
+        self.bar.add_button("🔐 Lock now", 1)
+        self.bar.connect("response", lambda *_: self.lock_now())
+        self.bar.set_no_show_all(True)
+        GLib.timeout_add_seconds(30, self._tick)
+        self._watch_screen_lock()
+
+    def _activity(self, *_):
+        self.last_use = time.time()
+        return False
+
+    def _tick(self):
+        if VAULT.is_open():
+            if time.time() - self.last_use > self.IDLE_LOCK:
+                self.lock_now("Locked after 10 minutes without use")
+            elif int(time.time()) % 120 < 30:                       # save changes into the vault every ~2 min
+                threading.Thread(target=VAULT.sync, daemon=True).start()
+        return True
+
+    def _watch_screen_lock(self):
+        if IS_WIN:
+            return
+        try:
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            for iface in ("org.gnome.ScreenSaver", "org.freedesktop.ScreenSaver"):
+                bus.signal_subscribe(None, iface, "ActiveChanged", None, None, Gio.DBusSignalFlags.NONE,
+                                     lambda *a: a[5].unpack()[0] and GLib.idle_add(
+                                         lambda: self.lock_now("Locked because the screen locked") or False))
+        except Exception:
+            pass
+
+    def open(self):
+        if VAULT.is_open():
+            self.win.show_files()
+            self.win.active.go(str(VAULT.work))
+            return
+        if not VAULT.exists():
+            return self.create()
+        pw = self._ask("🔐 Private vault", "Enter the vault password:")
+        if pw is None:
+            return
+        self.win.flash_all("Unlocking…")
+
+        def work():
+            path = VAULT.open(pw)
+            GLib.idle_add(lambda: self._opened(path) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _opened(self, path):
+        if not path:
+            self.win.error("That password isn't right.")
+            return
+        self.last_use = time.time()
+        self.bar.set_no_show_all(False)
+        self.bar.show_all()
+        self.win.show_files()
+        self.win.new_tab(self.win.left_nb, path)
+        self.win.flash_all("🔓 Vault open")
+
+    def lock_now(self, why="Vault locked"):
+        if not VAULT.is_open():
+            return
+        work = str(VAULT.work)
+        for p in list(self.win.all_panes()):                       # tabs showing the vault leave it first
+            if p.location == work or str(p.location).startswith(work + os.sep):
+                p.go(str(HOME))
+        VAULT.close()
+        self.bar.hide()
+        self.win.flash_all(f"🔐 {why}")
+
+    def create(self):
+        d = Gtk.Dialog(title="Create your private vault", transient_for=self.win, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Create the vault", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        t = Gtk.Label(xalign=0, wrap=True, max_width_chars=58)
+        t.set_markup("<b>🔐 Private vault</b>\nA place for sensitive files (salary slips, IDs, contracts), "
+                     "<b>encrypted</b> on this PC and opened only with your password.\n\n"
+                     "<span foreground='#e01b24'><b>If you forget the password, the files can't be recovered</b></span>"
+                     " — by anyone. Write it down somewhere safe.")
+        box.add(t)
+        p1 = Gtk.Entry(visibility=False, placeholder_text="Password (at least 8 characters)")
+        p2 = Gtk.Entry(visibility=False, placeholder_text="The same password again")
+        msg = Gtk.Label(xalign=0)
+        for w in (p1, p2, msg):
+            box.add(w)
+        d.show_all()
+        while d.run() == Gtk.ResponseType.OK:
+            if len(p1.get_text()) < 8:
+                msg.set_markup("<span foreground='#e01b24'>At least 8 characters, please.</span>")
+            elif p1.get_text() != p2.get_text():
+                msg.set_markup("<span foreground='#e01b24'>The two passwords are different.</span>")
+            else:
+                VAULT.create(p1.get_text())
+                pw = p1.get_text()
+                d.destroy()
+                self._opened(VAULT.open(pw))
+                return
+        d.destroy()
+
+    def _ask(self, title, text):
+        d = Gtk.Dialog(title=title, transient_for=self.win, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Unlock", Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        box.add(Gtk.Label(label=text, xalign=0))
+        e = Gtk.Entry(visibility=False, activates_default=True)
+        box.add(e)
+        d.show_all()
+        r = d.run()
+        pw = e.get_text()
+        d.destroy()
+        return pw if r == Gtk.ResponseType.OK and pw else None
+
+    def move_in(self, paths):
+        """Move files into the (open) vault; the originals are removed."""
+        if not VAULT.is_open():
+            self.open()
+            if not VAULT.is_open():
+                return
+        moved = 0
+        for p in paths:
+            dest = unique_target(Path(VAULT.work) / os.path.basename(p))
+            try:
+                shutil.move(p, dest)
+                JOURNEY.removed(p, trash=False)
+                moved += 1
+            except OSError as ex:
+                self.win.error(f"Couldn't move {os.path.basename(p)}: {ex.strerror}")
+        threading.Thread(target=VAULT.sync, daemon=True).start()
+        self.win.refresh_all()
+        self.win.flash_all(f"🔐 Moved {moved} item{'s' if moved != 1 else ''} into the vault")
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -19686,6 +20760,7 @@ class MainWindow(Gtk.ApplicationWindow):
         GLib.idle_add(self._default_fm_start)
         GLib.timeout_add_seconds(6, self._start_journey_watch)
         GLib.timeout_add_seconds(8, lambda: VERSIONS.start() or False)
+        GLib.timeout_add_seconds(5, lambda: RULES.start(self) or False)
         GLib.timeout_add_seconds(90, lambda: (INDEX.available() and not CONTENT.count() and CONTENT.update_async())
                                  and False)
         self.connect("configure-event", lambda *_: GLib.idle_add(self._check_compact) and False)
@@ -20022,6 +21097,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Keyboard shortcuts", lambda: self.info(SHORTCUTS, mono=True)),
             ("Default file manager…", self.default_fm_dialog),
             ("🏢 Organisation…", self.org_dialog),
+            ("🔐 Change the vault password…", self.vault_password),
             ("🏢 Arckad-D Pro (organisation admin)…", self.open_pro),
             ("Change logo…", self.choose_logo),
             ("Use the default logo", self.reset_logo),
@@ -20047,6 +21123,9 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Update search index now", INDEX.rebuild),
             ("Search index settings…", self.index_settings),
             ("🕘 Version history…", self.version_settings),
+            ("⚙ Folder rules…", lambda: (lambda d: (d.run(), d.destroy()))(RulesDialog(self))),
+            ("📊 Disk usage map…", lambda: DiskUsageWindow(self, self.active.location if is_folder_loc(self.active.location)
+                                                           else str(HOME))),
             ("Freeze report…", self.freeze_report)]
         self._tools_btn = self._menu_button("Tools", None, [
             ("Organize this folder…", lambda: self.organize(self.active)),
@@ -20061,6 +21140,9 @@ class MainWindow(Gtk.ApplicationWindow):
             ("🎵 Music player (on / off)", self.music_toggle),
         ] + ([("Install optional features…", self.features_dialog)] if not IS_WIN else []) + [
             ("🕘 Version history…", self.version_settings),
+            ("⚙ Folder rules…", lambda: (lambda d: (d.run(), d.destroy()))(RulesDialog(self))),
+            ("📊 Disk usage map…", lambda: DiskUsageWindow(self, self.active.location if is_folder_loc(self.active.location)
+                                                           else str(HOME))),
             ("Search index settings…", self.index_settings),
             ("Freeze report…", self.freeze_report),
         ] + ([None, ("Ubuntu search (Tracker): keep the disk safe…", self.tracker_dialog)] if not IS_WIN else []))
@@ -20133,6 +21215,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.infobar.add_button("Where was I?", 3)
         self.infobar.connect("response", self.on_infobar)
         outer.add(self.infobar)
+        self.vault_ui = VaultUI(self)                        # 🔐 the private vault (and its “open” bar)
+        outer.add(self.vault_ui.bar)
         self.update_bar = Gtk.InfoBar(show_close_button=True)
         self.update_bar.set_message_type(Gtk.MessageType.OTHER)
         self.update_label = Gtk.Label(xalign=0, wrap=True)
@@ -20621,6 +21705,9 @@ class MainWindow(Gtk.ApplicationWindow):
         if self.active:
             loc = self.active.location
             text = short(loc) if is_folder_loc(loc) else self.active.title()
+            if VAULT.is_open() and str(loc).startswith(str(VAULT.work)):       # not the temporary path
+                rel = os.path.relpath(str(loc), str(VAULT.work))
+                text = "🔐 Private vault" + ("" if rel == "." else " / " + rel)
             top = self.active.get_toplevel()
             (top if isinstance(top, TabWindow) else self).set_title(text)
             if isinstance(top, TabWindow):
@@ -20678,6 +21765,7 @@ class MainWindow(Gtk.ApplicationWindow):
             path = GLib.get_user_special_dir(kind)
             if path and os.path.isdir(path) and Path(path) != HOME:
                 self._side_row(Path(path).name, icon, path)
+        self._side_row("Private vault", "channel-secure-symbolic", "vault:")
         self._side_header("Library")
         lib_icons = {"pictures": "image-x-generic-symbolic", "movies": "video-x-generic-symbolic",
                      "music": "audio-x-generic-symbolic", "documents": "x-office-document-symbolic",
@@ -20859,6 +21947,9 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         if key.startswith("library:"):
             self.show_library(key.split(":", 1)[1])
+            return
+        if key == "vault:":
+            self.vault_ui.open()
             return
         self.show_files()
         volume = getattr(row, "volume", None)
@@ -23867,6 +24958,31 @@ class MainWindow(Gtk.ApplicationWindow):
         VERSIONS.save_settings(s)
         d.destroy()
 
+    def vault_password(self):
+        if not VAULT.exists():
+            self.error("You don't have a private vault yet: click “Private vault” in the sidebar to create one.")
+            return
+        d = Gtk.Dialog(title="Change the vault password", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Change", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        old, new, again = (Gtk.Entry(visibility=False, placeholder_text=t) for t in
+                           ("Current password", "New password (at least 8 characters)", "New password again"))
+        msg = Gtk.Label(xalign=0)
+        for w in (old, new, again, msg):
+            box.add(w)
+        d.show_all()
+        while d.run() == Gtk.ResponseType.OK:
+            if len(new.get_text()) < 8 or new.get_text() != again.get_text():
+                msg.set_markup("<span foreground='#e01b24'>The new passwords must match and be at least 8 characters.</span>")
+            elif not VAULT.change_password(old.get_text(), new.get_text()):
+                msg.set_markup("<span foreground='#e01b24'>The current password isn't right.</span>")
+            else:
+                self.flash_all("🔐 Vault password changed")
+                break
+        d.destroy()
+
     def org_dialog(self):
         """Organisations this PC trusts: their admin (Arckad-D Pro) can add you as a contact without a request."""
         d = Gtk.Dialog(title="Organisation", transient_for=self, modal=True)
@@ -24101,6 +25217,10 @@ class MainWindow(Gtk.ApplicationWindow):
             CornerPopup(title, body, pixbuf, lambda: (self.show_from_tray(), action() if action else None))
 
     def on_close(self, *_):
+        try:
+            VAULT.close()                                    # the vault locks when Arckad-D quits
+        except Exception:
+            pass
         self.preview.flush_note()
         if self._right and self.right_box.get_visible():
             self.cfg["right_width"] = self.right_box.get_allocated_width()
