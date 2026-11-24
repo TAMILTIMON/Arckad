@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.38.0"
+APP_VERSION = "3.38.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -14098,8 +14098,9 @@ def hand_over_to_running(folder, background, select=None):
         return False
     try:
         with socket.create_connection(("127.0.0.1", int(info["port"])), timeout=1.5) as s:
+            act = os.environ.get("XDG_ACTIVATION_TOKEN") or os.environ.get("DESKTOP_STARTUP_ID") or ""
             s.sendall(json.dumps({"token": info["token"], "cmd": "background" if background else "show",
-                                  "folder": folder, "select": select}).encode() + b"\n")
+                                  "folder": folder, "select": select, "activation": act}).encode() + b"\n")
             return s.recv(8).startswith(b"ok")
     except (OSError, ValueError):
         return False
@@ -14128,7 +14129,8 @@ def start_instance_listener(win):
                 data = json.loads(conn.makefile().readline() or "{}")
                 if data.get("token") == token:
                     if data.get("cmd") == "show":
-                        GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder"), select=d.get("select")) or False)
+                        GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder"), select=d.get("select"),
+                                                                        token=d.get("activation")) or False)
                     conn.sendall(b"ok")
             except (OSError, ValueError):
                 pass
@@ -16328,16 +16330,18 @@ class FileManagerService:
             self.reg = 0
 
     def _call(self, _conn, _sender, _path, _iface, method, params, invocation):
-        uris = list(params.unpack()[0]) if params else []
+        args = params.unpack() if params else ([], "")
+        uris = list(args[0])
+        token = args[1] if len(args) > 1 else ""            # lets Ubuntu bring Arckad-D to the front
         paths = [Gio.File.new_for_uri(u).get_path() if u.startswith("file:") else u for u in uris]
         paths = [p for p in paths if p]
         if paths:
             if method == "ShowFolders":
-                GLib.idle_add(lambda: self.win.show_from_tray(folder=paths[0]) or False)
+                GLib.idle_add(lambda: self.win.show_from_tray(folder=paths[0], token=token) or False)
             else:                                            # ShowItems / ShowItemProperties: the folder, file selected
                 p = paths[0]
-                folder = p if os.path.isdir(p) and method == "ShowFolders" else os.path.dirname(p)
-                GLib.idle_add(lambda: self.win.show_from_tray(folder=folder, select=p) or False)
+                folder = os.path.dirname(p)
+                GLib.idle_add(lambda: self.win.show_from_tray(folder=folder, select=p, token=token) or False)
         invocation.return_value(None)
 
 
@@ -20261,7 +20265,14 @@ class MainWindow(Gtk.ApplicationWindow):
                             for side, nb in (("left", self.left_nb), ("right", self.right_nb))}
         write_json(CONFIG_FILE, self.cfg)
 
-    def show_from_tray(self, chat=False, folder=None, select=None):
+    def show_from_tray(self, chat=False, folder=None, select=None, token=None):
+        """Bring the window forward. With the activation token another app passed along (Chrome's folder icon,
+        a file opened elsewhere), Ubuntu lets it come to the front instead of showing a “… is ready” notice."""
+        if token:
+            try:
+                self.set_startup_id(token)
+            except (TypeError, GLib.Error):
+                pass
         self.show()
         self.deiconify()
         self.present()
