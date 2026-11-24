@@ -14,6 +14,7 @@ import difflib
 import gzip
 import hashlib
 import html as htmlmod
+import itertools
 import json
 import lzma
 import mimetypes
@@ -92,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.40.1"
+APP_VERSION = "3.41.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1537,7 +1538,8 @@ class FileIndex:
             con.execute("CREATE TABLE files (path TEXT PRIMARY KEY, lname TEXT, ext TEXT,"
                         " is_dir INTEGER, size INTEGER, mtime REAL, dev INTEGER, ino INTEGER)")
             n, batch = 0, []
-            for p, st, is_dir in walk_entries(HOME):
+            extra = [x for x in read_json(CONFIG_FILE, {}).get("library_places", []) if os.path.isdir(x)]
+            for p, st, is_dir in itertools.chain(walk_entries(HOME), *(walk_entries(x) for x in extra)):
                 batch.append((str(p), p.name.lower(), "" if is_dir else ext_of(p.name),
                               int(is_dir), 0 if is_dir else st.st_size, st.st_mtime, st.st_dev, st.st_ino))
                 n += 1
@@ -17074,6 +17076,512 @@ class JourneyWindow(Gtk.Window):
         self.win.show_from_tray(folder=place, select=target if target and os.path.exists(target) else None)
 
 
+# ---------------------------------------------------------------- Library: Pictures, Movies, Music, Documents, Apps
+# Everything comes from the file index (your home folder plus any folders you add to the library), so the sections
+# open at once instead of searching the disk. Thumbnails are made in the background, a page at a time.
+LIB_SECTIONS = [("pictures", "🖼", "Pictures"), ("movies", "🎬", "Movies"), ("music", "🎵", "Music"),
+                ("documents", "📄", "Documents"), ("apps", "🧩", "Applications")]
+DOC_EXTS = (CATEGORIES["Documents"] | CATEGORIES["Spreadsheets"] | CATEGORIES["Presentations"]
+            | {"odg", "pages", "numbers", "xps", "djvu", "mobi", "log", "json", "xml", "html"})
+DOC_COLOURS = {"pdf": "#e01b24", "doc": "#2b579a", "docx": "#2b579a", "odt": "#2b579a", "rtf": "#2b579a",
+               "xls": "#217346", "xlsx": "#217346", "ods": "#217346", "csv": "#217346", "tsv": "#217346",
+               "ppt": "#d24726", "pptx": "#d24726", "odp": "#d24726", "key": "#d24726",
+               "txt": "#6b7280", "md": "#6b7280", "epub": "#8b5cf6", "html": "#e34c26", "json": "#c4a000"}
+LIB_PAGE = 240
+
+
+def library_rows(exts, limit=5000, query=""):
+    """(path, size, mtime) from the index, newest first."""
+    if not INDEX_DB.exists():
+        return None
+    exts = sorted(exts)
+    sql = f"SELECT path, size, mtime FROM files WHERE is_dir=0 AND ext IN ({','.join('?' * len(exts))})"
+    args = list(exts)
+    if query:
+        sql += " AND lname LIKE ? ESCAPE '\\'"
+        args.append("%" + like_escape(query.lower()) + "%")
+    sql += " ORDER BY mtime DESC LIMIT ?"
+    args.append(limit)
+    try:
+        con = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True)
+        rows = con.execute(sql, args).fetchall()
+        con.close()
+        return [r for r in rows if os.path.exists(r[0])]
+    except sqlite3.Error:
+        return None
+
+
+def library_doc_types():
+    if not INDEX_DB.exists():
+        return None
+    exts = sorted(DOC_EXTS)
+    try:
+        con = sqlite3.connect(f"file:{INDEX_DB}?mode=ro", uri=True)
+        rows = con.execute(f"SELECT ext, COUNT(*), SUM(size) FROM files WHERE is_dir=0 AND ext IN "
+                           f"({','.join('?' * len(exts))}) GROUP BY ext ORDER BY COUNT(*) DESC", exts).fetchall()
+        con.close()
+        return rows
+    except sqlite3.Error:
+        return None
+
+
+class LibraryView(Gtk.Box):
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.win = win
+        self.section = None
+        self._thumb_gen = 0
+        self.set_border_width(10)
+        top = Gtk.Box(spacing=8)
+        self.title = Gtk.Label(xalign=0)
+        top.pack_start(self.title, False, False, 0)
+        self.back_btn = Gtk.Button(label="← All types")
+        self.back_btn.connect("clicked", lambda *_: self.show("documents"))
+        self.back_btn.set_no_show_all(True)
+        top.pack_start(self.back_btn, False, False, 0)
+        self.search = Gtk.SearchEntry(placeholder_text="Search in this section", width_chars=22)
+        self.search.connect("search-changed", lambda *_: self.refresh())
+        top.pack_end(self.search, False, False, 0)
+        add = Gtk.Button(label="＋ Add a folder")
+        add.set_tooltip_text("Include another folder (for example on another drive) in the library")
+        add.connect("clicked", lambda *_: self.add_folder())
+        top.pack_end(add, False, False, 0)
+        self.add(top)
+        self.status = Gtk.Label(xalign=0)
+        self.status.get_style_context().add_class("dim-label")
+        self.add(self.status)
+        self.scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.scroll.add(self.body)
+        self.pack_start(self.scroll, True, True, 0)
+        self.doc_ext = None
+        self.album = None
+        self.music_tab = "albums"
+
+    # ---------- switching sections
+    def show(self, section, ext=None):
+        self.section, self.doc_ext, self.album = section, ext, None
+        icon, name = next((i, n) for s, i, n in LIB_SECTIONS if s == section)
+        self.title.set_markup(f"<span size='x-large'><b>{icon} {esc(name)}</b></span>" +
+                              (f"  <span size='large'>· {esc(ext.upper())}</span>" if ext else ""))
+        self.back_btn.set_visible(bool(ext))
+        self.search.set_text("")
+        self.refresh()
+
+    def _clear(self):
+        self._thumb_gen += 1
+        for c in self.body.get_children():
+            self.body.remove(c)
+        self.scroll.get_vadjustment().set_value(0)
+
+    def refresh(self):
+        self._clear()
+        q = self.search.get_text().strip()
+        if self.section in ("pictures", "movies"):
+            self._media(CATEGORIES["Images"] if self.section == "pictures" else CATEGORIES["Videos"], q)
+        elif self.section == "music":
+            self._music(q)
+        elif self.section == "documents":
+            self._doc_list(self.doc_ext, q) if self.doc_ext else self._doc_types(q)
+        elif self.section == "apps":
+            self._apps(q)
+        self.body.show_all()
+
+    def _no_index(self):
+        lbl = Gtk.Label(label="The library is being prepared (Arckad-D is indexing your files). This takes a minute the "
+                              "first time.", wrap=True, margin=30)
+        self.body.add(lbl)
+        b = Gtk.Button(label="Index now", halign=Gtk.Align.CENTER)
+        b.connect("clicked", lambda *_: (INDEX.rebuild(), self.status.set_text("Indexing… open this again shortly.")))
+        self.body.add(b)
+
+    # ---------- Pictures and Movies: by month, thumbnails in the background
+    def _media(self, exts, q, shown=LIB_PAGE):
+        rows = library_rows(exts, 20000, q)
+        if rows is None:
+            return self._no_index()
+        self.status.set_text(f"{len(rows)} {'photos' if self.section == 'pictures' else 'videos'}"
+                             f"{' matching' if q else ''} · newest first · grouped by month")
+        months, order = {}, []
+        for r in rows[:shown]:
+            key = time.strftime("%B %Y", time.localtime(r[2]))
+            if key not in months:
+                months[key] = []
+                order.append(key)
+            months[key].append(r)
+        todo = []
+        for key in order:
+            h = Gtk.Label(xalign=0)
+            h.set_markup(f"<b>{esc(key)}</b>  <small>{len(months[key])}</small>")
+            self.body.add(h)
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
+                               max_children_per_line=12, column_spacing=6, row_spacing=6)
+            for path, size, mtime in months[key]:
+                tile = self._tile(path, size, video=self.section == "movies")
+                flow.add(tile)
+                todo.append((path, tile.img))
+            self.body.add(flow)
+        if len(rows) > shown:
+            more = Gtk.Button(label=f"Load more ({len(rows) - shown} left)", halign=Gtk.Align.CENTER)
+            more.connect("clicked", lambda *_: (self._clear(), self._media(exts, q, shown + LIB_PAGE), self.body.show_all()))
+            self.body.add(more)
+        self._thumbs(todo)
+
+    def _tile(self, path, size, video=False):
+        ev = Gtk.EventBox()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        img = Gtk.Image.new_from_icon_name("video-x-generic" if video else "image-x-generic", Gtk.IconSize.DIALOG)
+        img.set_size_request(150, 120)
+        box.add(img)
+        name = Gtk.Label(label=os.path.basename(path), ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=18)
+        name.get_style_context().add_class("dim-label")
+        box.add(name)
+        ev.add(box)
+        ev.img = img
+        ev.set_tooltip_text(f"{os.path.basename(path)}\n{short(os.path.dirname(path))} · {human_size(size)}")
+        self._clickable(ev, path)
+        return ev
+
+    def _thumbs(self, todo):
+        gen = self._thumb_gen
+
+        def work():
+            for path, img in todo:
+                if gen != self._thumb_gen:
+                    return                               # the section changed: stop
+                try:
+                    pb = thumbnail_for(path, 150)
+                except Exception:
+                    pb = None
+                if pb is not None:
+                    GLib.idle_add(lambda i=img, p=pb: (gen == self._thumb_gen and i.set_from_pixbuf(p)) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- clicks: preview / open / menu
+    def _clickable(self, widget, path):
+        widget.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+
+        def press(_w, ev):
+            if ev.button == 3:
+                self._menu(path, ev)
+            elif ev.type == Gdk.EventType._2BUTTON_PRESS:
+                self.win.open_file(path)
+            else:
+                self.win.preview.show_paths([path])
+                if self.win._right not in ("preview",) and self.win.cfg.get("preview", True):
+                    self.win.show_right("preview")
+            return True
+        widget.connect("button-press-event", press)
+
+    def _menu(self, path, ev):
+        m = Gtk.Menu()
+        for label, cb in (("Open", lambda: self.win.open_file(path)),
+                          ("Show in folder", lambda: (self.win.show_files(), self.win.show_from_tray(
+                              folder=os.path.dirname(path), select=path))),
+                          ("🗺 Journey map", lambda: JourneyWindow(self.win, path)),
+                          ("Copy (Ctrl+C)", lambda: self.win.set_clipboard([path], False)),
+                          ("Move to Trash", lambda: (self.win.trash(self.win.active, [path]), self.refresh()))):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            m.append(it)
+        m.show_all()
+        m.attach_to_widget(self, None)
+        m.popup_at_pointer(ev)
+
+    # ---------- Music: albums (with covers), artists, songs
+    def _music(self, q):
+        rows = library_rows(PLAY_EXTS, 20000, "")
+        if rows is None:
+            return self._no_index()
+        tabs = Gtk.Box(spacing=6)
+        for key, label in (("albums", "💿 Albums"), ("artists", "🎤 Artists"), ("songs", "🎵 Songs")):
+            b = Gtk.ToggleButton(label=label)
+            b.set_active(self.music_tab == key)
+            b.connect("clicked", lambda _b, k=key: (setattr(self, "music_tab", k), setattr(self, "album", None),
+                                                    self.refresh()))
+            tabs.add(b)
+        self.body.add(tabs)
+        self.status.set_text(f"{len(rows)} songs · reading their tags…")
+        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.body.add(holder)
+        gen = self._thumb_gen
+
+        def work():
+            songs = [dict(music_tags(p), path=p) for p, _s, _m in rows]
+            GLib.idle_add(lambda: gen == self._thumb_gen and self._music_show(holder, songs, q) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _music_show(self, holder, songs, q):
+        ql = q.lower()
+        if ql:
+            songs = [s for s in songs if ql in (s["title"] + s["artist"] + s["album"]).lower()]
+        self.status.set_text(f"{len(songs)} songs" + (" matching" if q else ""))
+        if self.album is not None:
+            return self._song_list(holder, [s for s in songs if (s["album"] or "Unknown album") == self.album],
+                                   f"💿 {self.album}", back=True)
+        if self.music_tab == "songs":
+            return self._song_list(holder, songs, None)
+        if self.music_tab == "artists":
+            by = {}
+            for s in songs:
+                by.setdefault(s["artist"] or "Unknown artist", []).append(s)
+            for artist in sorted(by, key=str.casefold):
+                exp = Gtk.Expander(label=f"🎤 {artist}  ({len(by[artist])})")
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+                self._song_list(inner, by[artist], None)
+                exp.add(inner)
+                holder.add(exp)
+            holder.show_all()
+            return
+        albums = {}
+        for s in songs:
+            albums.setdefault(s["album"] or "Unknown album", []).append(s)
+        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, max_children_per_line=10,
+                           column_spacing=10, row_spacing=10)
+        todo = []
+        for name in sorted(albums, key=str.casefold):
+            items = albums[name]
+            ev = Gtk.EventBox()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            img = Gtk.Image.new_from_pixbuf(rounded_cover(None, 140, 14, name))
+            box.add(img)
+            t = Gtk.Label(ellipsize=Pango.EllipsizeMode.END, max_width_chars=18)
+            t.set_markup(f"<b>{esc(name)}</b>")
+            box.add(t)
+            a = Gtk.Label(label=f"{items[0]['artist'] or ''} · {len(items)}", ellipsize=Pango.EllipsizeMode.END,
+                          max_width_chars=18)
+            a.get_style_context().add_class("dim-label")
+            box.add(a)
+            ev.add(box)
+            ev.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            ev.connect("button-press-event", lambda _w, e, n=name: (setattr(self, "album", n), self.refresh()) and True)
+            flow.add(ev)
+            todo.append((items[0]["path"], img, name))
+        holder.add(flow)
+        holder.show_all()
+        gen = self._thumb_gen
+
+        def covers():
+            for path, img, name in todo:
+                if gen != self._thumb_gen:
+                    return
+                cover = read_tags(path).get("cover")
+                if cover:
+                    pb = rounded_cover(cover, 140, 14, name)
+                    GLib.idle_add(lambda i=img, p=pb: (gen == self._thumb_gen and i.set_from_pixbuf(p)) and False)
+        threading.Thread(target=covers, daemon=True).start()
+
+    def _song_list(self, holder, songs, title, back=False):
+        top = Gtk.Box(spacing=8)
+        if back:
+            b = Gtk.Button(label="← Albums")
+            b.connect("clicked", lambda *_: (setattr(self, "album", None), self.refresh()))
+            top.add(b)
+        if title:
+            t = Gtk.Label(xalign=0)
+            t.set_markup(f"<b>{esc(title)}</b>")
+            top.add(t)
+        play = Gtk.Button(label=f"▶ Play all ({len(songs)})")
+        play.get_style_context().add_class("suggested-action")
+        play.connect("clicked", lambda *_: self.win.music_play([s["path"] for s in songs]))
+        top.pack_end(play, False, False, 0)
+        holder.add(top)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        for i, s in enumerate(songs[:2000]):
+            row = Gtk.Box(spacing=8, margin=3)
+            b = Gtk.Button(label="▶")
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.connect("clicked", lambda _b, k=i: self.win.music_play([x["path"] for x in songs[k:]]))
+            row.add(b)
+            lbl = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+            lbl.set_markup(f"<b>{esc(s['title'])}</b>  <small>{esc(s['artist'])}{' · ' + esc(s['album']) if s['album'] else ''}</small>")
+            row.pack_start(lbl, True, True, 0)
+            ev = Gtk.EventBox()
+            ev.add(row)
+            self._clickable(ev, s["path"])
+            r = Gtk.ListBoxRow()
+            r.add(ev)
+            lst.add(r)
+        holder.add(lst)
+        holder.show_all()
+
+    # ---------- Documents: one tile per type, then that type's files
+    def _doc_types(self, q):
+        types = library_doc_types()
+        if types is None:
+            return self._no_index()
+        if q:
+            types = [t for t in types if q.lower() in t[0]]
+        total = sum(t[1] for t in types)
+        self.status.set_text(f"{total} documents in {len(types)} types · click a type to see its files")
+        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, max_children_per_line=8,
+                           column_spacing=10, row_spacing=10)
+        for ext, n, size in types:
+            ev = Gtk.EventBox()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, margin=6)
+            col = DOC_COLOURS.get(ext, "#3b82f6")
+            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="96" height="112" viewBox="0 0 96 112">'
+                   f'<path d="M8 4 H64 L88 28 V104 a4 4 0 0 1 -4 4 H8 a4 4 0 0 1 -4 -4 V8 a4 4 0 0 1 4 -4 Z" fill="{col}"/>'
+                   f'<path d="M64 4 V28 H88 Z" fill="#ffffff" opacity="0.45"/>'
+                   f'<text x="46" y="76" text-anchor="middle" fill="#ffffff" font-size="{26 if len(ext) <= 3 else 20}" '
+                   f'font-weight="800" font-family="Segoe UI, Ubuntu, Arial, sans-serif">{esc(ext.upper())}</text></svg>')
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write(svg.encode())
+            loader.close()
+            box.add(Gtk.Image.new_from_pixbuf(loader.get_pixbuf()))
+            t = Gtk.Label()
+            t.set_markup(f"<b>{esc(ext.upper())}</b>\n<small>{n} file{'s' if n != 1 else ''} · {human_size(size or 0)}</small>")
+            t.set_justify(Gtk.Justification.CENTER)
+            box.add(t)
+            ev.add(box)
+            ev.set_tooltip_text(f"Show all {n} .{ext} files")
+            ev.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
+            ev.connect("button-press-event", lambda _w, e, x=ext: self.show("documents", x) or True)
+            flow.add(ev)
+        self.body.add(flow)
+
+    def _doc_list(self, ext, q):
+        rows = library_rows({ext}, 5000, q)
+        if rows is None:
+            return self._no_index()
+        self.status.set_text(f"{len(rows)} .{ext} files{' matching' if q else ''} · newest first · double-click to open")
+        store = Gtk.ListStore(str, str, str, str, float, str)
+        for path, size, mtime in rows:
+            store.append([os.path.basename(path), short(os.path.dirname(path)), human_size(size),
+                          time.strftime("%d %b %Y %H:%M", time.localtime(mtime)), mtime, path])
+        tv = Gtk.TreeView(model=store)
+        for i, (title, expand) in enumerate((("Name", True), ("Folder", True), ("Size", False), ("Modified", False))):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE if i < 2 else Pango.EllipsizeMode.NONE)
+            c = Gtk.TreeViewColumn(title, r, text=i)
+            c.set_expand(expand)
+            c.set_resizable(True)
+            c.set_sort_column_id(4 if i == 3 else i)
+            tv.append_column(c)
+        tv.connect("row-activated", lambda v, p, c: self.win.open_file(store[p][5]))
+        tv.connect("cursor-changed", lambda v: v.get_cursor()[0] is not None and
+                   self.win.preview.show_paths([store[v.get_cursor()[0]][5]]))
+
+        def menu(v, ev):
+            if ev.button != 3:
+                return False
+            hit = v.get_path_at_pos(int(ev.x), int(ev.y))
+            if hit:
+                self._menu(store[hit[0]][5], ev)
+            return True
+        tv.connect("button-press-event", menu)
+        self.body.add(tv)
+
+    # ---------- Applications
+    def _apps(self, q):
+        apps = installed_apps()
+        ql = q.lower()
+        if ql:
+            apps = [a for a in apps if ql in a["name"].lower() or ql in a.get("cat", "").lower()]
+        self.status.set_text(f"{len(apps)} applications · click to open")
+        by = {}
+        for a in apps:
+            by.setdefault(a.get("cat") or "Other", []).append(a)
+        for cat in sorted(by, key=lambda c: (c == "Other", c)):
+            h = Gtk.Label(xalign=0)
+            h.set_markup(f"<b>{esc(cat)}</b>  <small>{len(by[cat])}</small>")
+            self.body.add(h)
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, max_children_per_line=10,
+                               column_spacing=8, row_spacing=8)
+            for a in sorted(by[cat], key=lambda x: x["name"].casefold()):
+                b = Gtk.Button()
+                b.set_relief(Gtk.ReliefStyle.NONE)
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+                img = Gtk.Image.new_from_gicon(a["icon"], Gtk.IconSize.DIALOG) if a.get("icon") else \
+                    Gtk.Image.new_from_icon_name("application-x-executable", Gtk.IconSize.DIALOG)
+                img.set_pixel_size(48)
+                box.add(img)
+                box.add(Gtk.Label(label=a["name"], ellipsize=Pango.EllipsizeMode.END, max_width_chars=14))
+                b.add(box)
+                b.set_tooltip_text(a.get("desc") or a["name"])
+                b.connect("clicked", lambda _b, a=a: self._launch(a))
+                flow.add(b)
+            self.body.add(flow)
+
+    def _launch(self, a):
+        try:
+            if a.get("info") is not None:
+                a["info"].launch([], None)
+            elif a.get("lnk"):
+                os.startfile(a["lnk"])
+            self.win.flash_all(f"Opening {a['name']}…")
+        except Exception as ex:
+            self.win.error(f"{a['name']} couldn't be opened: {ex}")
+
+    def add_folder(self):
+        fc = Gtk.FileChooserNative(title="Add a folder to the library", transient_for=self.win,
+                                   action=Gtk.FileChooserAction.SELECT_FOLDER)
+        if fc.run() == Gtk.ResponseType.ACCEPT:
+            folder = fc.get_filename()
+            places = self.win.cfg.setdefault("library_places", [])
+            if folder not in places and not folder.startswith(str(HOME) + os.sep) and folder != str(HOME):
+                places.append(folder)
+                write_json(CONFIG_FILE, self.win.cfg)
+            INDEX.rebuild()
+            self.status.set_text(f"Added {short(folder)}: it's being indexed now, and will appear here shortly.")
+        fc.destroy()
+
+
+_MUSIC_TAGS = {}
+
+
+def music_tags(path):
+    """Title, artist and album (cached by modification time; the cover is read only for album tiles)."""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        mt = 0
+    hit = _MUSIC_TAGS.get(path)
+    if hit and hit[0] == mt:
+        return hit[1]
+    t = read_tags(path)
+    info = {"title": t.get("title") or os.path.basename(path), "artist": t.get("artist") or "",
+            "album": t.get("album") or ""}
+    _MUSIC_TAGS[path] = (mt, info)
+    return info
+
+
+def installed_apps():
+    """Installed applications: Ubuntu's app list, or the Windows Start Menu."""
+    out = []
+    if not IS_WIN:
+        cats = {"AudioVideo": "Sound & Video", "Audio": "Sound & Video", "Video": "Sound & Video",
+                "Development": "Programming", "Education": "Education", "Game": "Games", "Graphics": "Graphics",
+                "Network": "Internet", "Office": "Office", "Science": "Science", "Settings": "Settings",
+                "System": "System", "Utility": "Accessories"}
+        for info in Gio.AppInfo.get_all():
+            if not info.should_show():
+                continue
+            cat = "Other"
+            if isinstance(info, Gio.DesktopAppInfo):
+                for c in (info.get_categories() or "").split(";"):
+                    if c in cats:
+                        cat = cats[c]
+                        break
+            out.append({"name": info.get_display_name() or info.get_name(), "icon": info.get_icon(), "info": info,
+                        "desc": info.get_description(), "cat": cat})
+        return out
+    roots = [Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs",
+             Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "Microsoft/Windows/Start Menu/Programs"]
+    seen = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for lnk in root.rglob("*.lnk"):
+            name = lnk.stem
+            low = name.lower()
+            if low in seen or "uninstall" in low:
+                continue
+            seen.add(low)
+            cat = lnk.parent.name if lnk.parent != root else "Other"
+            out.append({"name": name, "lnk": str(lnk), "cat": cat})
+    return out
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -17726,7 +18234,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self.right_box.set_no_show_all(True)
         self.right_stack.show_all()
         self.content_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self.content_paned.pack1(self.dual_paned, True, True)     # both sides may get narrow: the window never
+        self.lib_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, hexpand=True)
+        self.lib_stack.add_named(self.dual_paned, "files")          # your folders, or the Library
+        self.library = LibraryView(self)
+        self.lib_stack.add_named(self.library, "library")
+        self.content_paned.pack1(self.lib_stack, True, True)     # both sides may get narrow: the window never
         self.content_paned.pack2(self.right_box, False, True)     # grows past the screen when a panel opens
         content.pack_start(self.content_paned, True, True, 0)
         self._right = None
@@ -18203,6 +18715,12 @@ class MainWindow(Gtk.ApplicationWindow):
             path = GLib.get_user_special_dir(kind)
             if path and os.path.isdir(path) and Path(path) != HOME:
                 self._side_row(Path(path).name, icon, path)
+        self._side_header("Library")
+        lib_icons = {"pictures": "image-x-generic-symbolic", "movies": "video-x-generic-symbolic",
+                     "music": "audio-x-generic-symbolic", "documents": "x-office-document-symbolic",
+                     "apps": "view-app-grid-symbolic"}
+        for sec, _icon, name in LIB_SECTIONS:
+            self._side_row(name, lib_icons[sec], "library:" + sec)
         self._side_header("Tags")
         for tag, color in TAGS.items():
             self._side_row(tag, None, "tag:" + tag, dot=color)
@@ -18360,10 +18878,26 @@ class MainWindow(Gtk.ApplicationWindow):
                 label = f"Drive {path[:2]}"
         return label, text
 
+    def show_library(self, section):
+        self.lib_stack.set_visible_child_name("library")
+        self.library.show(section)
+        for row in self.sidebar.get_children():             # highlight the Library section, not a folder
+            if getattr(row, "key", None) == "library:" + section:
+                self.sidebar.select_row(row)
+
+    def show_files(self):
+        if self.lib_stack.get_visible_child_name() != "files":
+            self.lib_stack.set_visible_child_name("files")
+            self.sync_sidebar()
+
     def sidebar_activate(self, row):
         key = getattr(row, "key", None)
         if not key:
             return
+        if key.startswith("library:"):
+            self.show_library(key.split(":", 1)[1])
+            return
+        self.show_files()
         volume = getattr(row, "volume", None)
         if volume is None:
             self.active.go(key)
@@ -21043,6 +21577,8 @@ class MainWindow(Gtk.ApplicationWindow):
         write_json(CONFIG_FILE, self.cfg)
 
     def show_from_tray(self, chat=False, folder=None, select=None, token=None):
+        if folder:
+            self.show_files()
         """Bring the window forward. With the activation token another app passed along (Chrome's folder icon,
         a file opened elsewhere), Ubuntu lets it come to the front instead of showing a “… is ready” notice."""
         if token:
