@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.37.2"
+APP_VERSION = "3.38.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1868,6 +1868,42 @@ class FilePane(Gtk.Box):
         self.row1.add(self.new_btn)
         self.row1.reorder_child(self.new_btn, 1)          # right after Back / Forward / Up
         self.add(self.row1)
+        # spotlight: a file another app asked to show (e.g. Chrome's folder icon) glows lime and can stand alone
+        if not getattr(FilePane, "_spot_css", None):
+            FilePane._spot_css = Gtk.CssProvider()
+            FilePane._spot_css.load_from_data(b"""
+            .arckad-spot { background-image: none; background-color: #b8f52e; border-radius: 10px; padding: 4px 8px;
+              margin: 2px 4px; box-shadow: 0 0 12px rgba(160, 255, 40, 0.75); }
+            .arckad-spot label { color: #1c2a00; }
+            .arckad-spot button { background-image: none; background-color: rgba(255,255,255,0.65); color: #1c2a00;
+              border: none; box-shadow: none; border-radius: 8px; padding: 2px 10px; }
+            .arckad-spot button label { color: #1c2a00; }
+            .arckad-spot button:hover { background-color: #ffffff; }
+            treeview.arckad-spotview:selected, treeview.arckad-spotview:selected:focus,
+            iconview.arckad-spotview:selected, iconview.arckad-spotview:selected:focus {
+              background-image: none; background-color: #b8f52e; color: #1c2a00; }
+            treeview.arckad-spotview.arckad-spotpulse:selected, treeview.arckad-spotview.arckad-spotpulse:selected:focus,
+            iconview.arckad-spotview.arckad-spotpulse:selected, iconview.arckad-spotview.arckad-spotpulse:selected:focus {
+              background-color: #e3ff8c; }
+            """)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), FilePane._spot_css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 15)
+        self.spotlight, self.spot_only, self._spot_t0 = None, False, 0.0
+        self.spot_bar = Gtk.Box(spacing=8)
+        self.spot_bar.get_style_context().add_class("arckad-spot")
+        self.spot_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        self.spot_bar.pack_start(self.spot_label, True, True, 0)
+        for label, cb, tip in (("Open", lambda: self.spotlight and self.win.open_file(self.spotlight), "Open the file"),
+                               ("Show in the whole folder", lambda: self.spot_show_all(), "See the other files too"),
+                               ("Copy path", lambda: self.spotlight and Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                                .set_text(self.spotlight, -1), "Copy the file's full path"),
+                               ("✕", lambda: self.clear_spotlight(), "Close")):
+            b = Gtk.Button(label=label)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            self.spot_bar.add(b)
+        self.spot_bar.set_no_show_all(True)
+        self.add(self.spot_bar)
         self.connect("size-allocate", self._on_pane_size)
 
         # filters (wrap onto two lines when the pane is narrow)
@@ -2091,6 +2127,8 @@ class FilePane(Gtk.Box):
     # ---------- navigation
     def go(self, location, push=True):
         location = str(location)
+        if getattr(self, "spotlight", None) and os.path.dirname(self.spotlight) != location:
+            self.clear_spotlight()                           # went somewhere else: the spotlight ends
         if is_folder_loc(location) and not os.path.isdir(location):
             self.win.error(f"Folder not found: {location}")
             return
@@ -2433,10 +2471,74 @@ class FilePane(Gtk.Box):
             va, vb = model[a][C_NAME].casefold(), model[b][C_NAME].casefold()
         return (va > vb) - (va < vb)
 
+    # ---------- spotlight (a file another app asked to show)
+    def spotlight_file(self, path):
+        """Show this file: filters cleared, the file on its own first (with a lime banner), glowing lime."""
+        self.spotlight, self.spot_only = path, True
+        self.clear_filters()                                 # a filter (e.g. “.mp3”) must not hide the file
+        self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(path))}</b>  <small>shown on its own</small>")
+        self.spot_bar.set_no_show_all(False)
+        self.spot_bar.show_all()
+        self.pending_select = [path]
+        folder = os.path.dirname(path)
+        if self.location != folder:
+            self.go(folder)
+        else:
+            self.load_location()
+        self._spot_t0 = time.time()
+        self._spot_glow()
+
+    def spot_show_all(self):
+        """All the folder's files again; the file stays lime and in view."""
+        if not self.spotlight:
+            return
+        self.spot_only = False
+        self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(self.spotlight))}</b>  <small>highlighted in the "
+                                   f"folder</small>")
+        if self.filter is not None:
+            self.filter.refilter()
+        self.select_paths([self.spotlight])
+        self._spot_t0 = time.time()
+        self._spot_glow()
+
+    def clear_spotlight(self):
+        was = self.spot_only
+        self.spotlight, self.spot_only = None, False
+        self.spot_bar.hide()
+        if was and self.filter is not None:
+            self.filter.refilter()
+        for v in (self.tree, self.icons):
+            v.get_style_context().remove_class("arckad-spotview")
+            v.get_style_context().remove_class("arckad-spotpulse")
+
+    def _spot_glow(self):
+        """The spotlit file's selection turns lime and pulses for 6 seconds, then stays lime (works everywhere:
+        no extra drawing libraries needed)."""
+        for v in (self.tree, self.icons):
+            v.get_style_context().add_class("arckad-spotview")
+        if getattr(self, "_spot_timer", None):
+            return
+
+        def tick():
+            on = self.spotlight and time.time() - self._spot_t0 < 6
+            for v in (self.tree, self.icons):
+                ctx = v.get_style_context()
+                if on and not ctx.has_class("arckad-spotpulse"):
+                    ctx.add_class("arckad-spotpulse")
+                else:
+                    ctx.remove_class("arckad-spotpulse")
+            if not on:
+                self._spot_timer = None
+                return False
+            return True
+        self._spot_timer = GLib.timeout_add(380, tick)
+
     def visible(self, model, it, _data):
         if self.mode == "search":
             return True
         r = model[it]
+        if self.spot_only and self.spotlight:
+            return r[C_PATH] == self.spotlight
         note = TAG_STORE.note(r[C_PATH]) if self.filters.query else ""
         return self.filters.match(r[C_NAME], r[C_ISDIR], r[C_KIND], r[C_MTIME], note)
 
@@ -20172,15 +20274,12 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     def select_in_active(self, path):
-        """Select a file in the open folder (when the system or a browser asked to show it)."""
+        """Show a file another app asked for (Chrome's folder icon, a download pop-up…): on its own first,
+        glowing lime, with Open / Show in the whole folder / Copy path."""
         p = self.active
-        if p is None:
+        if p is None or not path:
             return
-        p.pending_select = [path]
-        if p.location != os.path.dirname(path):
-            p.go(os.path.dirname(path))
-        else:
-            p.reload() if hasattr(p, "reload") else p.go(p.location)
+        p.spotlight_file(path)
 
     # ---------- default file manager
     def _default_fm_start(self):
