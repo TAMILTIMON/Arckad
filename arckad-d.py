@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.42.1"
+APP_VERSION = "3.43.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1802,6 +1802,38 @@ def set_autostart(on):
 JOURNEY_DB = CONFIG_DIR / "journey.db"
 
 
+import queue as _queue
+
+
+class _JourneyWorker:
+    """Every journey record is written by this one background thread, in order. The window's thread only hands
+    work over (no database, no new thread per event), so file activity never makes Arckad-D stutter."""
+
+    def __init__(self):
+        self.q = _queue.Queue(maxsize=20000)
+        self.thread = None
+
+    def put(self, fn, *args, **kw):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self._run, daemon=True, name="journey")
+            self.thread.start()
+        try:
+            self.q.put_nowait((fn, args, kw))
+        except _queue.Full:
+            pass                                            # a huge burst: drop the extras (never block the window)
+
+    def _run(self):
+        while True:
+            fn, args, kw = self.q.get()
+            try:
+                fn(*args, **kw)
+            except Exception:
+                pass
+
+
+JOURNEY_WORK = _JourneyWorker()
+
+
 class Journey:
     KINDS = {"seen": "📍", "created": "✨", "renamed": "✏️", "moved": "🚚", "drive": "💽", "copied": "📄",
              "copy_of": "🧬", "size": "📏", "trashed": "🗑", "deleted": "❌", "gone": "❔", "back": "↩"}
@@ -1815,6 +1847,7 @@ class Journey:
         if self.con is None:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             self.con = sqlite3.connect(str(JOURNEY_DB), check_same_thread=False, timeout=10)
+            self.con.execute("PRAGMA journal_mode=WAL")
             self.con.executescript("""
                 CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, dev INTEGER, ino INTEGER, path TEXT,
                     is_dir INTEGER, first_ts REAL, gone_ts REAL);
@@ -1880,12 +1913,16 @@ class Journey:
         return time.time() - self.recent.get(tuple(str(k) for k in key), 0) < 8
 
     # ---------- what happened (Arckad-D's own actions: exact)
-    def moved(self, src, dst, how="arckad", ts=None, ts_from=None):
+    def moved(self, src, dst, how="arckad", ts=None, ts_from=None, _now=False, _st=None):
         """A rename or a move (also to another drive). Folders take their contents' records along."""
         src, dst = str(src), str(dst)
         if how == "arckad":
             self._mark("move", src, dst)
-        dev, ino, is_dir, size = self._stat(dst)
+        if not _now and threading.current_thread() is not JOURNEY_WORK.thread:
+            # the file's identity is read now (it may move on before the worker gets to it)
+            JOURNEY_WORK.put(self.moved, src, dst, how, ts or time.time(), ts_from, _now=True, _st=self._stat(dst))
+            return
+        dev, ino, is_dir, size = _st if _st and _st[0] is not None else self._stat(dst)
         try:
             with self.lock:
                 iid = self._find(src) or self._find(None, dev, ino)
@@ -1903,35 +1940,46 @@ class Journey:
         except sqlite3.Error:
             pass
 
-    def copied(self, src, dst):
+    def copied(self, src, dst, _now=False, _sst=None, _dst=None):
         src, dst = str(src), str(dst)
         self._mark("new", dst)
+        if not _now and threading.current_thread() is not JOURNEY_WORK.thread:
+            JOURNEY_WORK.put(self.copied, src, dst, _now=True, _sst=self._stat(src), _dst=self._stat(dst))
+            return
         try:
             with self.lock:
-                sdev, sino, sdir, _s = self._stat(src)
+                sdev, sino, sdir, _s = _sst if _sst and _sst[0] is not None else self._stat(src)
                 siid = self._find(src, sdev, sino) or self._new(src, sdev, sino, sdir)
                 self._event(siid, "copied", src, dst)
-                dev, ino, is_dir, size = self._stat(dst)
+                dev, ino, is_dir, size = _dst if _dst and _dst[0] is not None else self._stat(dst)
                 diid = self._new(dst, dev, ino, is_dir, kind="copy_of")
                 self._db().execute("UPDATE events SET a=?, b=? WHERE item=? AND kind='copy_of'", (src, dst, diid))
                 self._commit()
         except sqlite3.Error:
             pass
 
-    def created(self, path):
+    def created(self, path, _now=False, _st=None):
         self._mark("new", path)
+        if not _now and threading.current_thread() is not JOURNEY_WORK.thread:
+            JOURNEY_WORK.put(self.created, path, _now=True, _st=self._stat(path))
+            return
         try:
             with self.lock:
-                dev, ino, is_dir, _s = self._stat(path)
+                dev, ino, is_dir, _s = _st if _st and _st[0] is not None else self._stat(path)
                 self._new(path, dev, ino, is_dir, kind="created")
                 self._commit()
         except sqlite3.Error:
             pass
 
-    def removed(self, path, trash=True, how="arckad", ts=None, ts_from=None):
+    def removed(self, path, trash=True, how="arckad", ts=None, ts_from=None, _now=False):
         path = str(path)
         if how == "arckad":
             self._mark("rm", path)
+            if threading.current_thread() is not JOURNEY_WORK.thread:
+                # the file is about to go: note what we need now, write the record in the background
+                dev, ino, is_dir, _s = self._stat(path)
+                JOURNEY_WORK.put(self._removed_now, path, trash, ts or time.time(), dev, ino, is_dir)
+                return
         try:
             with self.lock:
                 iid = self._find(path)
@@ -1971,6 +2019,18 @@ class Journey:
         if old and old[0] != str(path):
             self.moved(old[0], path, how="live")
 
+    def _removed_now(self, path, trash, ts, dev, ino, is_dir):
+        try:
+            with self.lock:
+                iid = self._find(path) or (self._find(None, dev, ino) if dev is not None else None)
+                if iid is None:
+                    iid = self._new(path, dev, ino, is_dir, ts=ts - 0.001)
+                self._event(iid, "trashed" if trash else "deleted", path, None, how="arckad", ts=ts)
+                self._db().execute("UPDATE items SET gone_ts=? WHERE id=?", (ts, iid))
+                self._commit()
+        except sqlite3.Error:
+            pass
+
     def follow(self, path):
         """Make sure a file or folder has a journey (opening its map starts one)."""
         try:
@@ -2006,8 +2066,8 @@ class Journey:
         try:
             with self.lock:
                 iid = self._find(str(path))
-                if iid is None:
-                    return
+                if iid is None or not os.path.lexists(path):
+                    return                                  # gone (or moved) before we looked: nothing to measure
                 _d, _i, is_dir, size = self._stat(path)
                 last = self._db().execute("SELECT size_b FROM events WHERE item=? AND size_b IS NOT NULL "
                                           "ORDER BY ts DESC, id DESC LIMIT 1", (iid,)).fetchone()
@@ -2041,7 +2101,7 @@ class Journey:
             if os.path.isdir(b):
                 moved_dirs.append((a, b))
             if self._find(a) or self._find(b):              # only for files and folders that have a journey
-                self.moved(a, b, how="scan", ts=t_new, ts_from=t_old)
+                self.moved(a, b, how="scan", ts=t_new, ts_from=t_old, _now=True)
         self.check_known(new_db, t_old, t_new)
 
     def check_known(self, new_db, t_old, t_new):
@@ -2074,7 +2134,7 @@ class Journey:
                                       (os.path.basename(path).lower(), size_before)).fetchone()
                 if hit:
                     new_size = con.execute("SELECT size FROM files WHERE path=?", (hit[0],)).fetchone()
-                    self.moved(path, hit[0], how="scan", ts=t_new, ts_from=t_old)
+                    self.moved(path, hit[0], how="scan", ts=t_new, ts_from=t_old, _now=True)
                     if new_size and size_before is not None and not is_dir and new_size[0] != size_before:
                         with self.lock:
                             self._event(iid, "size", hit[0], None, size_before, new_size[0], "scan", t_new, t_old)
@@ -2098,33 +2158,39 @@ class Journey:
         if near and os.path.isdir(near):
             hit = _find_by_name(near, name, size, depth=3)
             if hit:
-                self.moved(path, hit, how="scan", ts=t_new, ts_from=t_old)
+                self.moved(path, hit, how="scan", ts=t_new, ts_from=t_old, _now=True)
                 return
         for root in [r for r in drive_roots() if not path.startswith(r)][:12]:
             hit = _find_by_name(root, name, size, depth=4)
             if hit:
-                self.moved(path, hit, how="scan", ts=t_new, ts_from=t_old)
+                self.moved(path, hit, how="scan", ts=t_new, ts_from=t_old, _now=True)
                 return
-        self.removed(path, trash=False, how="scan", ts=t_new, ts_from=t_old)
+        self.removed(path, trash=False, how="scan", ts=t_new, ts_from=t_old, _now=True)
 
     # ---------- reading a journey
     def journey(self, path):
-        """(item row, events) for a path: the newest record for it, by path or by the drive's file number."""
+        """(item row, events) for a path: the newest record for it, by path or by the drive's file number.
+        Reads with its own connection, so opening a map never waits for the background worker."""
+        self._db()
         try:
-            with self.lock:
-                dev, ino, _d, _s = self._stat(path)
-                iid = self._find(str(path), dev, ino)
-                if iid is None:
-                    r = self._db().execute("SELECT id FROM items WHERE path=? ORDER BY id DESC LIMIT 1",
-                                           (str(path),)).fetchone()
-                    iid = r[0] if r else None
-                if iid is None:
-                    return None, []
-                item = self._db().execute("SELECT id, dev, ino, path, is_dir, first_ts, gone_ts FROM items WHERE id=?",
-                                          (iid,)).fetchone()
-                evs = self._db().execute("SELECT ts, ts_from, kind, a, b, size_a, size_b, how FROM events WHERE "
-                                         "item=? ORDER BY ts, id", (iid,)).fetchall()
-                return item, evs
+            con = sqlite3.connect(str(JOURNEY_DB), timeout=5)
+            dev, ino, _d, _s = self._stat(path)
+            r = con.execute("SELECT id FROM items WHERE path=? AND gone_ts IS NULL ORDER BY id DESC LIMIT 1",
+                            (str(path),)).fetchone()
+            if not r and dev is not None and ino:
+                r = con.execute("SELECT id FROM items WHERE dev=? AND ino=? AND gone_ts IS NULL ORDER BY id DESC LIMIT 1",
+                                (dev, ino)).fetchone()
+            if not r:
+                r = con.execute("SELECT id FROM items WHERE path=? ORDER BY id DESC LIMIT 1", (str(path),)).fetchone()
+            if not r:
+                con.close()
+                return None, []
+            item = con.execute("SELECT id, dev, ino, path, is_dir, first_ts, gone_ts FROM items WHERE id=?",
+                               (r[0],)).fetchone()
+            evs = con.execute("SELECT ts, ts_from, kind, a, b, size_a, size_b, how FROM events WHERE item=? ORDER BY "
+                              "ts, id", (r[0],)).fetchall()
+            con.close()
+            return item, evs
         except sqlite3.Error:
             return None, []
 
@@ -2193,13 +2259,34 @@ JOURNEY = Journey()
 
 # ---------- watching other apps everywhere (Ubuntu Files, Explorer, the terminal…), not only open folders
 _JW_SKIP_PREFIX = ("~$", ".~lock", ".goutputstream")
+# developer and system folders change constantly and mean nothing for a file's journey: never watched
+JW_SKIP_DIRS = {"anaconda3", "anaconda", "miniconda3", "miniconda", "miniforge3", "mambaforge", "node_modules",
+                "site-packages", "dist-packages", "__pycache__", "venv", "env", "envs", "pkgs", "build", "dist",
+                "target", "out", "obj", "bin", "Sdk", "sdk", "android-sdk", "AndroidStudioProjects", "gradle",
+                "snap", "go", "vendor", "Cache", "cache", "caches", "CachedData", "tmp", "temp", "Temp",
+                "Steam", "steamapps", "VirtualBox VMs", "lib", "lib64", "include", "share"}
 
 
 def _jw_ignored(path):
     name = os.path.basename(path)
     low = name.lower()
     return (not name or name.startswith(".") or name.startswith(_JW_SKIP_PREFIX)
-            or low.rsplit(".", 1)[-1] in PARTIAL_EXTS or any(part in SKIP_DIRS for part in Path(path).parts))
+            or low.rsplit(".", 1)[-1] in PARTIAL_EXTS
+            or any(part in SKIP_DIRS or part in JW_SKIP_DIRS or part.startswith(".") for part in _inner_parts(path)))
+
+
+def _inner_parts(path):
+    """Folder names inside your home folder or drive (never the path leading to it, e.g. /home/you, /media/…)."""
+    path = str(path)
+    home = str(HOME) + os.sep
+    if path.startswith(home):
+        return Path(path[len(home):]).parts[:-1]
+    parts = Path(path).parts
+    if len(parts) > 4 and parts[1] in ("media", "run", "mnt"):
+        return parts[4 if parts[1] == "run" else (3 if parts[1] == "media" else 2):-1]
+    if IS_WIN and len(parts) > 1:
+        return parts[1:-1]
+    return parts[1:-1]
 
 
 def _trash_dirs():
@@ -2238,7 +2325,7 @@ class JourneyWatcher:
                 limit = int(Path("/proc/sys/fs/inotify/max_user_watches").read_text().strip())
             except (OSError, ValueError):
                 limit = 8192
-            self.budget = max(500, min(30000, limit // 2))       # leave plenty for other apps
+            self.budget = max(500, min(8000, limit // 4))        # leave plenty for other apps
             threading.Thread(target=self._plan, daemon=True).start()
         GLib.timeout_add_seconds(600, self._quick_check)
 
@@ -2257,24 +2344,32 @@ class JourneyWatcher:
             if os.path.isdir(d) and d not in seen and any(d == r or d.startswith(r + os.sep) for r in self.roots):
                 seen.add(d)
                 order.append(d)
-        queue = list(self.roots)
+        # your own folders first (Desktop, Documents, Downloads, Pictures, Music, Videos), then the rest
+        mine = [GLib.get_user_special_dir(k) for k in (GLib.UserDirectory.DIRECTORY_DESKTOP,
+                GLib.UserDirectory.DIRECTORY_DOCUMENTS, GLib.UserDirectory.DIRECTORY_DOWNLOAD,
+                GLib.UserDirectory.DIRECTORY_PICTURES, GLib.UserDirectory.DIRECTORY_MUSIC,
+                GLib.UserDirectory.DIRECTORY_VIDEOS)]
+        queue = [d for d in mine if d and os.path.isdir(d)] + list(self.roots)
+        scanned = set()                                      # looked inside (separate from “will be watched”)
         while queue and len(order) < self.budget:
             d = queue.pop(0)
-            if d in seen and d not in self.roots:
-                pass
+            if d in scanned:
+                continue
+            scanned.add(d)
             if d not in seen:
                 seen.add(d)
                 order.append(d)
             try:
                 with os.scandir(d) as it:
                     for e in it:
-                        if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and e.name not in SKIP_DIRS:
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith(".") and e.name not in SKIP_DIRS \
+                                and e.name not in JW_SKIP_DIRS and e.path not in scanned:
                             queue.append(e.path)
             except OSError:
                 continue
         order = order[: self.budget]
-        for i in range(0, len(order), 400):                  # create the watches in small batches (no UI pause)
-            GLib.idle_add(self._add_batch, order[i:i + 400])
+        for n, i in enumerate(range(0, len(order), 60)):    # small, spaced batches: no pause in the window
+            GLib.timeout_add(40 * n, self._add_batch, order[i:i + 60])
 
     def _add_batch(self, folders):
         for d in folders:
@@ -2296,48 +2391,60 @@ class JourneyWatcher:
             self.mons.pop(k).cancel()
 
     def _changed(self, _m, f, other, ev):
+        """On the window's thread: keep the watches up to date, hand everything else to the journey worker."""
         p = f.get_path() if f else None
         q = other.get_path() if other else None
         if not p:
             return
         E = Gio.FileMonitorEvent
         if ev in (E.RENAMED, E.MOVED_OUT) and q:
+            if os.path.isdir(q) and not any(q.startswith(t + os.sep) for t in _trash_dirs()):
+                self._unwatch_tree(p)
+                GLib.timeout_add(200, lambda: self._watch_tree(q) or False)
+            elif any(q.startswith(t + os.sep) for t in _trash_dirs()):
+                self._unwatch_tree(p)
+        elif ev == E.MOVED_IN and not q and os.path.isdir(p):
+            GLib.timeout_add(200, lambda: self._watch_tree(p) or False)
+        elif ev == E.CREATED and not _jw_ignored(p) and os.path.isdir(p):
+            self._watch(p)
+        elif ev == E.DELETED:
+            self._unwatch_tree(p)
+        if ev in (E.CHANGED, E.ATTRIBUTE_CHANGED, E.PRE_UNMOUNT, E.UNMOUNTED):
+            return                                          # not needed for journeys
+        JOURNEY_WORK.put(self._handle, p, q, ev)
+
+    def _handle(self, p, q, ev):
+        """In the journey worker (background): what the change means for the journeys."""
+        E = Gio.FileMonitorEvent
+        if ev in (E.RENAMED, E.MOVED_OUT) and q:
             if any(q.startswith(t + os.sep) for t in _trash_dirs()):        # put in the Trash by another app
                 if not JOURNEY._ours("rm", p):
-                    threading.Thread(target=JOURNEY.removed, args=(p, True, "live"), daemon=True).start()
-                self._unwatch_tree(p)
+                    JOURNEY.removed(p, True, "live")
                 return
-            if os.path.isdir(q):                             # a folder moved: watch it where it is now
-                self._unwatch_tree(p)
-                GLib.idle_add(lambda: self._watch_tree(q) or False)
             if JOURNEY._ours("move", p, q):
                 return
             if p.lower().rsplit(".", 1)[-1] in PARTIAL_EXTS:  # a download finished (.crdownload → name)
                 if not _jw_ignored(q):
-                    threading.Thread(target=JOURNEY.created_live, args=(q,), daemon=True).start()
+                    JOURNEY.created_live(q)
                 return
             if not _jw_ignored(q) or JOURNEY._find(p):
-                threading.Thread(target=JOURNEY.moved, args=(p, q, "live"), daemon=True).start()
+                JOURNEY.moved(p, q, how="live", _now=True)
         elif ev == E.MOVED_OUT and not q:                    # moved, but the system didn't say where
             if JOURNEY._find(p):
-                threading.Timer(1.2, self._resolve_move, args=(p,)).start()
-        elif ev == E.MOVED_IN and not q:                     # came from somewhere not watched
-            if os.path.isdir(p):
-                GLib.idle_add(lambda: self._watch_tree(p) or False)
+                time.sleep(1.0)
+                self._resolve_move(p)
+        elif ev == E.MOVED_IN and not q:
             if not _jw_ignored(p):
-                threading.Thread(target=JOURNEY.appeared, args=(p,), daemon=True).start()
+                JOURNEY.appeared(p)
         elif ev == E.CREATED:
-            if os.path.isdir(p):
-                self._watch(p)
             if not _jw_ignored(p) and not JOURNEY._ours("new", p):
-                threading.Thread(target=JOURNEY.created_live, args=(p,), daemon=True).start()
+                JOURNEY.created_live(p)
         elif ev == E.CHANGES_DONE_HINT:
-            if not JOURNEY._ours("new", p):
-                threading.Thread(target=JOURNEY.size_check, args=(p, "live"), daemon=True).start()
+            if not JOURNEY._ours("new", p) and not _jw_ignored(p):
+                JOURNEY.size_check(p, "live")
         elif ev == E.DELETED:
-            self._unwatch_tree(p)
             if not JOURNEY._ours("rm", p) and JOURNEY._find(p):
-                threading.Thread(target=JOURNEY.removed, args=(p, False, "live"), daemon=True).start()
+                JOURNEY.removed(p, False, "live")
 
     def _resolve_move(self, old):
         """Find a moved file by its file number around the old place (e.g. a folder created a moment ago)."""
@@ -2360,14 +2467,16 @@ class JourneyWatcher:
             if hit:
                 if os.path.isdir(hit):
                     GLib.idle_add(lambda: self._watch_tree(hit) or False)
-                JOURNEY.moved(old, hit, how="live")
+                JOURNEY.moved(old, hit, how="live", _now=True)
                 return
 
     def _watch_tree(self, d):
+        if _jw_ignored(d):
+            return
         self._watch(d)
         try:
             for root, dirs, _files in os.walk(d):
-                dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP_DIRS]
+                dirs[:] = [x for x in dirs if not x.startswith(".") and x not in SKIP_DIRS and x not in JW_SKIP_DIRS]
                 for x in dirs:
                     self._watch(os.path.join(root, x))
                     if len(self.mons) >= self.budget:
@@ -3319,7 +3428,7 @@ class FilePane(Gtk.Box):
 
     def on_folder_changed(self, _mon=None, f=None, other=None, ev=None):
         if ev is not None and not JOURNEY_WATCH.covers(self.location):   # (the background watcher records it)
-            threading.Thread(target=JOURNEY.live, args=(ev, f, other), daemon=True).start()
+            JOURNEY_WORK.put(JOURNEY.live, ev, f, other)
         if self.refresh_id is None:
             self.refresh_id = GLib.timeout_add(600, self.auto_refresh)
 
@@ -18388,6 +18497,100 @@ class MainWindow(Gtk.ApplicationWindow):
         b.connect("clicked", cb)
         return b
 
+    # ---------- title bar style: Full, Compact, Minimal (like Files), Minimal + auto-hide
+    def _optional_buttons(self):
+        """What Minimal hides (all of it stays reachable under ⋯)."""
+        return [self._last_btn, self._timeline_btn, self.dual_btn, self.music_btn, self.phone_btn, self.organize_btn,
+                self.undo_btn, self.share_btn.get_parent(), self._tools_btn, self._theme_btn]
+
+    def _build_more_menu(self):
+        m = Gtk.Menu()
+
+        def add(label, cb):
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda *_: cb())
+            m.append(it)
+        add("🕘 Last worked file", lambda: self.find_last_file(show=True))
+        add("🧭 Where was I?", self.open_timeline)
+        m.append(Gtk.SeparatorMenuItem())
+        add("◫ Dual panes (F3)", lambda: self.dual_btn.set_active(not self.dual_btn.get_active()))
+        add("🎵 Music player (on / off)", self.music_toggle)
+        add("📱 Phone", lambda: self.phone_btn.set_active(not self.phone_btn.get_active()))
+        m.append(Gtk.SeparatorMenuItem())
+        add("🗂 Organize this folder", lambda: self.organize(self.active))
+        add("↶ Undo last organize", lambda: self.on_undo(None))
+        add("📤 Send files…", lambda: self.open_share(self.active.selected_paths() or None, "nearby"))
+        add("📥 Receive files…", lambda: self.open_share(None, "receive"))
+        tools = Gtk.MenuItem(label="🛠 Tools")
+        sub = Gtk.Menu()
+        for label, cb in self._tools_list:
+            it = Gtk.MenuItem(label=label)
+            it.connect("activate", lambda _i, cb=cb: cb())
+            sub.append(it)
+        tools.set_submenu(sub)
+        m.append(tools)
+        add("🌗 Next theme (Ctrl+Shift+D)", self.cycle_theme)
+        m.show_all()
+        self.more_btn.set_popup(m)
+
+    def set_titlebar_style(self, style, save=True):
+        self._tb_style = style
+        if save:
+            self.cfg["titlebar"] = style
+            write_json(CONFIG_FILE, self.cfg)
+        if not hasattr(self, "_slim_css"):                 # a thinner bar in every style
+            self._slim_css = Gtk.CssProvider()
+            self._slim_css.load_from_data(b"""
+            headerbar.arckad-slim { min-height: 34px; padding-top: 0; padding-bottom: 0; }
+            headerbar.arckad-slim button, headerbar.arckad-slim menubutton > button, headerbar.arckad-slim togglebutton {
+              min-height: 26px; padding-top: 1px; padding-bottom: 1px; margin-top: 3px; margin-bottom: 3px; }
+            headerbar.arckad-slim .title { font-size: 0.92em; }
+            """)
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self._slim_css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 31)
+        self.get_titlebar().get_style_context().add_class("arckad-slim")
+        minimal = style in ("minimal", "autohide")
+        for b in self._optional_buttons():
+            b.set_no_show_all(minimal)
+            b.set_visible(not minimal)
+        self.more_btn.set_visible(minimal)
+        self._tb_revealed = False
+        if style == "compact" or minimal:
+            self._compact = None
+            self.set_compact(True)
+        else:
+            self._compact = None
+            self._check_compact()
+        if style == "autohide" and not getattr(self, "_tb_poll", None):
+            self._tb_poll = GLib.timeout_add(160, self._tb_hover)
+
+    def _tb_hover(self):
+        """Minimal + auto-hide: the hidden buttons slide in while the mouse is over the title bar."""
+        if getattr(self, "_tb_style", "") != "autohide":
+            self._tb_poll = None
+            return False
+        win = self.get_window()
+        if win is None or not self.is_active():
+            return True
+        seat = Gdk.Display.get_default().get_default_seat()
+        _w, x, y, _m = win.get_device_position(seat.get_pointer())
+        over = 0 <= y <= self.get_titlebar().get_allocated_height() + 6 and 0 <= x <= self.get_allocated_width()
+        now = time.time()
+        if over:
+            self._tb_last_over = now
+            if not self._tb_revealed:
+                self._tb_revealed = True
+                for b in self._optional_buttons():
+                    b.set_no_show_all(False)
+                    b.show_all() if isinstance(b, Gtk.Box) else b.show()
+                self.more_btn.hide()
+        elif self._tb_revealed and now - getattr(self, "_tb_last_over", 0) > 0.9:
+            self._tb_revealed = False
+            for b in self._optional_buttons():
+                b.hide()
+            self.more_btn.show()
+        return True
+
     # ---------- compact toolbar: fits half a screen (next to a browser) or a small window
     def _compact_items(self):
         return [(self._timeline_btn, "Where was I?", "🧭"), (self.dual_btn, "Dual", "◫"), (self.preview_btn, "Preview", "👁"),
@@ -18463,7 +18666,8 @@ class MainWindow(Gtk.ApplicationWindow):
         tiled = bool(state & (Gdk.WindowState.TILED | getattr(Gdk.WindowState, "LEFT_TILED", 0) |
                               getattr(Gdk.WindowState, "RIGHT_TILED", 0)))
         maxed = bool(state & (Gdk.WindowState.MAXIMIZED | Gdk.WindowState.FULLSCREEN))
-        self.set_compact(tiled or (not maxed and self.get_allocated_width() < 1700))
+        style = getattr(self, "_tb_style", self.cfg.get("titlebar", "full"))
+        self.set_compact(style != "full" or tiled or (not maxed and self.get_allocated_width() < 1700))
         self._queue_fit()
         return False
 
@@ -18510,6 +18714,7 @@ class MainWindow(Gtk.ApplicationWindow):
         last_btn.set_tooltip_text("Remind me which file I worked on last")
         last_btn.connect("clicked", lambda *_: self.find_last_file(show=True))
         hb.pack_start(last_btn)
+        self._last_btn = last_btn
         timeline_btn = Gtk.Button(label="Where was I?")
         self._timeline_btn = timeline_btn
         timeline_btn.set_tooltip_text("See your recent work grouped into sessions")
@@ -18531,7 +18736,21 @@ class MainWindow(Gtk.ApplicationWindow):
         self.icons_item = Gtk.CheckMenuItem(label="Colourful file icons")
         self.icons_item.set_active(ICON_STYLE["colour"])
         self.icons_item.connect("toggled", self.on_icons_toggled)
+        tb_item = Gtk.MenuItem(label="Title bar")
+        tb_menu = Gtk.Menu()
+        group = None
+        for key, label in (("full", "Full (all buttons with labels)"), ("compact", "Compact (icons, slim)"),
+                           ("minimal", "Minimal (like Files: the rest under ⋯)"),
+                           ("autohide", "Minimal + auto-hide (buttons appear when you point at the title bar)")):
+            it = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+            group = group or it
+            it.set_active(self.cfg.get("titlebar", "full") == key)
+            it.connect("toggled", lambda i, k=key: i.get_active() and self.set_titlebar_style(k))
+            tb_menu.append(it)
+        tb_item.set_submenu(tb_menu)
+        tb_menu.show_all()
         hb.pack_end(self._menu_button(None, "open-menu-symbolic", [
+            tb_item, None,
             self.hidden_item, self.icons_item, None, self.tray_item, self.login_item, None,
             ("New tab (Ctrl+T)", lambda: self.new_tab()),
             ("New folder… (Ctrl+Shift+N)", lambda: self.new_folder(self.active)),
@@ -18551,7 +18770,25 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Check for updates…", lambda: self.check_updates(manual=True)),
             (f"About {APP_NAME}", self.show_about),
         ]))
-        hb.pack_end(self._theme_button())
+        self.more_btn = Gtk.MenuButton()
+        more_lbl = Gtk.Label()
+        more_lbl.set_markup("<b>⋯</b>")                     # a character, not an icon: shows with every icon theme
+        self.more_btn.add(more_lbl)
+        more_lbl.show()                                     # (the button itself is shown only in Minimal)
+        self.more_btn.set_tooltip_text("More: Dual, Music, Phone, Organize, Undo, Send, Receive, Tools, Theme…")
+        self.more_btn.set_no_show_all(True)
+        hb.pack_end(self.more_btn)
+        self._theme_btn = self._theme_button()
+        hb.pack_end(self._theme_btn)
+        self._tools_list = [
+            ("Organize this folder…", lambda: self.organize(self.active)),
+            ("Find duplicate files…", lambda: self.duplicates(
+                self.active.location if is_folder_loc(self.active.location) else str(HOME))),
+            ("Compare selected files…", self.compare_selected),
+            ("Auto-sort Downloads…", self.autosort_dialog),
+            ("Update search index now", INDEX.rebuild),
+            ("Search index settings…", self.index_settings),
+            ("Freeze report…", self.freeze_report)]
         self._tools_btn = self._menu_button("Tools", None, [
             ("Organize this folder…", lambda: self.organize(self.active)),
             ("Find duplicate files…", lambda: self.duplicates(
@@ -18622,6 +18859,8 @@ class MainWindow(Gtk.ApplicationWindow):
         hb.pack_end(self.dual_btn)
         self.spinner = Gtk.Spinner()
         hb.pack_end(self.spinner)
+        self._build_more_menu()
+        GLib.idle_add(lambda: self.set_titlebar_style(self.cfg.get("titlebar", "full"), save=False) or False)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(outer)
