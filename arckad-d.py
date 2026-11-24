@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.46.1"
+APP_VERSION = "3.47.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -9283,6 +9283,27 @@ class Chat:
         pid = str(req.get("id", ""))[:40]
         if not pid or pid == self.me:
             return {"ok": False, "reason": "bad request"}
+        if path == "/f/org-invite":                       # an organisation's admin invites this PC (the user decides)
+            o = req.get("org") if isinstance(req.get("org"), dict) else {}
+            pub = str(o.get("pub", ""))
+            try:
+                int(pub, 16)
+                ts = int(req.get("ts", 0))
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "bad invitation"}
+            fp = org_fp(pub)
+            if len(pub) < 400 or abs(time.time() - ts) > 600 or not rsa_verify(
+                    pub, f"arckad-org-invite|{fp}|{pid}|{self.me}|{ts}".encode(), str(req.get("sig", ""))):
+                return {"ok": False, "reason": "not signed by that organisation"}
+            if fp in trusted_orgs():
+                return {"ok": True, "already": True}
+            asked = self.__dict__.setdefault("_org_asked", {})
+            if time.time() - asked.get(fp, 0) < 600:
+                return {"ok": True, "pending": True}
+            asked[fp] = time.time()
+            self.ui("on_org_invite", {"org": str(o.get("org", "Organisation"))[:60], "admin": str(o.get("admin", ""))[:40],
+                                      "pub": pub, "fp": fp, "from": str(req.get("name", "?"))[:40]})
+            return {"ok": True, "pending": True}
         if path == "/f/request":
             dh, sigpub, sig = str(req.get("dh", "")), str(req.get("sigpub", ""))[:1100], str(req.get("dhsig", ""))
             if not rsa_verify(sigpub, f"arckad-friend|{pid}|{self.me}|{dh}".encode(), sig):
@@ -9711,7 +9732,9 @@ class Chat:
     def handle_get(self, h, path):
         if path == "/f/hello":                       # for profile codes: who is at this address?
             return h._plain(200, {"ok": True, "id": self.me, "name": self.my_name(), "os": OS_NAME,
-                                  "ph": self.photo_hash(), "ver": APP_VERSION, "card": self.my_card()})
+                                  "ph": self.photo_hash(), "ver": APP_VERSION, "card": self.my_card(),
+                                  "hidden": not self.profile.get("visible"),
+                                  "orgs": [fp.replace(" ", "") for fp in trusted_orgs()][:4]})
         if path == "/f/card":                        # the work profile (only what the person filled in)
             return h._plain(200, {"ok": True, "card": self.my_card(), "pv": self.card_hash()})
         if path == "/f/photo":
@@ -18268,8 +18291,7 @@ def installed_apps():
 #  · other admin PCs: a licence file the owner signs for that PC's code (☰ → Issue a Pro licence…).
 # A licence works only on the PC it was made for and can't be changed without the owner key.
 # (The organisation key, made inside Pro, is what office PCs trust; the licence only unlocks the panel.)
-OWNER_PUB = "d6d99dd148da5ccaea5b0ea6268c88f7ae463a854aca2d478a886de0ae336af07d92349832f2640b46b5630679c5431bc8dc1629bcbcac2564d7593ea216b1b2818952cf18ea39fa9a1f85374aaaf87269f820e0935af33386711adce833d570eb66bf2de9022686c0c7d32a8b36325100d98c8be925836788165fad373c84f4b8922666bcf396b97dae937ea6db6563b1e52f891cc552c91cd5da50dc7ecab123dd4a44e253ce4d914da2237a4c71bb1a1f180748d1db546d6ccb9b8f78dc3f42e44206cbf716f0a251880eedddab96679b2ba238dd1f13c312fdd37a7539a3f487730914d3494f4fe93b9a8acfbc744c429f3f57833c12ecb8b903db62dbd7"
-                     # the owner's public key (hex). Set by the owner: see  arckad-d --owner-setup
+OWNER_PUB = ""                     # the owner's public key (hex). Set by the owner: see  arckad-d --owner-setup
 OWNER_KEY = CONFIG_DIR / "owner-key.json"
 PRO_LICENCE = CONFIG_DIR / "pro-licence.arckadlicense"
 
@@ -18425,6 +18447,15 @@ class ArckadPro:
         self.render()
         w.show_all()
         self._tick = GLib.timeout_add_seconds(4, self._refresh_people)
+        GLib.timeout_add_seconds(60, self._rescan)
+
+    def _rescan(self):
+        if self.window is None:
+            return False
+        nets = self.win.cfg.get("pro_networks", [])
+        if nets and self.has_key():
+            self.scan(nets)
+        return True
 
     def _clear(self):
         for c in self.box.get_children():
@@ -18444,7 +18475,8 @@ class ArckadPro:
         self.box.add(head)
         btns = Gtk.Box(spacing=8)
         for label, cb in (("💾 Save organisation file…", self.save_file),
-                          ("How to install it on office PCs…", self.it_help)) + \
+                          ("How to install it on office PCs…", self.it_help),
+                          ("🌐 Find people in other networks…", self.networks_dialog)) + \
                          ((("🔑 Issue a Pro licence…", self.issue_dialog),) if owner_key() else ()):
             b = Gtk.Button(label=label)
             b.connect("clicked", lambda _b, cb=cb: cb())
@@ -18498,8 +18530,10 @@ class ArckadPro:
         me_fp = self.fp().replace(" ", "")
         for c in self.list.get_children():
             self.list.remove(c)
+        scanned = getattr(self, "scanned", {})
         people = sorted(((pid, p) for pid, p in chat.people.items()
-                         if pid != chat.me and time.time() - p.get("seen", 0) < 120),
+                         if pid != chat.me and (time.time() - p.get("seen", 0) < 120 or
+                                                time.time() - scanned.get(pid, 0) < 900)),
                         key=lambda x: x[1].get("name", "").casefold())
         if not people:
             self.list.add(Gtk.Label(label="Nobody is online on your network right now.", margin=20))
@@ -18510,7 +18544,8 @@ class ArckadPro:
             lbl = Gtk.Label(xalign=0, hexpand=True)
             status = ("✓ contact" if friend else ("🏢 enrolled (can be added directly)" if enrolled else
                                                   "not enrolled (gets a friend request)"))
-            lbl.set_markup(f"<b>{esc(p.get('name', '?'))}</b>  <small>{esc(p.get('os', ''))}</small>\n"
+            where = f" · {p.get('ip')} (other network)" if pid in scanned else ""
+            lbl.set_markup(f"<b>{esc(p.get('name', '?'))}</b>  <small>{esc(p.get('os', ''))}{esc(where)}</small>\n"
                            f"<small>{esc(status)}</small>")
             row.pack_start(lbl, True, True, 0)
             if friend:
@@ -18520,6 +18555,12 @@ class ArckadPro:
             elif pid in chat.contacts["outgoing"]:
                 row.add(Gtk.Label(label="request sent"))
             else:
+                if not enrolled:
+                    inv = Gtk.Button(label="🏢 Invite")
+                    inv.set_tooltip_text("Invite this PC into the organisation (they accept once); then you can add "
+                                         "them directly")
+                    inv.connect("clicked", lambda _b, pid=pid: self.invite(pid, _b))
+                    row.add(inv)
                 b = Gtk.Button(label="Add directly" if enrolled else "Send request")
                 if enrolled:
                     b.get_style_context().add_class("suggested-action")
@@ -18539,6 +18580,123 @@ class ArckadPro:
             ok, msg = self.win.chat.send_request(pid, org_signer=self.signer if enrolled else None)
             GLib.idle_add(lambda: (self.status.set_markup(("✓ " if ok else "✗ ") + esc(msg)), self._refresh_people())
                           and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def invite(self, pid, btn):
+        """Invite a PC into the organisation, signed with the organisation's key (the user accepts on their PC)."""
+        btn.set_sensitive(False)
+        chat = self.win.chat
+        ts = int(time.time())
+        body = {"id": chat.me, "name": chat.my_name(), "org": self.org_file(), "ts": ts,
+                "sig": rsa_sign(self.data["key"], f"arckad-org-invite|{self.fp()}|{chat.me}|{pid}|{ts}".encode())}
+        name = chat.people.get(pid, {}).get("name", "them")
+
+        def work():
+            try:
+                r = chat._call(pid, "/f/org-invite", body)
+                msg = (f"{name} already trusts this organisation." if r.get("already") else
+                       f"Invitation sent to {name}: once they accept on their PC, you can add them directly." if r.get("ok")
+                       else f"{name}'s Arckad-D said no: {r.get('reason', 'unknown')} (is it version 3.47 or newer?)")
+            except Exception as ex:
+                msg = f"Couldn't reach {name}: {ex}"
+            GLib.idle_add(lambda: (self.status.set_text(msg), btn.set_sensitive(True)) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- people in other networks (VLANs): broadcasts don't cross them, direct connections do
+    def networks_dialog(self):
+        d = Gtk.Dialog(title="Find people in other networks", transient_for=self.window, modal=True)
+        d.add_buttons("Close", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        t = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        t.set_markup("Arckad-D finds people on <b>your own network</b> automatically. Other networks (VLANs) don't "
+                     "pass that on, so list them here, separated by commas, e.g. <tt>128.128.10.0/24, "
+                     "128.128.20.0/24</tt>. Every address is asked directly (about 5 seconds per /24).")
+        box.add(t)
+        e = Gtk.Entry(text=", ".join(self.win.cfg.get("pro_networks", [])))
+        box.add(e)
+        prog = Gtk.Label(xalign=0, wrap=True)
+        go = Gtk.Button(label="🔍 Find people")
+        go.get_style_context().add_class("suggested-action")
+
+        def start(*_):
+            nets = [x.strip() for x in e.get_text().replace(";", ",").split(",") if x.strip()]
+            self.win.cfg["pro_networks"] = nets
+            write_json(CONFIG_FILE, self.win.cfg)
+            go.set_sensitive(False)
+            prog.set_text("Looking…")
+            self.scan(nets, lambda done, total, found: GLib.idle_add(
+                lambda: prog.set_text(f"Checked {done} of {total} addresses · found {found}") and False),
+                      lambda found, err: GLib.idle_add(
+                lambda: (prog.set_markup(("✗ " + esc(err)) if err else f"✓ Found <b>{found}</b> people. They're in "
+                         f"the list now (refreshed every minute while this panel is open)."),
+                         go.set_sensitive(True), self._refresh_people()) and False))
+        go.connect("clicked", start)
+        e.connect("activate", start)
+        box.add(go)
+        box.add(prog)
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    def scan(self, nets, progress=None, finished=None):
+        import ipaddress
+        import concurrent.futures
+        hosts, err = [], None
+        try:
+            for n in nets:
+                net = ipaddress.ip_network(n, strict=False)
+                if net.num_addresses > 4096:
+                    raise ValueError(f"{n} is too big (at most 4096 addresses each, e.g. a /20)")
+                hosts += [str(ip) for ip in (net.hosts() if net.num_addresses > 2 else [net.network_address])]
+        except ValueError as ex:
+            err = str(ex)
+        if err:
+            if finished:
+                finished(0, err)
+            return
+
+        def hello(ip):
+            """Everyone running Arckad-D at this address (usually one; several on a shared PC)."""
+            import http.client
+            out = []
+            for port in [p for p in PAIR_TCP_PORTS if p]:
+                try:
+                    c = http.client.HTTPConnection(ip, port, timeout=0.7)
+                    c.request("GET", "/f/hello")
+                    r = c.getresponse()
+                    d = json.loads(r.read(20000) or b"{}")
+                    c.close()
+                    if d.get("id") and d.get("ver"):
+                        out.append((ip, port, d))
+                except ConnectionRefusedError:
+                    continue                                # a computer, but not on this port: try the next
+                except Exception:
+                    break                                   # no answer at all (no computer here): move on
+            return out
+
+        def work():
+            chat = self.win.chat
+            self.scanned = getattr(self, "scanned", {})
+            found, done = 0, 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=96) as ex:
+                for results in ex.map(hello, hosts):
+                    done += 1
+                    for ip, port, d in results:
+                        pid = str(d["id"])[:40]
+                        if pid != chat.me and not d.get("hidden"):
+                            found += 1
+                            old = chat.people.get(pid, {})
+                            chat.people[pid] = dict(old, name=str(d.get("name", "?"))[:40], ip=ip, port=port,
+                                                    os=str(d.get("os", ""))[:10], ph=str(d.get("ph", ""))[:16],
+                                                    seen=time.time(), ver=str(d.get("ver", ""))[:12],
+                                                    orgs=[str(x)[:20] for x in (d.get("orgs") or [])][:4])
+                            self.scanned[pid] = time.time()
+                    if progress and done % 32 == 0:
+                        progress(done, len(hosts), found)
+            if finished:
+                finished(found, None)
         threading.Thread(target=work, daemon=True).start()
 
     def _group_menu(self, btn, pid):
@@ -22928,6 +23086,29 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.fm_service.stop()
         self.flash_all(f"{APP_NAME} is now your default file manager" if on else
                        "Your system's file manager is the default again")
+
+    def on_org_invite(self, inv):
+        """An organisation's admin invites this PC (signed with the organisation's key): the user decides."""
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
+                              buttons=Gtk.ButtonsType.NONE, text=f"🏢 Join “{inv['org']}”?")
+        d.format_secondary_markup(
+            f"<b>{esc(inv['from'])}</b> (admin of {esc(inv['org'])}) invites this PC into the organisation.\n\n"
+            f"If you accept, this admin can add you as a contact <b>without a request</b>. You can leave at any time: "
+            f"☰ → 🏢 Organisation….\n\nFingerprint (check it with your admin):\n<tt><b>{esc(inv['fp'])}</b></tt>")
+        d.add_buttons("Decline", Gtk.ResponseType.REJECT, "Accept", Gtk.ResponseType.ACCEPT)
+        d.get_widget_for_response(Gtk.ResponseType.ACCEPT).get_style_context().add_class("suggested-action")
+
+        def respond(dlg, r):
+            dlg.destroy()
+            if r == Gtk.ResponseType.ACCEPT:
+                ORG_USER_DIR.mkdir(parents=True, exist_ok=True)
+                (ORG_USER_DIR / (inv["fp"].replace(" ", "") + ".arckadorg")).write_text(json.dumps(
+                    {"format": "arckad-org-1", "org": inv["org"], "admin": inv["admin"] or inv["from"],
+                     "pub": inv["pub"]}), encoding="utf-8")
+                self.flash_all(f"🏢 This PC now trusts {inv['org']}")
+        d.connect("response", respond)
+        d.show_all()
+        return False
 
     def org_dialog(self):
         """Organisations this PC trusts: their admin (Arckad-D Pro) can add you as a contact without a request."""
