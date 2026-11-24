@@ -54,7 +54,7 @@ def _clear_forced_theme():
             theme = json.load(f).get("theme", "midnight")
     except (OSError, ValueError, AttributeError):
         theme = "midnight"
-    if theme in ("midnight", "snow", "mono"):
+    if theme in ("midnight", "snow", "mono") or theme.startswith(("dark-", "light-")):
         os.environ.pop("GTK_THEME", None)
 
 
@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.43.0"
+APP_VERSION = "3.44.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -2702,6 +2702,7 @@ class FilePane(Gtk.Box):
             Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), FilePane._spot_css,
                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 15)
         self.spotlight, self.spot_only, self._spot_t0 = None, False, 0.0
+        self.spotlights = set()
         self.spot_bar = Gtk.Box(spacing=8)
         self.spot_bar.get_style_context().add_class("arckad-spot")
         self.spot_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
@@ -3274,9 +3275,11 @@ class FilePane(Gtk.Box):
             self.sort["folder" if self.mode == "folder" else "other"] = (col, order)
 
     def sort_func(self, model, a, b, col):
-        spot = getattr(self, "spotlight", None)
-        if spot:                                            # the file another app asked to show comes first
-            sa, sb = model[a][C_PATH] == spot, model[b][C_PATH] == spot
+        spots = getattr(self, "spotlights", None)
+        if spots:                                           # the file(s) another app asked to show come first
+            sa, sb = model[a][C_PATH] in spots, model[b][C_PATH] in spots
+            if sa and sb and col != C_MTIME:                # among them: newest first
+                return (model[b][C_MTIME] > model[a][C_MTIME]) - (model[b][C_MTIME] < model[a][C_MTIME])
             if sa != sb:
                 res = -1 if sa else 1
                 _, order = self.sorted.get_sort_column_id() if self.sorted else (None, Gtk.SortType.ASCENDING)
@@ -3294,16 +3297,27 @@ class FilePane(Gtk.Box):
         return (va > vb) - (va < vb)
 
     # ---------- spotlight (a file another app asked to show)
-    def spotlight_file(self, path):
+    def spotlight_files(self, paths, note=""):
+        """Several files to point out (e.g. recent downloads, when a browser opened only the folder)."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        self.spotlight_file(paths[0], also=paths[1:], note=note)
+
+    def spotlight_file(self, path, also=(), note=""):
         """Show this file: filters cleared, the file on its own first (with a lime banner), glowing lime."""
+        self.spotlights = {path, *also}
         self.spotlight, self.spot_only = path, True
         self.clear_filters()                                 # a filter (e.g. “.mp3”) must not hide the file
         fresh = time.time() - os.path.getmtime(path) < 600 if os.path.exists(path) else False
-        self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(path))}</b>  <small>"
-                                   f"{'latest download · ' if fresh else ''}shown on its own</small>")
+        if len(self.spotlights) > 1:
+            self.spot_label.set_markup(f"<b>⬇ {len(self.spotlights)} recent downloads</b>  <small>{esc(note)}</small>")
+        else:
+            self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(path))}</b>  <small>"
+                                       f"{'latest download · ' if fresh else ''}shown on its own</small>")
         self.spot_bar.set_no_show_all(False)
         self.spot_bar.show_all()
-        self.pending_select = [path]
+        self.pending_select = [path, *also]
         folder = os.path.dirname(path)
         if self.location != folder:
             self.go(folder)
@@ -3317,12 +3331,16 @@ class FilePane(Gtk.Box):
         if not self.spotlight:
             return
         self.spot_only = False
-        self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(self.spotlight))}</b>  <small>highlighted in the "
-                                   f"folder</small>")
+        if len(self.spotlights) > 1:
+            self.spot_label.set_markup(f"<b>⬇ {len(self.spotlights)} recent downloads</b>  <small>highlighted at the "
+                                       f"top of the folder</small>")
+        else:
+            self.spot_label.set_markup(f"<b>⬇ {esc(os.path.basename(self.spotlight))}</b>  <small>highlighted in the "
+                                       f"folder</small>")
         if self.filter is not None:
             self.filter.refilter()
-        self._resort()                                      # re-sort so it sits at the top
-        self.select_paths([self.spotlight])
+        self._resort()                                      # re-sort so they sit at the top
+        self.select_paths(sorted(self.spotlights))
         self._spot_t0 = time.time()
         self._spot_glow()
         (self.gadj if self.view_mode == "grid" else self.vadj).set_value(0)
@@ -3339,6 +3357,7 @@ class FilePane(Gtk.Box):
     def clear_spotlight(self):
         was = self.spot_only
         self.spotlight, self.spot_only = None, False
+        self.spotlights = set()
         self.spot_bar.hide()
         if was and self.filter is not None:
             self.filter.refilter()
@@ -3373,7 +3392,7 @@ class FilePane(Gtk.Box):
             return True
         r = model[it]
         if self.spot_only and self.spotlight:
-            return r[C_PATH] == self.spotlight
+            return r[C_PATH] in self.spotlights
         note = TAG_STORE.note(r[C_PATH]) if self.filters.query else ""
         return self.filters.match(r[C_NAME], r[C_ISDIR], r[C_KIND], r[C_MTIME], note)
 
@@ -14974,7 +14993,8 @@ def start_instance_listener(win):
                 if data.get("token") == token:
                     if data.get("cmd") == "show":
                         GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder"), select=d.get("select"),
-                                                                        token=d.get("activation")) or False)
+                                                                        token=d.get("activation"),
+                                                                        source="opened by an app") or False)
                     conn.sendall(b"ok")
             except (OSError, ValueError):
                 pass
@@ -17216,11 +17236,11 @@ class FileManagerService:
         paths = [p for p in paths if p]
         if paths:
             if method == "ShowFolders":
-                GLib.idle_add(lambda: self.win.show_from_tray(folder=paths[0], token=token) or False)
+                GLib.idle_add(lambda: self.win.show_from_tray(folder=paths[0], token=token, source="ShowFolders") or False)
             else:                                            # ShowItems / ShowItemProperties: the folder, file selected
                 p = paths[0]
                 folder = os.path.dirname(p)
-                GLib.idle_add(lambda: self.win.show_from_tray(folder=folder, select=p, token=token) or False)
+                GLib.idle_add(lambda: self.win.show_from_tray(folder=folder, select=p, token=token, source=method) or False)
         invocation.return_value(None)
 
 
@@ -18191,6 +18211,77 @@ SKINS = {
                  menu="#1a1a1e", scroll="rgba(255,255,255,0.25)", bubble_text="#0c0c0e"),
 }
 
+# ---------- accent colours: Dark and Light, each with seven accents (orange is Midnight / Snow above)
+ACCENTS = [("orange", "🟠", "Orange", None, None), ("lime", "🟢", "Lime", "#a3e635", "#84cc16"),
+           ("green", "🌿", "Green", "#22c55e", "#16a34a"), ("blue", "🔵", "Blue", "#3b82f6", "#2563eb"),
+           ("pink", "🌸", "Pink", "#ec4899", "#db2777"), ("yellow", "🟡", "Yellow", "#facc15", "#eab308"),
+           ("purple", "🟣", "Purple", "#a855f7", "#9333ea")]
+
+
+def _rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def _hex(c):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(v * 255))) for v in c)
+
+
+def _mix(h, other, t):
+    a, b = _rgb(h), _rgb(other)
+    return _hex(tuple(x + (y - x) * t for x, y in zip(a, b)))
+
+
+def _lum(h):
+    f = (lambda v: v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4)
+    r, g, b = (f(x) for x in _rgb(h))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(a, b):
+    la, lb = _lum(a), _lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def _accent_skin(base, accent):
+    """A full colour set from one accent colour: shades for gradients, selections and menu highlights; text on the
+    accent in white or near-black, whichever reads better on all of its shades; ticks that show on it."""
+    s = dict(SKINS[base])
+    light = not s["dark"]
+    white, black = "#ffffff", "#14140f"
+    # 1. the text colour comes from the accent itself (white on deep colours, dark on bright ones)
+    on_white = _contrast(white, accent) >= 3.0      # white wherever a slightly deeper shade makes it fully readable
+    text = white if on_white else black
+
+    def fit(c, need=4.6):
+        """Adjust a shade until the text on it is easy to read (darker for white text, lighter for dark text)."""
+        for _ in range(30):
+            if _contrast(text, c) >= need:
+                return c
+            c = _mix(c, "#000000" if on_white else "#ffffff", 0.06)
+        return c
+    # 2. every shade is readable with that text: buttons, selected rows, menu highlights, sent chat bubbles
+    s["accent"] = accent
+    s["accent2"] = fit(_mix(accent, "#ffffff", 0.10))
+    s["accent_mid"] = fit(_mix(accent, "#000000", 0.08))
+    s["accent_dark"] = fit(_mix(accent, "#000000", 0.18))
+    s["hover"] = fit(accent)
+    s["on_accent"] = s["bubble_text"] = text
+    # 3. read ticks that stand out on the sent bubbles
+    ends = (s["accent2"], s["accent_dark"])
+    choices = ["#7df9ff", "#a5f3fc", "#ffffff"] if on_white else ["#1d4ed8", "#1e3a8a", "#0a2a8a"]
+    s["tick"] = max(choices, key=lambda t: min(_contrast(t, c) for c in ends))
+    r, g, b = (round(v * 255) for v in _rgb(accent))
+    s["glow"] = f"rgba({r},{g},{b},{0.30 if light else 0.38})"
+    s["glow_soft"] = f"rgba({r},{g},{b},{0.12 if light else 0.16})"
+    return s
+
+
+for _key, _icon, _name, _dark, _light in ACCENTS:
+    if _dark:
+        SKINS[f"dark-{_key}"] = _accent_skin("midnight", _dark)
+        SKINS[f"light-{_key}"] = _accent_skin("snow", _light)
+
 _SKIN_TEMPLATE = """
 * { font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", sans-serif; }
 window, dialog, messagedialog, .background { background-color: $bg; color: $text; }
@@ -18309,20 +18400,21 @@ def skin_css(name):
     return Template(_SKIN_TEMPLATE).safe_substitute(SKINS[name]).encode()
 
 
-def recent_download_in(folder, minutes=10):
-    """The newest file in a folder if it arrived in the last few minutes (browsers that open only the folder)."""
-    best, newest = None, time.time() - minutes * 60
+def recent_downloads_in(folder, minutes=30, limit=12):
+    """Files that arrived in a folder in the last half hour, newest first (for browsers that open only the folder:
+    they don't say which file you clicked, so all recent ones are pointed out)."""
+    since, found = time.time() - minutes * 60, []
     try:
         with os.scandir(folder) as it:
             for e in it:
                 if e.name.startswith(".") or e.name.lower().endswith(_PARTIAL) or not e.is_file(follow_symlinks=False):
                     continue
-                t = e.stat(follow_symlinks=False).st_mtime
-                if t > newest:
-                    best, newest = e.path, t
+                t = e.stat(follow_symlinks=False).st_mtime    # a download's time is when it finished
+                if t > since:
+                    found.append((t, e.path))
     except OSError:
-        return None
-    return best
+        return []
+    return [p for _t, p in sorted(found, reverse=True)[:limit]]
 
 
 class TabWindow(Gtk.Window):
@@ -19115,15 +19207,20 @@ class MainWindow(Gtk.ApplicationWindow):
         return False
 
     # ---------- themes: the modern skins (glossy, rounded) and the classic look
-    THEMES = [("midnight", "🟠", "Midnight Orange (black + orange)"), ("snow", "🔆", "Snow Orange (white + orange)"),
-              ("mono", "◐", "Mono (black + white)"), ("system", "🖥", "Classic: follow system"),
-              ("light", "☀", "Classic light"), ("dark", "🌙", "Classic dark")]
+    THEMES = ([("midnight", "🟠", "Dark · Orange")] +
+              [(f"dark-{k}", i, f"Dark · {n}") for k, i, n, d, _l in ACCENTS if d] +
+              [("snow", "🔆", "Light · Orange")] +
+              [(f"light-{k}", i, f"Light · {n}") for k, i, n, d, _l in ACCENTS if d] +
+              [("mono", "◐", "Mono (black + white)"), ("system", "🖥", "Classic: follow system"),
+               ("light", "☀", "Classic light"), ("dark", "🌙", "Classic dark")])
 
     def _theme_button(self):
         menu = Gtk.Menu()
         group = None
         self.theme_items = {}
         for key, icon, label in self.THEMES:
+            if key in ("snow", "mono"):                       # separators between Dark, Light and the others
+                menu.append(Gtk.SeparatorMenuItem())
             item = Gtk.RadioMenuItem.new_with_label_from_widget(group, f"{icon}   {label}")
             group = item
             item.set_active(self.cfg["theme"] == key)
@@ -22269,7 +22366,7 @@ class MainWindow(Gtk.ApplicationWindow):
                             for side, nb in (("left", self.left_nb), ("right", self.right_nb))}
         write_json(CONFIG_FILE, self.cfg)
 
-    def show_from_tray(self, chat=False, folder=None, select=None, token=None):
+    def show_from_tray(self, chat=False, folder=None, select=None, token=None, source="app"):
         if folder:
             self.show_files()
         """Bring the window forward. With the activation token another app passed along (Chrome's folder icon,
@@ -22294,10 +22391,17 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.set_active(existing)
             else:
                 self.new_tab(self.left_nb, folder)
-            if not select:                                   # a browser that only opens the folder
-                select = recent_download_in(folder)
+            self.__dict__.setdefault("_open_log", []).append(
+                (time.time(), source, os.path.basename(select) if select else f"(folder only) {short(folder)}"))
+            self._open_log = self._open_log[-8:]
             if select:
                 self.select_in_active(select)
+            else:                                            # a browser that opened only the folder
+                recent = recent_downloads_in(folder)
+                if len(recent) == 1:
+                    self.select_in_active(recent[0])
+                elif recent and self.active is not None:
+                    self.active.spotlight_files(recent, "your browser didn't say which one")
         if chat:
             self.show_right("chat")
         return False
@@ -22432,9 +22536,9 @@ class MainWindow(Gtk.ApplicationWindow):
             always.connect("toggled", lambda c: (self.cfg.__setitem__("fm_takeover", c.get_active()),
                                                  write_json(CONFIG_FILE, self.cfg)))
             box.add(always)
-            log = getattr(getattr(self, "fm_service", None), "log", [])
-            lines = "\n".join(f"{time.strftime('%H:%M:%S', time.localtime(t))}  {m}  {esc(os.path.basename(u) or u)}"
-                              for t, m, u in reversed(log)) or "none yet (since Arckad-D started)"
+            log = getattr(self, "_open_log", [])
+            lines = "\n".join(f"{time.strftime('%H:%M:%S', time.localtime(t))}  {esc(src)}  →  {esc(what)}"
+                              for t, src, what in reversed(log)) or "none yet (since Arckad-D started)"
             got = Gtk.Label(xalign=0, wrap=True)
             got.set_markup(f"<small><b>Last requests received:</b>\n<tt>{lines}</tt></small>")
             box.add(got)
