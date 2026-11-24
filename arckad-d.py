@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.47.1"
+APP_VERSION = "3.47.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -19349,6 +19349,9 @@ class MainWindow(Gtk.ApplicationWindow):
         if dual and self.right_nb.get_visible() != want_two:
             self.right_nb.set_visible(want_two)
             changed.append("second folder " + ("back" if want_two else "hidden"))
+            if not want_two and self.active is not None and self.active.get_parent() is self.right_nb:
+                # you were working in the pane that's now hidden: continue in the one you can see
+                self.set_active(self.left_nb.get_nth_page(self.left_nb.get_current_page()))
         if changed:
             everything = want_side and (want_two or not dual)
             self.flash_all("To fit this window: " + ", ".join(changed) +
@@ -20027,6 +20030,11 @@ class MainWindow(Gtk.ApplicationWindow):
     def set_active(self, pane):
         if pane is None or pane is self.active:
             return
+        nb = pane.get_parent()
+        if nb is self.right_nb and not self.right_nb.get_visible():      # never work in a hidden pane
+            pane = self.left_nb.get_nth_page(self.left_nb.get_current_page())
+            if pane is None or pane is self.active:
+                return
         if self.active is not None:
             self.active.row1.get_style_context().remove_class("fm-active-bar")
         self.active = pane
