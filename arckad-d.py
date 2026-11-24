@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.47.0"
+APP_VERSION = "3.47.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -18291,7 +18291,7 @@ def installed_apps():
 #  · other admin PCs: a licence file the owner signs for that PC's code (☰ → Issue a Pro licence…).
 # A licence works only on the PC it was made for and can't be changed without the owner key.
 # (The organisation key, made inside Pro, is what office PCs trust; the licence only unlocks the panel.)
-OWNER_PUB = ""                     # the owner's public key (hex). Set by the owner: see  arckad-d --owner-setup
+OWNER_PUB = "d6d99dd148da5ccaea5b0ea6268c88f7ae463a854aca2d478a886de0ae336af07d92349832f2640b46b5630679c5431bc8dc1629bcbcac2564d7593ea216b1b2818952cf18ea39fa9a1f85374aaaf87269f820e0935af33386711adce833d570eb66bf2de9022686c0c7d32a8b36325100d98c8be925836788165fad373c84f4b8922666bcf396b97dae937ea6db6563b1e52f891cc552c91cd5da50dc7ecab123dd4a44e253ce4d914da2237a4c71bb1a1f180748d1db546d6ccb9b8f78dc3f42e44206cbf716f0a251880eedddab96679b2ba238dd1f13c312fdd37a7539a3f487730914d3494f4fe93b9a8acfbc744c429f3f57833c12ecb8b903db62dbd7"  # the owner's public key (TAMILTIMON)
 OWNER_KEY = CONFIG_DIR / "owner-key.json"
 PRO_LICENCE = CONFIG_DIR / "pro-licence.arckadlicense"
 
