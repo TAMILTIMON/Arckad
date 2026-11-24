@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.44.0"
+APP_VERSION = "3.46.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -6914,6 +6914,54 @@ def rsa_verify(n_hex, data, sig_hex):
     return pow(s, 65537, n).to_bytes(k, "big") == _emsa(data, k)
 
 
+# ---- organisations: an admin (Arckad-D Pro) can add people directly, on PCs that trust the organisation
+ORG_SYSTEM_DIR = (Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Arckad-D" / "org" if IS_WIN
+                  else Path("/etc/arckad-d/org"))       # installed by IT (needs the PC's administrator password)
+ORG_USER_DIR = CONFIG_DIR / "org"                       # joined by the user
+
+
+def org_fp(pub_hex):
+    """The organisation's fingerprint, always calculated from its key (never taken from a file)."""
+    h = hashlib.sha256(("arckad-org|" + str(pub_hex)).encode()).hexdigest()[:20].upper()
+    return " ".join(h[i:i + 4] for i in range(0, 20, 4))
+
+
+def read_org_file(path):
+    """An organisation file (.arckadorg): {org, admin, pub}. None if it isn't one."""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        if d.get("format") != "arckad-org-1":
+            return None
+        pub = str(d.get("pub", ""))
+        int(pub, 16)
+        if len(pub) < 400:
+            return None
+        return {"org": str(d.get("org", "Organisation"))[:60], "admin": str(d.get("admin", ""))[:40], "pub": pub,
+                "fp": org_fp(pub)}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def trusted_orgs():
+    """{fingerprint: org} for every organisation this PC trusts: installed by IT, or joined by the user."""
+    out = {}
+    for folder, source in ((ORG_SYSTEM_DIR, "it"), (ORG_USER_DIR, "you")):
+        try:
+            files = sorted(folder.glob("*.arckadorg"))
+        except OSError:
+            continue
+        for f in files:
+            o = read_org_file(f)
+            if o and o["fp"] not in out:
+                o.update(source=source, path=str(f))
+                out[o["fp"]] = o
+    return out
+
+
+def org_add_data(fp, admin_pid, target, dh, ts):
+    return f"arckad-org-add|{fp}|{admin_pid}|{target}|{dh}|{int(ts)}".encode()
+
+
 # ---- built-in stickers (drawn by Arckad-D, so no licensing issues)
 _STICKER_SYMBOLS = {
     "check": '<path d="M52 64 l20 20 l38 -40" fill="none" stroke="#fff" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>',
@@ -7537,7 +7585,8 @@ class Chat:
             out["fcode"] = hashlib.sha256(f"arckad-friend-code|{self.fcode['code']}".encode()).hexdigest()[:20]
         if self.profile.get("setup") and self.profile.get("visible"):
             out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
-                          "ver": APP_VERSION, "pv": self.card_hash()}
+                          "ver": APP_VERSION, "pv": self.card_hash(),
+                          "orgs": [fp.replace(" ", "") for fp in trusted_orgs()][:4]}
         elif self.contacts["outgoing"] or self.contacts["friends"]:
             out["who"] = {"id": self.me, "name": self.my_name()[:40], "os": OS_NAME, "ph": self.photo_hash(),
                           "hidden": True, "pv": self.card_hash()}    # friends and people I asked still see me
@@ -8032,7 +8081,8 @@ class Chat:
         pv = str(who.get("pv") or "")[:16]
         self.people[pid] = {"name": name, "ip": ip, "port": port, "ph": ph, "os": str(who.get("os", ""))[:10],
                             "seen": time.time(), "hidden": bool(who.get("hidden")), "ver": str(who.get("ver", ""))[:12],
-                            "pv": pv, "card": (old or {}).get("card") or (self.contacts["friends"].get(pid) or {}).get("card")}
+                            "pv": pv, "card": (old or {}).get("card") or (self.contacts["friends"].get(pid) or {}).get("card"),
+                            "orgs": [str(x)[:20] for x in (who.get("orgs") or [])][:4]}
         known = ((self.contacts["friends"].get(pid) or {}).get("pv") if pid in self.contacts["friends"]
                  else (old or {}).get("pv_fetched"))
         if pv and pv != known and not (old or {}).get("card_busy"):
@@ -8263,6 +8313,28 @@ class Chat:
         a, b = sorted([mine_hex, their_dh_hex])
         return hashlib.sha256(b"arckad-friend-key|" + shared + a.encode() + b.encode()).digest()
 
+    def _org_check(self, req, pid, dh):
+        """A friend request signed by a trusted organisation's admin: for this PC, this exact key offer, recently,
+        and never twice. Anything else is an ordinary request."""
+        o = req.get("org")
+        if not isinstance(o, dict):
+            return None
+        orgs = trusted_orgs()
+        fp = str(o.get("fp", ""))
+        org = orgs.get(fp)
+        try:
+            ts = int(o.get("ts", 0))
+        except (TypeError, ValueError):
+            return None
+        if not org or abs(time.time() - ts) > 600:
+            return None
+        sig = str(o.get("sig", ""))
+        seen = self.__dict__.setdefault("_org_seen", set())
+        if sig in seen or not rsa_verify(org["pub"], org_add_data(fp, pid, self.me, dh, ts), sig):
+            return None
+        seen.add(sig)
+        return org
+
     def safety_code(self, pid):
         """A code both people see; if it matches on both screens, nobody intercepted the friendship."""
         f = self.contacts["friends"].get(pid) or {}
@@ -8270,10 +8342,13 @@ class Chat:
         digits = str(int(hashlib.sha256((a + "|" + b).encode()).hexdigest(), 16))[:30]
         return " ".join(digits[i:i + 5] for i in range(0, 30, 5))
 
-    def send_request(self, pid):
-        """Background thread. Returns (ok, message)."""
+    def send_request(self, pid, org_signer=None):
+        """Background thread. Returns (ok, message). Arckad-D Pro passes org_signer: on PCs that trust the
+        organisation, the request is then accepted at once (signed by the organisation's admin key)."""
         self.start()
         x, offer = self._dh_offer(pid)
+        if org_signer:
+            offer["org"] = org_signer(self.me, pid, offer["dh"])
         try:
             r = self._call(pid, "/f/request", offer)
         except (OSError, ValueError) as ex:
@@ -8285,6 +8360,8 @@ class Chat:
                                           "ts": time.time()}
         self.save_contacts()
         self.ui("on_people_changed")
+        if r.get("auto"):
+            return True, f"{p.get('name', 'They')} is now your contact (added through your organisation)."
         return True, f"Friend request sent to {p.get('name', 'them')}."
 
     def accept_request(self, pid):
@@ -9225,6 +9302,24 @@ class Chat:
                 threading.Thread(target=self.accept_request, args=(pid,), daemon=True).start()
                 self.ui("on_pair_event", f"🔄 Re-connected the friendship with {req.get('name', 'a friend')}")
                 return {"ok": True}
+            org = self._org_check(req, pid, dh)
+            if org:                                           # signed by an organisation this PC trusts
+                self.contacts["incoming"][pid] = {"name": str(req.get("name", "?"))[:40], "os": str(req.get("os", ""))[:10],
+                                                  "sigpub": sigpub, "dh": dh, "ph": str(req.get("ph", ""))[:16],
+                                                  "ts": time.time()}
+                self.people.setdefault(pid, {"name": str(req.get("name", "?"))[:40], "ip": ip, "port": req.get("port"),
+                                             "ph": "", "os": "", "seen": time.time()})
+                self.people[pid].update(ip=ip, port=req.get("port"), seen=time.time())
+
+                def accept():
+                    self.accept_request(pid)
+                    f = self.contacts["friends"].get(pid)
+                    if f is not None:
+                        f["org"] = org["org"]
+                        self.save_contacts()
+                    self.ui("on_pair_event", f"🏢 {req.get('name', 'Your admin')} ({org['org']}) added you as a contact")
+                threading.Thread(target=accept, daemon=True).start()
+                return {"ok": True, "auto": True}
             if pid in self.contacts["outgoing"]:              # both asked each other: that's a yes from both
                 out = self.contacts["outgoing"][pid]
                 key = self._friend_key(int(out["x"], 16), dh, out["dh"])
@@ -14963,7 +15058,8 @@ def hand_over_to_running(folder, background, select=None):
         with socket.create_connection(("127.0.0.1", int(info["port"])), timeout=1.5) as s:
             act = os.environ.get("XDG_ACTIVATION_TOKEN") or os.environ.get("DESKTOP_STARTUP_ID") or ""
             s.sendall(json.dumps({"token": info["token"], "cmd": "background" if background else "show",
-                                  "folder": folder, "select": select, "activation": act}).encode() + b"\n")
+                                  "folder": folder, "select": select, "activation": act,
+                                  "pro": "--pro" in sys.argv}).encode() + b"\n")
             return s.recv(8).startswith(b"ok")
     except (OSError, ValueError):
         return False
@@ -14995,6 +15091,8 @@ def start_instance_listener(win):
                         GLib.idle_add(lambda d=data: win.show_from_tray(folder=d.get("folder"), select=d.get("select"),
                                                                         token=d.get("activation"),
                                                                         source="opened by an app") or False)
+                        if data.get("pro"):
+                            GLib.idle_add(lambda: win.open_pro() or False)
                     conn.sendall(b"ok")
             except (OSError, ValueError):
                 pass
@@ -18164,6 +18262,358 @@ def installed_apps():
     return out
 
 
+# ---------------------------------------------------------------- Arckad-D Pro: activation with the owner's key
+# Pro is part of every Arckad-D (so it updates with it) but stays hidden until activated:
+#  · the owner's PC: its owner key (made with  arckad-d --owner-setup) matches OWNER_PUB below;
+#  · other admin PCs: a licence file the owner signs for that PC's code (☰ → Issue a Pro licence…).
+# A licence works only on the PC it was made for and can't be changed without the owner key.
+# (The organisation key, made inside Pro, is what office PCs trust; the licence only unlocks the panel.)
+OWNER_PUB = ""                     # the owner's public key (hex). Set by the owner: see  arckad-d --owner-setup
+OWNER_KEY = CONFIG_DIR / "owner-key.json"
+PRO_LICENCE = CONFIG_DIR / "pro-licence.arckadlicense"
+
+
+def pc_code():
+    """This PC's code for a Pro licence (from the system's machine ID, scrambled: it doesn't reveal the ID)."""
+    raw = ""
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography", 0,
+                                winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)) as k:
+                raw = winreg.QueryValueEx(k, "MachineGuid")[0]
+        except OSError:
+            raw = ""
+    else:
+        for f in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+            try:
+                raw = Path(f).read_text().strip()
+                if raw:
+                    break
+            except OSError:
+                continue
+    raw = raw or socket.gethostname()
+    alphabet = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+    n = int(hashlib.sha256(("arckad-pc|" + raw).encode()).hexdigest(), 16)
+    s = ""
+    for _ in range(12):
+        n, r = divmod(n, len(alphabet))
+        s += alphabet[r]
+    return f"{s[:4]}-{s[4:8]}-{s[8:]}"
+
+
+def _licence_data(lic):
+    return (f"arckad-pro-licence|{lic.get('name', '')}|{lic.get('pc', '')}|{int(lic.get('issued', 0))}|"
+            f"{int(lic.get('expires') or 0)}").encode()
+
+
+def owner_key():
+    """The owner key on this PC, if it is THE owner key (its public half matches OWNER_PUB)."""
+    k = read_json(OWNER_KEY, {}) if OWNER_KEY.exists() else {}
+    return k if OWNER_PUB and k.get("n") == OWNER_PUB else None
+
+
+def licence_ok(lic):
+    """(ok, reason) for a licence: signed with the owner key, for this PC, not expired."""
+    if not OWNER_PUB:
+        return False, "This copy of Arckad-D has no owner key built in yet."
+    if not isinstance(lic, dict) or lic.get("format") != "arckad-pro-licence-1":
+        return False, "That isn't an Arckad-D Pro licence."
+    if not rsa_verify(OWNER_PUB, _licence_data(lic), str(lic.get("sig", ""))):
+        return False, "The licence isn't signed by the owner (or it was changed)."
+    if lic.get("pc") != pc_code():
+        return False, f"This licence is for another PC ({lic.get('pc')}); this PC is {pc_code()}."
+    if lic.get("expires") and time.time() > float(lic["expires"]):
+        return False, "This licence has expired."
+    return True, f"Licensed to {lic.get('name', '?')}"
+
+
+def pro_active():
+    """(True, who) when Pro is unlocked on this PC: the owner's own PC, or a valid licence."""
+    if owner_key():
+        return True, "the owner"
+    lic = read_json(PRO_LICENCE, {}) if PRO_LICENCE.exists() else {}
+    ok, why = licence_ok(lic) if lic else (False, "")
+    return ok, (lic.get("name") if ok else why)
+
+
+def issue_licence(name, pc, days=0):
+    k = owner_key()
+    if not k:
+        raise PermissionError("Only the owner's PC can issue licences.")
+    lic = {"format": "arckad-pro-licence-1", "name": name.strip()[:60], "pc": pc.strip().upper(),
+           "issued": int(time.time()), "expires": int(time.time() + days * 86400) if days else 0}
+    lic["sig"] = rsa_sign(k, _licence_data(lic))
+    return lic
+
+
+def owner_setup():
+    """arckad-d --owner-setup: make the owner key on this PC (once) and show its public half."""
+    if OWNER_KEY.exists():
+        k = read_json(OWNER_KEY, {})
+        print("You already have an owner key on this PC.")
+    else:
+        print("Making your owner key (2048-bit)…")
+        k = rsa_generate(2048)
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        write_json(OWNER_KEY, k)
+        try:
+            os.chmod(OWNER_KEY, 0o600)
+        except OSError:
+            pass
+    out = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS) or str(HOME)) / "arckad-owner-public.txt"
+    out.write_text(f'OWNER_PUB = "{k["n"]}"\n', encoding="utf-8")
+    print(f"\nYour owner key is in {OWNER_KEY} (keep it safe and private: back it up, never share it).")
+    print(f"Its PUBLIC half is saved in {out}. Put that line into arckad-d.py (replace the line that")
+    print("starts with  OWNER_PUB = \"\"  ), or send that file to the developer to build it in.")
+    print("Then this PC is Arckad-D Pro, and it can issue Pro licences for other admin PCs.")
+    return 0
+
+
+PRO_DIR = CONFIG_DIR / "pro"
+PRO_KEY = PRO_DIR / "org-admin.json"
+
+
+class ArckadPro:
+    def __init__(self, win):
+        self.win = win
+        self.window = None
+        self.data = read_json(PRO_KEY, {}) if PRO_KEY.exists() else {}
+
+    # ---------- the organisation's key
+    def has_key(self):
+        return bool(self.data.get("key", {}).get("n"))
+
+    def fp(self):
+        return org_fp(self.data["key"]["n"])
+
+    def org_file(self):
+        return {"format": "arckad-org-1", "org": self.data.get("org", "Organisation"),
+                "admin": self.win.chat.my_name(), "pub": self.data["key"]["n"], "created": int(time.time())}
+
+    def signer(self, admin_pid, target, dh):
+        ts = int(time.time())
+        fp = self.fp()
+        return {"fp": fp, "ts": ts, "sig": rsa_sign(self.data["key"], org_add_data(fp, admin_pid, target, dh, ts))}
+
+    def create(self, name, done):
+        def work():
+            key = rsa_generate(2048)
+            PRO_DIR.mkdir(parents=True, exist_ok=True)
+            self.data = {"org": name.strip()[:60] or "Organisation", "key": key, "created": time.time()}
+            write_json(PRO_KEY, self.data)
+            try:
+                os.chmod(PRO_KEY, 0o600)                    # only you can read the admin key
+            except OSError:
+                pass
+            GLib.idle_add(lambda: done() or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- the window
+    def open(self):
+        if self.window is not None:
+            self.window.present()
+            return
+        w = Gtk.Window(title=f"{APP_NAME} Pro · Organisation admin")
+        w.set_transient_for(self.win)
+        w.set_default_size(760, 640)
+        w.connect("destroy", lambda *_: setattr(self, "window", None))
+        self.window = w
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=16)
+        w.add(self.box)
+        self.render()
+        w.show_all()
+        self._tick = GLib.timeout_add_seconds(4, self._refresh_people)
+
+    def _clear(self):
+        for c in self.box.get_children():
+            self.box.remove(c)
+
+    def render(self):
+        self._clear()
+        if not self.win.chat.profile.get("setup"):
+            self.box.add(Gtk.Label(label="Set up your chat profile first (Chat → your name and photo).", wrap=True))
+            self.box.show_all()
+            return
+        if not self.has_key():
+            return self._setup()
+        head = Gtk.Label(xalign=0, wrap=True)
+        head.set_markup(f"<span size='x-large'><b>🏢 {esc(self.data.get('org', ''))}</b></span>\n"
+                        f"<small>Admin: {esc(self.win.chat.my_name())} · fingerprint <tt>{esc(self.fp())}</tt></small>")
+        self.box.add(head)
+        btns = Gtk.Box(spacing=8)
+        for label, cb in (("💾 Save organisation file…", self.save_file),
+                          ("How to install it on office PCs…", self.it_help)) + \
+                         ((("🔑 Issue a Pro licence…", self.issue_dialog),) if owner_key() else ()):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            btns.add(b)
+        self.box.add(btns)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>PCs that trust this organisation are marked 🏢 and can be <b>added directly</b>. "
+                        "Others get an ordinary friend request, which they can accept or decline.</small>")
+        note.get_style_context().add_class("dim-label")
+        self.box.add(note)
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(self.list)
+        self.box.pack_start(sw, True, True, 0)
+        self.status = Gtk.Label(xalign=0, wrap=True)
+        self.box.add(self.status)
+        self.box.show_all()
+        self._refresh_people()
+
+    def _setup(self):
+        t = Gtk.Label(xalign=0, wrap=True)
+        t.set_markup("<span size='x-large'><b>Create your organisation</b></span>\n\nArckad-D Pro makes an "
+                     "<b>admin key</b> for your organisation on this PC. Office PCs that trust it (installed by IT, or "
+                     "joined by the user) let you add their users as contacts without a request.\n\n"
+                     "<b>Keep this PC safe:</b> whoever has the admin key can add people on enrolled PCs.")
+        self.box.add(t)
+        e = Gtk.Entry(placeholder_text="Organisation name, e.g. SRM IT Infra")
+        self.box.add(e)
+        b = Gtk.Button(label="Create the organisation key")
+        b.get_style_context().add_class("suggested-action")
+        spin = Gtk.Label()
+
+        def go(*_):
+            if not e.get_text().strip():
+                return
+            b.set_sensitive(False)
+            spin.set_text("Creating a 2048-bit key… (this can take up to a minute)")
+            self.create(e.get_text(), self.render)
+        b.connect("clicked", go)
+        e.connect("activate", go)
+        self.box.add(b)
+        self.box.add(spin)
+        self.box.show_all()
+
+    def _refresh_people(self):
+        if self.window is None:
+            return False
+        if not self.has_key() or not hasattr(self, "list"):
+            return True
+        chat = self.win.chat
+        me_fp = self.fp().replace(" ", "")
+        for c in self.list.get_children():
+            self.list.remove(c)
+        people = sorted(((pid, p) for pid, p in chat.people.items()
+                         if pid != chat.me and time.time() - p.get("seen", 0) < 120),
+                        key=lambda x: x[1].get("name", "").casefold())
+        if not people:
+            self.list.add(Gtk.Label(label="Nobody is online on your network right now.", margin=20))
+        for pid, p in people:
+            friend = pid in chat.contacts["friends"]
+            enrolled = me_fp in (p.get("orgs") or [])
+            row = Gtk.Box(spacing=10, margin=6)
+            lbl = Gtk.Label(xalign=0, hexpand=True)
+            status = ("✓ contact" if friend else ("🏢 enrolled (can be added directly)" if enrolled else
+                                                  "not enrolled (gets a friend request)"))
+            lbl.set_markup(f"<b>{esc(p.get('name', '?'))}</b>  <small>{esc(p.get('os', ''))}</small>\n"
+                           f"<small>{esc(status)}</small>")
+            row.pack_start(lbl, True, True, 0)
+            if friend:
+                g = Gtk.Button(label="Add to group…")
+                g.connect("clicked", lambda b, pid=pid: self._group_menu(b, pid))
+                row.add(g)
+            elif pid in chat.contacts["outgoing"]:
+                row.add(Gtk.Label(label="request sent"))
+            else:
+                b = Gtk.Button(label="Add directly" if enrolled else "Send request")
+                if enrolled:
+                    b.get_style_context().add_class("suggested-action")
+                b.connect("clicked", lambda _b, pid=pid, en=enrolled: self.add(pid, en, _b))
+                row.add(b)
+            r = Gtk.ListBoxRow()
+            r.add(row)
+            self.list.add(r)
+        self.list.show_all()
+        return True
+
+    def add(self, pid, enrolled, btn):
+        btn.set_sensitive(False)
+        btn.set_label("Adding…" if enrolled else "Sending…")
+
+        def work():
+            ok, msg = self.win.chat.send_request(pid, org_signer=self.signer if enrolled else None)
+            GLib.idle_add(lambda: (self.status.set_markup(("✓ " if ok else "✗ ") + esc(msg)), self._refresh_people())
+                          and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _group_menu(self, btn, pid):
+        chat = self.win.chat
+        m = Gtk.Menu()
+        mine = [(gid, g) for gid, g in chat.groups.items()
+                if g.get("kind") not in ("direct", "saved") and chat.is_owner(gid) and not g.get("removed")]
+        if not mine:
+            it = Gtk.MenuItem(label="(You don't own any groups yet: create one in Chat)")
+            it.set_sensitive(False)
+            m.append(it)
+        for gid, g in mine:
+            it = Gtk.MenuItem(label=g.get("name", "Group"))
+            it.connect("activate", lambda _i, gid=gid: threading.Thread(
+                target=lambda: chat.add_friends_to_group(gid, [pid]), daemon=True).start())
+            m.append(it)
+        m.show_all()
+        m.popup_at_widget(btn, Gdk.Gravity.SOUTH_WEST, Gdk.Gravity.NORTH_WEST, None)
+
+    def issue_dialog(self):
+        """The owner's PC: a Pro licence for another admin's PC (they send their PC code)."""
+        d = Gtk.Dialog(title="Issue a Pro licence", transient_for=self.window, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save licence…", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        name = Gtk.Entry(placeholder_text="Who it's for (e.g. Dinesh, IT Infra)")
+        pc = Gtk.Entry(placeholder_text="Their PC code (☰ → Arckad-D Pro… on their PC), e.g. 7K3F-9QX2-M4TD")
+        days = Gtk.ComboBoxText()
+        for label in ("No expiry", "30 days", "90 days", "1 year"):
+            days.append_text(label)
+        days.set_active(0)
+        for w in (name, pc, days):
+            box.add(w)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK and name.get_text().strip() and len(pc.get_text().strip()) >= 12:
+            n = (0, 30, 90, 365)[days.get_active()]
+            lic = issue_licence(name.get_text(), pc.get_text(), n)
+            fc = Gtk.FileChooserNative(title="Save the licence", transient_for=self.window,
+                                       action=Gtk.FileChooserAction.SAVE)
+            fc.set_current_name(re.sub(r"[^\w\-]", "", name.get_text().replace(" ", "-")) + ".arckadlicense")
+            if fc.run() == Gtk.ResponseType.ACCEPT:
+                write_json(Path(fc.get_filename()), lic)
+                self.status.set_markup(f"✓ Licence for <b>{esc(lic['name'])}</b> ({esc(lic['pc'])}) saved. "
+                                       "It works only on that PC.")
+            fc.destroy()
+        d.destroy()
+
+    def save_file(self):
+        fc = Gtk.FileChooserNative(title="Save the organisation file", transient_for=self.window,
+                                   action=Gtk.FileChooserAction.SAVE)
+        fc.set_current_name(re.sub(r"[^\w\- ]", "", self.data.get("org", "organisation")).strip().replace(" ", "-")
+                            + ".arckadorg")
+        fc.set_do_overwrite_confirmation(True)
+        if fc.run() == Gtk.ResponseType.ACCEPT:
+            Path(fc.get_filename()).write_text(json.dumps(self.org_file(), indent=1), encoding="utf-8")
+            self.status.set_markup(f"✓ Saved. Give it to IT (or to your users) with this fingerprint to check:\n"
+                                   f"<tt>{esc(self.fp())}</tt>")
+        fc.destroy()
+
+    def it_help(self):
+        name = re.sub(r"[^\w\- ]", "", self.data.get("org", "organisation")).strip().replace(" ", "-") + ".arckadorg"
+        text = (f"Install the organisation file on each office PC (IT, with the PC's administrator rights).\n"
+                f"Users can't remove it; Arckad-D shows it as “installed by IT”.\n\n"
+                f"UBUNTU (Terminal):\n"
+                f"  sudo install -D -m 644 {name} /etc/arckad-d/org/{name}\n\n"
+                f"WINDOWS (PowerShell as Administrator):\n"
+                f"  $d = \"$env:ProgramData\\Arckad-D\\org\"\n"
+                f"  New-Item -ItemType Directory -Force $d | Out-Null\n"
+                f"  Copy-Item .\\{name} $d\n"
+                f"  icacls $d /inheritance:r /grant:r \"Administrators:F\" \"SYSTEM:F\" \"Users:RX\"\n\n"
+                f"Or each user: Arckad-D → ☰ → 🏢 Organisation… → Join an organisation… (they check this fingerprint):\n"
+                f"  {self.fp()}")
+        self.win.info(text, mono=True)
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -18857,6 +19307,8 @@ class MainWindow(Gtk.ApplicationWindow):
         ] + ([] if INSTALLED or IS_WIN else [(f"Add {APP_NAME} to app menu", self.on_install)]) + [
             ("Keyboard shortcuts", lambda: self.info(SHORTCUTS, mono=True)),
             ("Default file manager…", self.default_fm_dialog),
+            ("🏢 Organisation…", self.org_dialog),
+            ("🏢 Arckad-D Pro (organisation admin)…", self.open_pro),
             ("Change logo…", self.choose_logo),
             ("Use the default logo", self.reset_logo),
             ("Check for updates…", lambda: self.check_updates(manual=True)),
@@ -22476,6 +22928,131 @@ class MainWindow(Gtk.ApplicationWindow):
         self.flash_all(f"{APP_NAME} is now your default file manager" if on else
                        "Your system's file manager is the default again")
 
+    def org_dialog(self):
+        """Organisations this PC trusts: their admin (Arckad-D Pro) can add you as a contact without a request."""
+        d = Gtk.Dialog(title="Organisation", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=64)
+        intro.set_markup("If this PC trusts your organisation, its <b>admin</b> (with Arckad-D Pro) can add you as a "
+                         "contact <b>without a request</b>. Only requests signed with that organisation's own key are "
+                         "accepted this way; everyone else still has to ask.")
+        box.add(intro)
+        holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.add(holder)
+
+        def fill():
+            for c in holder.get_children():
+                holder.remove(c)
+            orgs = trusted_orgs()
+            if not orgs:
+                none = Gtk.Label(label="This PC doesn't trust any organisation.", xalign=0)
+                none.get_style_context().add_class("dim-label")
+                holder.add(none)
+            for o in orgs.values():
+                row = Gtk.Box(spacing=10)
+                lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+                lbl.set_markup(f"🏢 <b>{esc(o['org'])}</b>" + (f"  ·  admin {esc(o['admin'])}" if o["admin"] else "") +
+                               f"\n<small><tt>{esc(o['fp'])}</tt> · " +
+                               ("installed by IT (only an administrator of this PC can remove it)" if o["source"] == "it"
+                                else "joined by you") + "</small>")
+                row.pack_start(lbl, True, True, 0)
+                if o["source"] == "you":
+                    b = Gtk.Button(label="Leave")
+                    b.connect("clicked", lambda _b, o=o: (Path(o["path"]).unlink(missing_ok=True), fill()))
+                    row.add(b)
+                holder.add(row)
+            holder.show_all()
+        fill()
+        join = Gtk.Button(label="Join an organisation… (choose its .arckadorg file)")
+
+        def do_join(*_):
+            fc = Gtk.FileChooserNative(title="Organisation file", transient_for=d, action=Gtk.FileChooserAction.OPEN)
+            flt = Gtk.FileFilter()
+            flt.set_name("Arckad-D organisation (*.arckadorg)")
+            flt.add_pattern("*.arckadorg")
+            fc.add_filter(flt)
+            if fc.run() == Gtk.ResponseType.ACCEPT:
+                o = read_org_file(fc.get_filename())
+                if not o:
+                    self.error("That isn't an Arckad-D organisation file.")
+                elif self.confirm(f"Join “{o['org']}”?\n\nIts admin will be able to add you as a contact without a "
+                                  f"request.\n\nCheck this fingerprint with your admin before you say yes:\n\n"
+                                  f"{o['fp']}"):
+                    ORG_USER_DIR.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(fc.get_filename(), ORG_USER_DIR / (o["fp"].replace(" ", "") + ".arckadorg"))
+                    fill()
+                    self.flash_all(f"🏢 This PC now trusts {o['org']}")
+            fc.destroy()
+        join.connect("clicked", do_join)
+        box.add(join)
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    # ---------- Arckad-D Pro (the admin panel), when installed
+    def open_pro(self):
+        """☰ → Arckad-D Pro: the admin panel when Pro is active here, otherwise how to activate it."""
+        ok, _who = pro_active()
+        if not ok:
+            return self.activate_pro()
+        if not getattr(self, "pro", None):
+            self.pro = ArckadPro(self)
+        self.pro.open()
+
+    def activate_pro(self):
+        d = Gtk.Dialog(title="Activate Arckad-D Pro", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        code = pc_code()
+        t = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        t.set_markup("<span size='large'><b>🏢 Arckad-D Pro</b></span>\n\nPro adds the <b>organisation admin</b> panel. "
+                     "It's activated with a <b>licence from the owner</b>, made for this PC.\n\n"
+                     "1. Send the owner this PC's code:")
+        box.add(t)
+        row = Gtk.Box(spacing=8)
+        c = Gtk.Label(selectable=True)
+        c.set_markup(f"<span size='x-large'><tt><b>{code}</b></tt></span>")
+        row.add(c)
+        cp = Gtk.Button(label="Copy")
+        cp.connect("clicked", lambda *_: (Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(code, -1),
+                                          cp.set_label("Copied ✓")))
+        row.add(cp)
+        box.add(row)
+        t2 = Gtk.Label(xalign=0, label="2. Load the licence file they send you:")
+        box.add(t2)
+        msg = Gtk.Label(xalign=0, wrap=True)
+        b = Gtk.Button(label="Choose licence file…")
+        b.get_style_context().add_class("suggested-action")
+
+        def choose(*_):
+            fc = Gtk.FileChooserNative(title="Arckad-D Pro licence", transient_for=d, action=Gtk.FileChooserAction.OPEN)
+            flt = Gtk.FileFilter()
+            flt.set_name("Arckad-D Pro licence (*.arckadlicense)")
+            flt.add_pattern("*.arckadlicense")
+            fc.add_filter(flt)
+            if fc.run() == Gtk.ResponseType.ACCEPT:
+                lic = read_json(Path(fc.get_filename()), {})
+                ok, why = licence_ok(lic)
+                if ok:
+                    write_json(PRO_LICENCE, lic)
+                    d.response(Gtk.ResponseType.CLOSE)
+                    self.flash_all(f"🏢 Arckad-D Pro is active ({why})")
+                    GLib.idle_add(lambda: self.open_pro() or False)
+                else:
+                    msg.set_markup(f"✗ {esc(why)}")
+            fc.destroy()
+        b.connect("clicked", choose)
+        box.add(b)
+        box.add(msg)
+        d.show_all()
+        d.run()
+        d.destroy()
+
     def default_fm_dialog(self):
         d = Gtk.Dialog(title="Default file manager", transient_for=self, modal=True)
         d.add_button("Close", Gtk.ResponseType.CLOSE)
@@ -22669,6 +23246,8 @@ def install_error_recorder():
 
 def main():
     install_error_recorder()
+    if "--owner-setup" in sys.argv:
+        sys.exit(owner_setup())
     if "--selftest" in sys.argv:
         i = sys.argv.index("--selftest")
         sys.exit(selftest(sys.argv[i + 1] if len(sys.argv) > i + 1 else "selftest.txt"))
@@ -22709,6 +23288,8 @@ def main():
             win = MainWindow(a, start)
             if select:
                 GLib.idle_add(lambda: win.select_in_active(select) or False)
+            if "--pro" in sys.argv:
+                GLib.timeout_add(800, lambda: win.open_pro() or False)
             if background:                         # started at log-in: just the tray icon
                 a.hold()
                 win.hide()
