@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.51.0"
+APP_VERSION = "3.52.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20730,6 +20730,9 @@ def settings_entries(win):
            [("full", "Full"), ("compact", "Compact"), ("minimal", "Minimal (like Files)"),
             ("autohide", "Minimal + auto-hide")],
            lambda: win.cfg.get("titlebar", "full"), lambda k: win.set_titlebar_style(k)),
+          ("appearance", "Sidebar", "Full, a slim rail of icons, or auto-hide (opens when you point at it; 📌 locks "
+           "it open).", "choice", [("expanded", "Expanded"), ("icons", "Icons only"), ("autohide", "Auto-hide")],
+           lambda: win.cfg.get("sidebar_mode", "expanded"), lambda k: win.set_sidebar_mode(k)),
           ("appearance", "Colourful file icons", "Coloured icons for each file type.", "switch",
            lambda: win.icons_item.get_active(), lambda v: win.icons_item.set_active(v)),
           ("appearance", "Show hidden files", "Files whose names start with a dot (Ctrl+H).", "switch",
@@ -21479,7 +21482,7 @@ class MainWindow(Gtk.ApplicationWindow):
             return False
         panel = self.right_box.get_preferred_width()[0] if self.right_box.get_visible() else 0
         dual = bool(self.cfg.get("dual"))
-        side_w, pane_w = 230, 290
+        side_w, pane_w = (60 if getattr(self, "_side_rail", False) else 230), 290
 
         def need(side, two):
             return (side_w if side else 0) + (2 if two else 1) * pane_w + panel + 24
@@ -21745,7 +21748,31 @@ class MainWindow(Gtk.ApplicationWindow):
 
         main = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         main.set_position(220)
+        self.main_paned = main
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        # the sidebar's own controls: « shrink / » expand · ⇔ auto-hide · 📌 lock open
+        self.side_strip = Gtk.Box(spacing=2, margin=4, halign=Gtk.Align.END)
+        self.side_toggle = Gtk.Button(label="«")
+        self.side_toggle.set_tooltip_text("Shrink the sidebar to icons")
+        self.side_toggle.connect("clicked", lambda *_: self.set_sidebar_mode(
+            "expanded" if self._side_rail else "icons"))
+        self.side_auto = Gtk.ToggleButton(label="⇔")
+        self.side_auto.set_tooltip_text("Auto-hide: icons only, opens when you point at it")
+        self.side_auto.connect("toggled", lambda b: None if self._side_guard else
+                               self.set_sidebar_mode("autohide" if b.get_active() else "expanded"))
+        self.side_lock = Gtk.ToggleButton(label="📌")
+        self.side_lock.set_tooltip_text("Lock the sidebar open (while auto-hide is on)")
+        self.side_lock.connect("toggled", lambda b: None if self._side_guard else self._side_lock_toggled(b.get_active()))
+        self.side_lock.set_no_show_all(True)
+        for b in (self.side_toggle, self.side_auto, self.side_lock):
+            b.set_relief(Gtk.ReliefStyle.NONE)
+            b.get_style_context().add_class("side-ctl")
+            self.side_strip.add(b)
+        side.add(self.side_strip)
+        self._side_rail, self._side_guard, self._side_anim = False, False, None
+        css = Gtk.CssProvider()
+        css.load_from_data(b"button.side-ctl { min-width: 26px; min-height: 24px; padding: 0 4px; font-size: 12px; }")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 9)
         self.sidebar = Gtk.ListBox()
         self.sidebar.get_style_context().add_class("arckad-sidebar")
         self.sidebar.get_style_context().add_class("navigation-sidebar")
@@ -21765,8 +21792,15 @@ class MainWindow(Gtk.ApplicationWindow):
         footer.pack_start(self.index_label, True, True, 0)
         footer.add(self.icon_btn("view-refresh-symbolic", "Update the search index now", lambda *_: INDEX.rebuild()))
         side.add(footer)
-        main.pack1(side, False, False)
-        self.side_box = side
+        self.side_footer = footer
+        side_ev = Gtk.EventBox()                             # auto-hide: open when pointed at
+        side_ev.add(side)
+        side_ev.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        side_ev.connect("enter-notify-event", self._side_enter)
+        side_ev.connect("leave-notify-event", self._side_leave)
+        main.pack1(side_ev, False, False)
+        self.side_box = side_ev
+        GLib.idle_add(lambda: self.set_sidebar_mode(self.cfg.get("sidebar_mode", "expanded"), save=False) or False)
 
         content = Gtk.Box()
         self.dual_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, hexpand=True)
@@ -22555,6 +22589,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _side_header(self, text, dim=False):
         row = Gtk.ListBoxRow(selectable=False, activatable=False)
+        row.is_header = True
         label = Gtk.Label(xalign=0, margin_start=10, margin_top=4 if dim else 10, margin_bottom=2, wrap=True)
         label.set_markup(f"<small>{esc(text)}</small>" if dim else f"<b><small>{esc(text.upper())}</small></b>")
         label.get_style_context().add_class("dim-label")
@@ -22585,8 +22620,108 @@ class MainWindow(Gtk.ApplicationWindow):
         row.add(box)
         row.key, row.pinned = key, pinned
         row.set_tooltip_text(key if is_folder_loc(key) and not key.startswith("volume:") else None)
+        row.side_name, row.side_texts, row.side_box, row.side_extra = text, texts, box, extra
+        row.side_tip = row.get_tooltip_text()
         self.sidebar.add(row)
+        if getattr(self, "_side_rail", False):
+            GLib.idle_add(lambda: self._apply_rail(True) or False)
         return row
+
+    # ---------- sidebar: expanded · icons only · auto-hide (with lock)
+    def set_sidebar_mode(self, mode, save=True):
+        self.side_mode = mode
+        if save:
+            self.cfg["sidebar_mode"] = mode
+            write_json(CONFIG_FILE, self.cfg)
+        self._side_guard = True
+        self.side_auto.set_active(mode == "autohide")
+        self.side_lock.set_active(bool(self.cfg.get("sidebar_locked")) and mode == "autohide")
+        self._side_guard = False
+        self.side_lock.set_no_show_all(mode != "autohide")
+        self.side_lock.set_visible(mode == "autohide")
+        rail = mode == "icons" or (mode == "autohide" and not self.cfg.get("sidebar_locked"))
+        self._side_slide(rail)
+        self._queue_fit()
+
+    def _side_lock_toggled(self, on):
+        self.cfg["sidebar_locked"] = on
+        write_json(CONFIG_FILE, self.cfg)
+        if on:
+            self._side_slide(False)
+        self.flash_all("📌 Sidebar locked open" if on else "Sidebar hides itself again")
+
+    def _apply_rail(self, rail):
+        """Icons only: names, section titles, free-space lines and the footer hide; icons centre; names as tips."""
+        self._side_rail = rail
+        for row in self.sidebar.get_children():
+            if getattr(row, "is_header", False):
+                row.set_visible(not rail)
+            elif hasattr(row, "side_texts"):
+                row.side_texts.set_visible(not rail)
+                if row.side_extra is not None:
+                    row.side_extra.set_visible(not rail)
+                row.side_box.set_halign(Gtk.Align.CENTER if rail else Gtk.Align.FILL)
+                row.side_box.set_margin_start(0 if rail else 10)
+                row.set_tooltip_text(row.side_name if rail else row.side_tip)
+        self.side_footer.set_visible(not rail)
+        self.side_strip.set_orientation(Gtk.Orientation.VERTICAL if rail else Gtk.Orientation.HORIZONTAL)
+        self.side_strip.set_halign(Gtk.Align.CENTER if rail else Gtk.Align.END)
+        self.side_toggle.set_label("»" if rail else "«")
+        self.side_toggle.set_tooltip_text("Show names" if rail else "Shrink the sidebar to icons")
+
+    def _side_slide(self, rail):
+        """Smoothly to the slim rail (about 60 px) or back to the full sidebar."""
+        if self._side_anim:
+            GLib.source_remove(self._side_anim)
+            self._side_anim = None
+        full = max(180, int(self.cfg.get("sidebar_width", 220)))
+        start, end = self.main_paned.get_position(), (60 if rail else full)
+        if not rail:
+            self._apply_rail(False)
+        else:
+            self._side_full_width = start if start > 120 else full
+        steps = 8 if self.cfg.get("animations", True) else 1
+        n = [0]
+
+        def step():
+            n[0] += 1
+            k = n[0] / steps
+            k = k * k * (3 - 2 * k)
+            self.main_paned.set_position(int(start + (end - start) * k))
+            if n[0] >= steps:
+                self._side_anim = None
+                if rail:
+                    self._apply_rail(True)
+                self._queue_fit()
+                return False
+            return True
+        if rail:
+            self._apply_rail(True)
+        self._side_anim = GLib.timeout_add(18, step)
+
+    def _side_enter(self, _w, _ev):
+        if getattr(self, "side_mode", "") == "autohide" and self._side_rail and not self.cfg.get("sidebar_locked"):
+            if getattr(self, "_side_leave_t", None):
+                GLib.source_remove(self._side_leave_t)
+                self._side_leave_t = None
+            if not getattr(self, "_side_enter_t", None):     # a short pause: passing over doesn't open it
+                self._side_enter_t = GLib.timeout_add(180, lambda: (setattr(self, "_side_enter_t", None),
+                                                                    self._side_slide(False)) and False)
+        elif getattr(self, "_side_leave_t", None):
+            GLib.source_remove(self._side_leave_t)
+            self._side_leave_t = None
+        return False
+
+    def _side_leave(self, _w, ev):
+        if ev.detail == Gdk.NotifyType.INFERIOR:
+            return False
+        if getattr(self, "_side_enter_t", None):
+            GLib.source_remove(self._side_enter_t)
+            self._side_enter_t = None
+        if getattr(self, "side_mode", "") == "autohide" and not self._side_rail and not self.cfg.get("sidebar_locked"):
+            self._side_leave_t = GLib.timeout_add(700, lambda: (setattr(self, "_side_leave_t", None),
+                                                                self._side_slide(True)) and False)
+        return False
 
     def sync_sidebar(self):
         loc = self.active.location if self.active else None
