@@ -92,7 +92,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.39.1"
+APP_VERSION = "3.40.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -1456,6 +1456,10 @@ class TagStore:
 
     def moved(self, old, new):
         old, new = str(old), str(new)
+        try:
+            JOURNEY.moved(old, new)                      # the file's journey map
+        except NameError:
+            pass
         with self.lock:
             changed = False
             for key in list(self.data):
@@ -1531,22 +1535,27 @@ class FileIndex:
                 tmp.unlink()
             con = sqlite3.connect(str(tmp))
             con.execute("CREATE TABLE files (path TEXT PRIMARY KEY, lname TEXT, ext TEXT,"
-                        " is_dir INTEGER, size INTEGER, mtime REAL)")
+                        " is_dir INTEGER, size INTEGER, mtime REAL, dev INTEGER, ino INTEGER)")
             n, batch = 0, []
             for p, st, is_dir in walk_entries(HOME):
                 batch.append((str(p), p.name.lower(), "" if is_dir else ext_of(p.name),
-                              int(is_dir), 0 if is_dir else st.st_size, st.st_mtime))
+                              int(is_dir), 0 if is_dir else st.st_size, st.st_mtime, st.st_dev, st.st_ino))
                 n += 1
                 if n % 300 == 0:
                     time.sleep(0.01)              # give way: the window stays responsive and the disk breathes
                 if len(batch) >= 5000:
-                    con.executemany("INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?)", batch)
+                    con.executemany("INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?,?,?)", batch)
                     batch = []
             if batch:
-                con.executemany("INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?)", batch)
+                con.executemany("INSERT OR IGNORE INTO files VALUES (?,?,?,?,?,?,?,?)", batch)
             con.execute("CREATE INDEX idx_mtime ON files(mtime)")
+            con.execute("CREATE INDEX idx_ino ON files(dev, ino)")
             con.commit()
             con.close()
+            try:                                          # journeys: what other apps renamed, moved or changed
+                JOURNEY.compare(INDEX_DB, tmp, self.updated or time.time(), time.time())
+            except Exception as ex:
+                print(f"{APP_NAME}: journey check failed:", ex, file=sys.stderr)
             os.replace(tmp, INDEX_DB)
             self.count, self.updated = n, time.time()
             write_json(INDEX_META, {"count": n, "updated": self.updated})
@@ -1755,6 +1764,353 @@ def set_autostart(on):
             "X-GNOME-Autostart-enabled=true\n")
     elif AUTOSTART_FILE.exists():
         AUTOSTART_FILE.unlink()
+
+
+# ---------------------------------------------------------------- File journey (where a file or folder has been)
+# Every file and folder Arckad-D sees can have a journey: renamed, moved (also to another drive), copied, changed
+# size, trashed or deleted, each with date and time. A file keeps its identity through renames and moves on the
+# same drive by the drive's own file number (inode / NTFS file ID); moves to another drive are matched by name,
+# size and modification time. Sources: what you do in Arckad-D (exact), folders open in Arckad-D (exact, live),
+# and the background index (other apps; the time is a range: between two scans).
+JOURNEY_DB = CONFIG_DIR / "journey.db"
+
+
+class Journey:
+    KINDS = {"seen": "📍", "created": "✨", "renamed": "✏️", "moved": "🚚", "drive": "💽", "copied": "📄",
+             "copy_of": "🧬", "size": "📏", "trashed": "🗑", "deleted": "❌", "gone": "❔", "back": "↩"}
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.con = None
+        self.recent = {}                        # path -> time: Arckad-D just did this (live events skip it)
+
+    def _db(self):
+        if self.con is None:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            self.con = sqlite3.connect(str(JOURNEY_DB), check_same_thread=False, timeout=10)
+            self.con.executescript("""
+                CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, dev INTEGER, ino INTEGER, path TEXT,
+                    is_dir INTEGER, first_ts REAL, gone_ts REAL);
+                CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, item INTEGER, ts REAL, ts_from REAL,
+                    kind TEXT, a TEXT, b TEXT, size_a INTEGER, size_b INTEGER, how TEXT);
+                CREATE INDEX IF NOT EXISTS items_path ON items(path);
+                CREATE INDEX IF NOT EXISTS items_ino ON items(dev, ino);
+                CREATE INDEX IF NOT EXISTS events_item ON events(item);""")
+        return self.con
+
+    @staticmethod
+    def _stat(path):
+        try:
+            st = os.lstat(path)
+            return st.st_dev, st.st_ino, int(stat_isdir(st)), (0 if stat_isdir(st) else st.st_size)
+        except OSError:
+            return None, None, 0, 0
+
+    def _find(self, path=None, dev=None, ino=None):
+        c = self._db()
+        if path:
+            r = c.execute("SELECT id FROM items WHERE path=? AND gone_ts IS NULL ORDER BY id DESC LIMIT 1",
+                          (str(path),)).fetchone()
+            if r:
+                return r[0]
+        if dev is not None and ino:
+            r = c.execute("SELECT id FROM items WHERE dev=? AND ino=? AND gone_ts IS NULL ORDER BY id DESC LIMIT 1",
+                          (dev, ino)).fetchone()
+            if r:
+                return r[0]
+        return None
+
+    def _new(self, path, dev, ino, is_dir, ts=None, kind="seen", how="arckad"):
+        ts = ts or time.time()
+        c = self._db()
+        cur = c.execute("INSERT INTO items (dev, ino, path, is_dir, first_ts) VALUES (?,?,?,?,?)",
+                        (dev, ino, str(path), is_dir, ts))
+        iid = cur.lastrowid
+        size = self._stat(path)[3] if os.path.exists(path) else 0
+        c.execute("INSERT INTO events (item, ts, kind, a, size_b, how) VALUES (?,?,?,?,?,?)",
+                  (iid, ts, kind, str(path), size, how))
+        return iid
+
+    def _event(self, iid, kind, a=None, b=None, sa=None, sb=None, how="arckad", ts=None, ts_from=None):
+        self._db().execute("INSERT INTO events (item, ts, ts_from, kind, a, b, size_a, size_b, how) VALUES "
+                           "(?,?,?,?,?,?,?,?,?)", (iid, ts or time.time(), ts_from, kind, a, b, sa, sb, how))
+
+    def _commit(self):
+        try:
+            self._db().commit()
+        except sqlite3.Error:
+            pass
+
+    def _mark(self, *key):
+        """Remember exactly what Arckad-D just did (a move src→dst, a removal, a new item), so the live echo of that
+        same action isn't recorded twice. Other apps' changes to the same file still are."""
+        now = time.time()
+        self.recent[tuple(str(k) for k in key)] = now
+        if len(self.recent) > 500:
+            self.recent = {k: v for k, v in self.recent.items() if now - v < 30}
+
+    def _ours(self, *key):
+        return time.time() - self.recent.get(tuple(str(k) for k in key), 0) < 8
+
+    # ---------- what happened (Arckad-D's own actions: exact)
+    def moved(self, src, dst, how="arckad", ts=None, ts_from=None):
+        """A rename or a move (also to another drive). Folders take their contents' records along."""
+        src, dst = str(src), str(dst)
+        if how == "arckad":
+            self._mark("move", src, dst)
+        dev, ino, is_dir, size = self._stat(dst)
+        try:
+            with self.lock:
+                iid = self._find(src) or self._find(None, dev, ino)
+                if iid is None:                             # first time we hear of it: start its journey at src
+                    iid = self._new(src, dev, ino, is_dir, ts=(ts_from or ts or time.time()) - 0.001, how=how)
+                prev_dev = self._db().execute("SELECT dev FROM items WHERE id=?", (iid,)).fetchone()[0]
+                same_dir = os.path.dirname(src) == os.path.dirname(dst)
+                kind = "renamed" if same_dir else ("drive" if prev_dev not in (None, dev) else "moved")
+                self._event(iid, kind, src, dst, size, size, how, ts, ts_from)
+                self._db().execute("UPDATE items SET path=?, dev=?, ino=? WHERE id=?", (dst, dev, ino, iid))
+                if is_dir:                                  # the folder's contents moved with it
+                    self._db().execute("UPDATE items SET path = ? || substr(path, ?) WHERE path LIKE ? ESCAPE '\\' "
+                                       "AND gone_ts IS NULL", (dst, len(src) + 1, like_escape(src + os.sep) + "%"))
+                self._commit()
+        except sqlite3.Error:
+            pass
+
+    def copied(self, src, dst):
+        src, dst = str(src), str(dst)
+        self._mark("new", dst)
+        try:
+            with self.lock:
+                sdev, sino, sdir, _s = self._stat(src)
+                siid = self._find(src, sdev, sino) or self._new(src, sdev, sino, sdir)
+                self._event(siid, "copied", src, dst)
+                dev, ino, is_dir, size = self._stat(dst)
+                diid = self._new(dst, dev, ino, is_dir, kind="copy_of")
+                self._db().execute("UPDATE events SET a=?, b=? WHERE item=? AND kind='copy_of'", (src, dst, diid))
+                self._commit()
+        except sqlite3.Error:
+            pass
+
+    def created(self, path):
+        self._mark("new", path)
+        try:
+            with self.lock:
+                dev, ino, is_dir, _s = self._stat(path)
+                self._new(path, dev, ino, is_dir, kind="created")
+                self._commit()
+        except sqlite3.Error:
+            pass
+
+    def removed(self, path, trash=True, how="arckad", ts=None, ts_from=None):
+        path = str(path)
+        if how == "arckad":
+            self._mark("rm", path)
+        try:
+            with self.lock:
+                iid = self._find(path)
+                if iid is None and how != "arckad":
+                    return                                  # nobody asked about this one: no record needed
+                if iid is None:
+                    dev, ino, is_dir, _s = self._stat(path)
+                    iid = self._new(path, dev, ino, is_dir, ts=time.time() - 0.001)
+                kind = "trashed" if trash else ("deleted" if how == "arckad" else "gone")
+                self._event(iid, kind, path, None, how=how, ts=ts, ts_from=ts_from)
+                self._db().execute("UPDATE items SET gone_ts=? WHERE id=?", (ts or time.time(), iid))
+                self._commit()
+        except sqlite3.Error:
+            pass
+
+    def follow(self, path):
+        """Make sure a file or folder has a journey (opening its map starts one)."""
+        try:
+            with self.lock:
+                dev, ino, is_dir, _s = self._stat(path)
+                iid = self._find(path, dev, ino)
+                if iid is None and dev is not None:
+                    iid = self._new(path, dev, ino, is_dir)
+                    self._commit()
+                return iid
+        except sqlite3.Error:
+            return None
+
+    # ---------- live: folders open in Arckad-D (other apps' changes, exact time)
+    def live(self, ev, f, other):
+        p = f.get_path() if f else None
+        q = other.get_path() if other else None
+        if not p:
+            return
+        if ev == Gio.FileMonitorEvent.RENAMED and q:
+            if not self._ours("move", p, q):               # not the echo of Arckad-D's own rename
+                self.moved(p, q, how="live")
+        elif ev == Gio.FileMonitorEvent.CHANGES_DONE_HINT:
+            if not self._ours("new", p):
+                self.size_check(p, how="live")
+        elif ev in (Gio.FileMonitorEvent.DELETED, Gio.FileMonitorEvent.MOVED_OUT):
+            if not self._ours("rm", p) and not any(k[0] == "move" and k[1] == p and self._ours(*k) for k in list(self.recent)):
+                if self._find(p):
+                    self.removed(p, trash=False, how="live")
+
+    def size_check(self, path, how="live", ts=None, ts_from=None):
+        """A known file's size changed: note old → new."""
+        try:
+            with self.lock:
+                iid = self._find(str(path))
+                if iid is None:
+                    return
+                _d, _i, is_dir, size = self._stat(path)
+                last = self._db().execute("SELECT size_b FROM events WHERE item=? AND size_b IS NOT NULL "
+                                          "ORDER BY ts DESC, id DESC LIMIT 1", (iid,)).fetchone()
+                before = last[0] if last else None
+                if before is not None and before != size and not is_dir:
+                    self._event(iid, "size", str(path), None, before, size, how, ts, ts_from)
+                    self._commit()
+        except sqlite3.Error:
+            pass
+
+    # ---------- background: compare two index scans (other apps' changes; time = between the scans)
+    def compare(self, old_db, new_db, t_old, t_new):
+        if not Path(old_db).exists():
+            return
+        try:
+            con = sqlite3.connect(str(new_db), timeout=10)
+            con.execute("ATTACH DATABASE ? AS old", (str(old_db),))
+            cols = [r[1] for r in con.execute("PRAGMA old.table_info(files)")]
+            if "ino" not in cols:
+                con.close()
+                return                                      # the first scan with identities: nothing to compare yet
+            moves = con.execute("SELECT o.path, n.path FROM files n JOIN old.files o ON n.dev=o.dev AND n.ino=o.ino "
+                                "WHERE n.path != o.path AND n.ino != 0 ORDER BY length(o.path) LIMIT 20000").fetchall()
+            con.close()
+        except sqlite3.Error:
+            return
+        moved_dirs = []
+        for a, b in moves:                                  # record a folder's move once, not each file inside
+            if any(a.startswith(oa + os.sep) and b == nb + a[len(oa):] for oa, nb in moved_dirs):
+                continue
+            if os.path.isdir(b):
+                moved_dirs.append((a, b))
+            if self._find(a) or self._find(b):              # only for files and folders that have a journey
+                self.moved(a, b, how="scan", ts=t_new, ts_from=t_old)
+        self.check_known(new_db, t_old, t_new)
+
+    def check_known(self, new_db, t_old, t_new):
+        """Every followed file: still there? moved (by its file number, or name and size)? size changed? gone?"""
+        try:
+            with self.lock:
+                items = self._db().execute("SELECT id, path, dev, ino, is_dir FROM items WHERE gone_ts IS NULL").fetchall()
+            con = sqlite3.connect(str(new_db), timeout=10)
+        except sqlite3.Error:
+            return
+        home = str(HOME) + os.sep
+        for iid, path, dev, ino, is_dir in items:
+            try:
+                last = self._db().execute("SELECT size_b FROM events WHERE item=? AND size_b IS NOT NULL ORDER BY "
+                                          "ts DESC, id DESC LIMIT 1", (iid,)).fetchone()
+                size_before = last[0] if last else None
+                if os.path.lexists(path):
+                    if not is_dir:
+                        r = con.execute("SELECT size FROM files WHERE path=?", (path,)).fetchone()
+                        if r and size_before is not None and r[0] != size_before:
+                            with self.lock:
+                                self._event(iid, "size", path, None, size_before, r[0], "scan", t_new, t_old)
+                                self._commit()
+                    continue
+                if not path.startswith(home):
+                    continue                                # outside the scanned area: can't tell yet
+                hit = con.execute("SELECT path FROM files WHERE dev=? AND ino=? AND ino != 0", (dev, ino)).fetchone()
+                if not hit and size_before is not None and not is_dir:
+                    hit = con.execute("SELECT path FROM files WHERE lname=? AND size=? AND is_dir=0",
+                                      (os.path.basename(path).lower(), size_before)).fetchone()
+                if hit:
+                    new_size = con.execute("SELECT size FROM files WHERE path=?", (hit[0],)).fetchone()
+                    self.moved(path, hit[0], how="scan", ts=t_new, ts_from=t_old)
+                    if new_size and size_before is not None and not is_dir and new_size[0] != size_before:
+                        with self.lock:
+                            self._event(iid, "size", hit[0], None, size_before, new_size[0], "scan", t_new, t_old)
+                            self._commit()
+                    continue
+                self.find_elsewhere(iid, path, t_old, t_new)
+            except sqlite3.Error:
+                continue
+        con.close()
+
+    def find_elsewhere(self, iid, path, t_old=None, t_new=None):
+        """A file left its place: look for it on other drives (same name, size and modification time)."""
+        try:
+            with self.lock:
+                last = self._db().execute("SELECT size_b FROM events WHERE item=? AND size_b IS NOT NULL ORDER BY "
+                                          "ts DESC, id DESC LIMIT 1", (iid,)).fetchone()
+        except sqlite3.Error:
+            return
+        name, size = os.path.basename(path), (last[0] if last else None)
+        for root in [r for r in drive_roots() if not path.startswith(r)][:12]:
+            hit = _find_by_name(root, name, size, depth=4)
+            if hit:
+                self.moved(path, hit, how="scan", ts=t_new, ts_from=t_old)
+                return
+        self.removed(path, trash=False, how="scan", ts=t_new, ts_from=t_old)
+
+    # ---------- reading a journey
+    def journey(self, path):
+        """(item row, events) for a path: the newest record for it, by path or by the drive's file number."""
+        try:
+            with self.lock:
+                dev, ino, _d, _s = self._stat(path)
+                iid = self._find(str(path), dev, ino)
+                if iid is None:
+                    r = self._db().execute("SELECT id FROM items WHERE path=? ORDER BY id DESC LIMIT 1",
+                                           (str(path),)).fetchone()
+                    iid = r[0] if r else None
+                if iid is None:
+                    return None, []
+                item = self._db().execute("SELECT id, dev, ino, path, is_dir, first_ts, gone_ts FROM items WHERE id=?",
+                                          (iid,)).fetchone()
+                evs = self._db().execute("SELECT ts, ts_from, kind, a, b, size_a, size_b, how FROM events WHERE "
+                                         "item=? ORDER BY ts, id", (iid,)).fetchall()
+                return item, evs
+        except sqlite3.Error:
+            return None, []
+
+
+def drive_roots():
+    if IS_WIN:
+        return [f"{d}:\\" for d in "CDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{d}:\\")]
+    roots = [str(HOME)]
+    for base in ("/media", "/mnt", "/run/media"):
+        try:
+            for user in os.scandir(base):
+                if user.is_dir():
+                    roots += [e.path for e in os.scandir(user.path) if e.is_dir()] if base != "/mnt" else [user.path]
+        except OSError:
+            pass
+    return roots
+
+
+def _find_by_name(root, name, size, depth=4):
+    """A quick, shallow search (a few levels) for a file with this name (and size)."""
+    try:
+        stack = [(root, 0)]
+        seen = 0
+        while stack and seen < 20000:
+            folder, d = stack.pop()
+            with os.scandir(folder) as it:
+                for e in it:
+                    seen += 1
+                    if e.name == name and (size is None or (e.is_file() and e.stat().st_size == size)):
+                        return e.path
+                    if d < depth and e.is_dir(follow_symlinks=False) and not e.name.startswith(".") \
+                            and e.name not in SKIP_DIRS:
+                        stack.append((e.path, d + 1))
+    except OSError:
+        pass
+    return None
+
+
+def stat_isdir(st):
+    return statmod.S_ISDIR(st.st_mode)
+
+
+JOURNEY = Journey()
 
 
 # ---------------------------------------------------------------- one browsing pane (= one tab)
@@ -2588,12 +2944,14 @@ class FilePane(Gtk.Box):
             self.monitor = None
         if folder:
             try:
-                self.monitor = Gio.File.new_for_path(folder).monitor_directory(Gio.FileMonitorFlags.NONE, None)
+                self.monitor = Gio.File.new_for_path(folder).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
                 self.monitor.connect("changed", self.on_folder_changed)
             except GLib.Error:
                 self.monitor = None
 
-    def on_folder_changed(self, *_):
+    def on_folder_changed(self, _mon=None, f=None, other=None, ev=None):
+        if ev is not None:                                   # other apps' changes go into the journeys (exact time)
+            threading.Thread(target=JOURNEY.live, args=(ev, f, other), daemon=True).start()
         if self.refresh_id is None:
             self.refresh_id = GLib.timeout_add(600, self.auto_refresh)
 
@@ -2806,6 +3164,8 @@ class FilePane(Gtk.Box):
             add("Duplicate", lambda: win.duplicate(self, paths))
             add("Send to chat 💬", lambda: win.send_to_chat(paths))
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
+            if len(paths) == 1:
+                add("🗺 Journey map (where it has been)", lambda: JourneyWindow(win, paths[0]))
             add("Properties (Alt+Enter)", lambda: win.properties(paths))
             menu.append(Gtk.SeparatorMenuItem())
             add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
@@ -2820,6 +3180,7 @@ class FilePane(Gtk.Box):
             for item in win.terminal_menu_items(self.location):
                 item.set_sensitive(in_folder)
                 menu.append(item)
+            add("🗺 Journey map of this folder", lambda: JourneyWindow(win, self.location), in_folder)
             add("Properties of this folder", lambda: win.properties([self.location]), in_folder)
             menu.append(Gtk.SeparatorMenuItem())
             add("Organize this folder…", lambda: win.organize(self), in_folder)
@@ -2989,6 +3350,10 @@ class PreviewPanel(Gtk.ScrolledWindow):
         self.reveal_btn.connect("clicked", lambda *_: self.path and self.win.active.show_in_folder(self.path))
         btns.add(self.open_btn)
         btns.add(self.reveal_btn)
+        jb = Gtk.Button(label="🗺 Journey")
+        jb.set_tooltip_text("Where this has been: renames, moves, copies, size changes, with dates")
+        jb.connect("clicked", lambda *_: self.path and JourneyWindow(self.win, self.path))
+        btns.add(jb)
         box.add(btns)
 
         box.add(self._heading("Tags"))
@@ -16488,6 +16853,174 @@ class DownloadWatcher:
         return False
 
 
+# ---------------------------------------------------------------- 🗺 Journey map (window)
+_J_COLOURS = {"seen": "#3b82f6", "created": "#22c55e", "renamed": "#f59e0b", "moved": "#8b5cf6", "drive": "#ec4899",
+              "copied": "#06b6d4", "copy_of": "#14b8a6", "size": "#64748b", "trashed": "#ef4444", "deleted": "#b91c1c",
+              "gone": "#9ca3af", "now": "#16a34a"}
+_J_TITLES = {"seen": "First seen", "created": "Created", "renamed": "Renamed", "moved": "Moved",
+             "drive": "Moved to another drive", "copied": "Copied", "copy_of": "Created as a copy",
+             "size": "Size changed", "trashed": "Moved to the Trash", "deleted": "Deleted permanently",
+             "gone": "No longer found", "now": "Now"}
+_J_HOW = {"arckad": "in Arckad-D", "live": "seen live", "scan": "found by the background check"}
+
+
+def _j_short(path, n=58):
+    s = short(path) if path else ""
+    return s if len(s) <= n else s[: n // 2 - 1] + "…" + s[-(n // 2 - 1):]
+
+
+def _j_when(ts, ts_from=None):
+    t = time.localtime(ts)
+    if ts_from and ts - ts_from > 90:
+        a = time.localtime(ts_from)
+        same = a.tm_yday == t.tm_yday and a.tm_year == t.tm_year
+        return (f"between {time.strftime('%d %b %H:%M', a)} and "
+                f"{time.strftime('%H:%M' if same else '%d %b %H:%M', t)}")
+    return time.strftime("%a %d %b %Y, %H:%M", t)
+
+
+def journey_lines(ev):
+    """(title, detail lines, folder to open) for one event."""
+    ts, ts_from, kind, a, b, sa, sb, how = ev
+    lines, place = [], None
+    if kind in ("seen", "created"):
+        lines = [os.path.basename(a or ""), "in " + _j_short(os.path.dirname(a or ""))]
+        place = os.path.dirname(a or "")
+    elif kind == "renamed":
+        lines = [f"{os.path.basename(a)}  →  {os.path.basename(b)}", "in " + _j_short(os.path.dirname(b))]
+        place = os.path.dirname(b)
+    elif kind in ("moved", "drive"):
+        lines = ["from " + _j_short(os.path.dirname(a)), "to     " + _j_short(os.path.dirname(b))]
+        if os.path.basename(a) != os.path.basename(b):
+            lines.append(f"(renamed {os.path.basename(a)} → {os.path.basename(b)})")
+        place = os.path.dirname(b)
+    elif kind == "copied":
+        lines = ["copy placed in " + _j_short(os.path.dirname(b or "")), os.path.basename(b or "")]
+        place = os.path.dirname(b or "")
+    elif kind == "copy_of":
+        lines = ["copied from " + _j_short(a or ""), "into " + _j_short(os.path.dirname(b or ""))]
+        place = os.path.dirname(a or "")
+    elif kind == "size":
+        lines = [f"{human_size(sa or 0)}  →  {human_size(sb or 0)}"]
+        place = os.path.dirname(a or "")
+    elif kind in ("trashed", "deleted", "gone"):
+        lines = ["from " + _j_short(os.path.dirname(a or ""))]
+        place = os.path.dirname(a or "")
+    lines.append(f"{_j_when(ts, ts_from)} · {_J_HOW.get(how, how or '')}")
+    return _J_TITLES.get(kind, kind), lines, place
+
+
+def journey_svg(events, text_rgb, now_path=None, width=720):
+    """A winding road with a pin for each change (start at the top, now at the bottom)."""
+    stops = [(_J_TITLES.get(e[2], e[2]), journey_lines(e)[1], e[2]) for e in events]
+    if now_path:
+        stops.append(("Now", [os.path.basename(now_path), "in " + _j_short(os.path.dirname(now_path))], "now"))
+    gap, top = 118, 70
+    h = top + gap * max(1, len(stops)) + 20
+    xs = [70 if i % 2 == 0 else 120 for i in range(len(stops))]
+    ys = [top + i * gap for i in range(len(stops))]
+    road = ""
+    for i in range(1, len(stops)):                       # an S-curve between stops, like a mountain road
+        x0, y0, x1, y1 = xs[i - 1], ys[i - 1], xs[i], ys[i]
+        road += f"M{x0},{y0} C{x0},{y0 + gap * 0.55} {x1},{y1 - gap * 0.55} {x1},{y1} "
+    fg = "#%02x%02x%02x" % tuple(int(c * 255) for c in text_rgb)
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{h}" viewBox="0 0 {width} {h}">',
+           f'<path d="{road}" fill="none" stroke="#9aa3ad" stroke-width="16" stroke-linecap="round" opacity="0.55"/>',
+           f'<path d="{road}" fill="none" stroke="#ffffff" stroke-width="2.4" stroke-dasharray="9 9" opacity="0.9"/>']
+    font = 'font-family="Segoe UI, Ubuntu, Cantarell, Arial, sans-serif"'
+    for i, (title, lines, kind) in enumerate(stops):
+        x, y, col = xs[i], ys[i], _J_COLOURS.get(kind, "#64748b")
+        if i == 0 or kind == "now" or kind in ("trashed", "deleted", "gone"):
+            out.append(f'<path d="M{x},{y + 4} C{x - 20},{y - 18} {x - 18},{y - 44} {x},{y - 44} C{x + 18},{y - 44} '
+                       f'{x + 20},{y - 18} {x},{y + 4} Z" fill="{col}" stroke="#ffffff" stroke-width="2.5"/>'
+                       f'<circle cx="{x}" cy="{y - 26}" r="7" fill="#ffffff"/>')
+        else:
+            out.append(f'<circle cx="{x}" cy="{y}" r="14" fill="{col}" stroke="#ffffff" stroke-width="3"/>'
+                       f'<text x="{x}" y="{y + 5}" text-anchor="middle" fill="#ffffff" font-size="13" font-weight="800" '
+                       f'{font}>{i}</text>')
+        tx = 175
+        out.append(f'<text x="{tx}" y="{y - 26}" fill="{col}" font-size="15" font-weight="800" {font}>'
+                   f'{esc(title)}</text>')
+        for k, line in enumerate(lines[:4]):
+            last = k == len(lines[:4]) - 1
+            out.append(f'<text x="{tx}" y="{y - 6 + k * 18}" fill="{fg}" font-size="{12 if last else 13}" '
+                       f'opacity="{0.65 if last else 0.95}" {font}>{esc(line)}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+class JourneyWindow(Gtk.Window):
+    """🗺 Where a file or folder has been: a route map of renames, moves (also to other drives), copies, size
+    changes and deletion, with date and time, and “Open this place” for each stop."""
+
+    def __init__(self, win, path):
+        super().__init__(title=f"Journey · {os.path.basename(path)}")
+        self.win, self.path = win, path
+        self.set_transient_for(win)
+        self.set_default_size(820, 780)
+        JOURNEY.follow(path)                              # from now on, this one is followed closely
+        item, events = JOURNEY.journey(path)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=14)
+        self.add(box)
+        head = Gtk.Label(xalign=0, wrap=True)
+        exists = os.path.lexists(path)
+        kind = "Folder" if item and item[4] else "File"
+        since = time.strftime("%d %b %Y, %H:%M", time.localtime(item[5])) if item else "now"
+        head.set_markup(f"<span size='x-large'><b>🗺 {esc(os.path.basename(path))}</b></span>\n"
+                        f"<small>{kind} · {len(events)} record{'s' if len(events) != 1 else ''} · followed since "
+                        f"{since}{'' if exists else ' · no longer here'}</small>")
+        box.add(head)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>Changes made in Arckad-D and in folders open in Arckad-D have the exact time; changes "
+                        "by other apps are found by the background check (every 2 hours, in your home folder), so "
+                        "their time is shown as a range.</small>")
+        note.get_style_context().add_class("dim-label")
+        box.add(note)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sw.add(inner)
+        box.pack_start(sw, True, True, 0)
+        ctx = self.get_style_context()
+        fg = ctx.get_color(Gtk.StateFlags.NORMAL)
+        shown = events[-60:]
+        if len(events) > 60:
+            more = Gtk.Label(label=f"… {len(events) - 60} earlier records not shown on the map", xalign=0)
+            more.get_style_context().add_class("dim-label")
+            inner.add(more)
+        live_now = path if exists and not (item and item[6]) else None
+        svg = journey_svg(shown, (fg.red, fg.green, fg.blue), live_now)
+        try:
+            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+            loader.write(svg.encode())
+            loader.close()
+            inner.add(Gtk.Image.new_from_pixbuf(loader.get_pixbuf()))
+        except Exception as ex:
+            inner.add(Gtk.Label(label=f"(The map picture couldn't be drawn: {ex})"))
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        for ev in reversed(shown):                         # newest first in the list
+            title, lines, place = journey_lines(ev)
+            row = Gtk.Box(spacing=10, margin=6)
+            dot = Gtk.Label()
+            dot.set_markup(f"<span foreground='{_J_COLOURS.get(ev[2], '#64748b')}' size='x-large'>●</span>")
+            row.add(dot)
+            t = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+            t.set_markup(f"<b>{esc(title)}</b>\n<small>" + "\n".join(esc(x) for x in lines) + "</small>")
+            row.pack_start(t, True, True, 0)
+            if place and os.path.isdir(place):
+                b = Gtk.Button(label="Open this place")
+                b.connect("clicked", lambda _b, pl=place, ev=ev: self._open(pl, ev))
+                row.add(b)
+            r = Gtk.ListBoxRow()
+            r.add(row)
+            lst.add(r)
+        inner.add(lst)
+        self.show_all()
+
+    def _open(self, place, ev):
+        target = ev[4] if ev[2] in ("renamed", "moved", "drive", "copied") else ev[3]
+        self.win.show_from_tray(folder=place, select=target if target and os.path.exists(target) else None)
+
+
 # ---------------------------------------------------------------- main window
 CSS = b"""
 .fm-active-bar { background-color: alpha(@theme_selected_bg_color, 0.14); }
@@ -18490,8 +19023,10 @@ class MainWindow(Gtk.ApplicationWindow):
                 TAG_STORE.moved(src, dst)
             elif os.path.isdir(src) and not os.path.islink(src):
                 shutil.copytree(src, dst, symlinks=True)
+                JOURNEY.copied(src, dst)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
+                JOURNEY.copied(src, dst)
             state["done"] += 1
 
         def place(src, dest_dir):
@@ -18551,6 +19086,7 @@ class MainWindow(Gtk.ApplicationWindow):
     @staticmethod
     def _remove_for_replace(path):
         """The item being replaced goes to the Trash, so a wrong click can be undone."""
+        JOURNEY.removed(path, trash=True)
         try:
             Gio.File.new_for_path(path).trash(None)
         except GLib.Error:
@@ -18720,6 +19256,7 @@ class MainWindow(Gtk.ApplicationWindow):
         done = 0
         for p in paths:
             try:
+                JOURNEY.removed(p, trash=True)
                 Gio.File.new_for_path(p).trash(None)
                 done += 1
             except GLib.Error as ex:
@@ -18787,6 +19324,7 @@ class MainWindow(Gtk.ApplicationWindow):
         errors = []
         for p in paths:
             try:
+                JOURNEY.removed(p, trash=False)
                 if os.path.isdir(p) and not os.path.islink(p):
                     shutil.rmtree(p)
                 else:
@@ -18936,6 +19474,7 @@ class MainWindow(Gtk.ApplicationWindow):
         target = unique_target(Path(pane.location) / name)
         try:
             target.mkdir()
+            JOURNEY.created(target)
         except OSError as ex:
             self.error(f"Couldn't create folder: {ex.strerror}")
             return
