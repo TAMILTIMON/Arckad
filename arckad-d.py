@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.55.0"
+APP_VERSION = "3.55.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20974,6 +20974,15 @@ def _paper_svg(t, angle, count, size, seed=7):
 TRASH_ANIM_SPEEDS = [("slow", "🐢 Slow", 1.7), ("normal", "Normal", 1.0), ("fast", "⚡ Fast", 0.5)]
 
 
+# How big the paper is (Settings → Appearance → Trash animation size), in pixels
+TRASH_ANIM_SIZES = [("small", "Small", 48), ("medium", "Medium", 72), ("large", "Large", 104), ("huge", "Extra large", 144)]
+
+
+def _trash_anim_size(win):
+    want = win.cfg.get("trash_anim_size", "medium")
+    return next((px for k, _l, px in TRASH_ANIM_SIZES if k == want), 72)
+
+
 def _trash_anim_scale(win):
     want = win.cfg.get("trash_anim_speed", "normal")
     return next((f for k, _l, f in TRASH_ANIM_SPEEDS if k == want), 1.0)
@@ -20999,7 +21008,7 @@ def fly_to_trash(win, start, count):
         return
     tx, ty = target_row.translate_coordinates(win.overlay, 18, target_row.get_allocated_height() // 2) or (0, 0)
     sx, sy = start
-    size = 72
+    size = _trash_anim_size(win)
     f = _trash_anim_scale(win)
     crumple, hold, fly = 1.0 * f, 0.15 * f, 0.75 * f
     img = Gtk.Image(halign=Gtk.Align.START, valign=Gtk.Align.START)
@@ -21047,7 +21056,7 @@ def fly_from_trash(win, count, landed=None):
     sx, sy = row.translate_coordinates(win.overlay, 18, row.get_allocated_height() // 2) or (0, 0)
     a = win.lib_stack.get_allocation()
     tx, ty = win.lib_stack.translate_coordinates(win.overlay, a.width // 2, a.height // 3) or (sx + 300, sy)
-    size = 72
+    size = _trash_anim_size(win)
     f = _trash_anim_scale(win)
     fly, unfold, fade = 0.75 * f, 1.0 * f, 0.35 * f
     _bounce(row)
@@ -21154,6 +21163,10 @@ def settings_entries(win):
            "(and back out when you restore).", "choice", [(k, label) for k, label, _f in TRASH_ANIM_SPEEDS],
            lambda: win.cfg.get("trash_anim_speed", "normal"),
            lambda k: (win.cfg.__setitem__("trash_anim_speed", k), write_json(CONFIG_FILE, win.cfg))),
+          ("appearance", "Trash animation size", "How big the crumpling paper is.", "choice",
+           [(k, label) for k, label, _px in TRASH_ANIM_SIZES],
+           lambda: win.cfg.get("trash_anim_size", "medium"),
+           lambda k: (win.cfg.__setitem__("trash_anim_size", k), write_json(CONFIG_FILE, win.cfg))),
           ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
            "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
           ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
