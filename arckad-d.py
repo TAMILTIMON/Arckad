@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.54.2"
+APP_VERSION = "3.54.3"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20417,15 +20417,51 @@ class VaultUI:
 # ---------------------------------------------------------------- 🗑 Trash: see, restore, delete permanently
 # Ubuntu: the freedesktop Trash (your home Trash, plus the Trash folder on other drives, e.g. a big data volume).
 # Windows: the Recycle Bin (through PowerShell).
+def _mount_points():
+    """Every mounted drive on this PC (like Ubuntu's Files app sees them), from the kernel's mount list."""
+    out = []
+    skip = ("/proc", "/sys", "/dev", "/snap", "/boot", "/var/snap", "/run/user", "/run/snapd", "/tmp")
+    try:
+        with open("/proc/self/mounts", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mp = parts[1].replace("\\040", " ").replace("\\011", "\t").replace("\\134", "\\")
+                fs = parts[2]
+                if fs in ("proc", "sysfs", "tmpfs", "devtmpfs", "cgroup", "cgroup2", "squashfs", "overlay", "devpts",
+                          "securityfs", "debugfs", "tracefs", "fusectl", "configfs", "pstore", "bpf", "mqueue",
+                          "hugetlbfs", "autofs", "efivarfs", "binfmt_misc", "nsfs", "ramfs", "fuse.portal",
+                          "fuse.gvfsd-fuse", "rpc_pipefs"):
+                    continue
+                if mp == "/" or any(mp == s or mp.startswith(s + "/") for s in skip):
+                    continue
+                out.append(mp)
+    except OSError:
+        pass
+    return out
+
+
 def _trash_dirs_all():
+    """Your home Trash, plus the Trash folder of every drive (each drive keeps its own, like Ubuntu's Files shows).
+    A drive that can't be read (not opened yet, no permission) is skipped, never the whole Trash."""
     out = [Path(GLib.get_user_data_dir()) / "Trash"]
     if IS_WIN:
         return out
     uid = os.getuid()
-    for root in drive_roots():
+    roots, seen = [], set()
+    for r in ["/"] + drive_roots() + _mount_points():
+        if r not in seen:
+            seen.add(r)
+            roots.append(r)
+    for root in roots:
         for cand in (Path(root) / f".Trash-{uid}", Path(root) / ".Trash" / str(uid)):
-            if (cand / "files").is_dir():
-                out.append(cand)
+            try:
+                if (cand / "files").is_dir() and os.access(cand / "files", os.R_OK | os.X_OK):
+                    if cand not in out:
+                        out.append(cand)
+            except OSError:
+                continue
     return out
 
 
