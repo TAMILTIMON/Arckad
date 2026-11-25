@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.61.0"
+APP_VERSION = "3.61.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20425,7 +20425,7 @@ class RulesDialog(Gtk.Dialog):
             lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
             lbl.set_markup(f"<b>{esc(r.get('name') or 'Rule')}</b>\n<small>{esc(rule_describe(r))}</small>")
             row.pack_start(lbl, True, True, 0)
-            for label, cb in (("Run now", lambda r=r: self.run(r)), ("Edit", lambda r=r: self.edit(r)),
+            for label, cb in (("Run now", lambda r=r: self.run_rule(r)), ("Edit", lambda r=r: self.edit(r)),
                               ("Delete", lambda r=r: (rules.remove(r), RULES.save(), self.fill()))):
                 b = Gtk.Button(label=label)
                 b.connect("clicked", lambda _b, cb=cb: cb())
@@ -20442,7 +20442,7 @@ class RulesDialog(Gtk.Dialog):
             f"{time.strftime('%d %b %H:%M', time.localtime(t))} · {esc(n)} · {esc(res)}" for t, _r, n, res in reversed(recent))
             or "nothing yet") + "</small>")
 
-    def run(self, r):
+    def run_rule(self, r):
         n = len(RULES.matching(r))
         if not n:
             self.win.flash_all("Nothing in that folder matches this rule right now")
@@ -23345,7 +23345,8 @@ def settings_entries(win):
                "Install…", win.features_dialog)]
     E += [("system", "Keyboard shortcuts", "Every shortcut on one page.", "button", "Show",
            lambda: show_shortcuts(win)),
-          ("system", "About Arckad-D", "Version, credits and licence.", "button", "About", win.show_about)]
+          ("system", "About Arckad-D", "Every feature explained, page by page, with “Try it” buttons; version and "
+           "credits.", "button", "Open the guide", win.show_about)]
     return E
 
 
@@ -23930,7 +23931,7 @@ class CommandPalette(Gtk.Window):
              ("⚙", "Settings", "Ctrl+,", lambda: w.open_settings()),
              ("⌨", "Keyboard shortcuts", "", lambda: show_shortcuts(w)),
              ("🔄", "Check for updates", "", lambda: w.check_updates(manual=True)),
-             ("ℹ", f"About {APP_NAME}", "", lambda: w.show_about())]
+             ("📘", f"About {APP_NAME}: every feature explained", "", lambda: w.show_about())]
         A += [("🛠", label.rstrip("…"), "", cb) for label, cb in getattr(w, "_tools_list", [])]
         for e in settings_entries(w):                      # every setting: switches flip, buttons run, the rest opens
             cat, title, kind = e[0], e[1], e[3]
@@ -25245,6 +25246,421 @@ class PhoneInbox:
 PHONE_INBOX = PhoneInbox()
 
 
+
+# ---------------------------------------------------------------- 📘 The guide: every feature, explained (About)
+def _side(win, key):
+    row = next((r for r in win.sidebar.get_children() if getattr(r, "key", None) == key), None)
+    if row is not None:
+        win.sidebar_activate(row)
+
+
+def _here(win):
+    return win.active.location if is_folder_loc(win.active.location) else str(HOME)
+
+
+# (icon, title, what it does, where to find it, shortcut, try-it action or None)
+GUIDE = [
+    ("files", "📁", "Files & folders", "Everyday work with files: tabs, views, previews, copying and tidying.", [
+        ("🗂", "Tabs and two panes", "Open as many folders as you like in tabs, or two folders side by side to move "
+         "files between them. Drag a tab out of the window to give it a window of its own.", "Tab bar · ◫ button",
+         "Ctrl+T · Ctrl+W · F3 · F6", lambda w: w.new_tab()),
+        ("▦", "List and thumbnail views", "Details in columns, or big thumbnails of photos, videos and documents.",
+         "The two buttons at the right of the folder bar", "Ctrl+1 · Ctrl+2", lambda w: w.active.set_view("grid")),
+        ("👁", "Preview panel", "See pictures, PDFs, videos and text without opening them, with size, dates, tags "
+         "and a note for the file.", "👁 button in the title bar", "Space",
+         lambda w: w.preview_btn.set_active(True)),
+        ("📝", "Quick edit", "Edit text and code files right in the preview panel. The old text is kept in version "
+         "history; Windows line endings are kept.", "Preview panel → ✏ Edit", "Ctrl+S saves", None),
+        ("✏", "Rename and batch rename", "Rename one file, or many at once with numbers, dates (even the photo's "
+         "camera date) and find & replace, with a preview first and Undo afterwards.",
+         "Right-click → Rename", "F2", None),
+        ("📋", "Copy, cut, paste, drag", "Works with other apps too: copy here and paste in another file manager, or "
+         "drag files in from anywhere. Ctrl+drag copies instead of moving.", "Right-click menu", "Ctrl+C · Ctrl+X · Ctrl+V",
+         None),
+        ("🗜", "Compress and extract", "ZIP, 7z, tar and more, with a password if you like. Extract opens archives "
+         "of every common kind.", "Right-click → Compress… / Extract", "", None),
+        ("🧹", "Organize and auto-sort", "Sort a messy folder into Pictures, Documents, Videos… in one click, and keep "
+         "Downloads tidy automatically. Undo puts everything back.", "Tools → Organize · Auto-sort Downloads", "",
+         lambda w: w.autosort_dialog()),
+        ("⚙", "Folder rules", "“When a PDF arrives in Downloads, move it to Invoices and tag it”, or “files in Scans "
+         "older than 90 days → Archive”. Any folder, any rule.", "Tools → Folder rules", "",
+         lambda w: (lambda d: (d.run(), d.destroy()))(RulesDialog(w))),
+        ("🕑", "Recent files and the timeline", "What you worked on, newest first, and a timeline of every file "
+         "by day, week or month.", "Sidebar → Recent files · Timeline", "", lambda w: _side(w, "timeline:")),
+        ("📚", "Library", "All your pictures, movies, music, documents and apps in one place, wherever they are "
+         "stored.", "Sidebar → Library", "", lambda w: _side(w, "library:pictures")),
+        ("📌", "Pinned folders", "Keep the folders you use most in the sidebar.", "Right-click a folder → Pin to sidebar",
+         "", None),
+        ("🗑", "The Trash", "Everything deleted from every drive, as a list or thumbnails, with a shortcut per drive. "
+         "Restore puts files back (and takes you there), or Restore to… another folder.", "Sidebar → Trash",
+         "Delete · Enter restores", lambda w: _side(w, "trash:")),
+    ]),
+    ("search", "🔎", "Search & find", "Find anything in a second, by name, kind, date or the words inside.", [
+        ("🔎", "The filter bar", "Filter by name or note, kind, extension and date, in this folder, every folder "
+         "inside it, or your whole home folder.", "Top of every folder", "Ctrl+F", lambda w: w.active.search.grab_focus()),
+        ("⚡", "Instant search", "A search index of your files makes whole-home searches instant.",
+         "Filter bar → “Everywhere” · Tools → Search index settings", "", lambda w: w.index_settings()),
+        ("📄", "Search inside files", "Finds the words inside PDFs, Word, Excel, PowerPoint, LibreOffice, EPUB and "
+         "text files, showing the matching line.", "Filter bar → scope “🔎 Inside files”", "", None),
+        ("🔖", "Saved searches", "Keep a search in the sidebar; it always shows what matches right now.",
+         "🔖 button in the filter bar", "", lambda w: w.save_search()),
+        ("🧭", "Command palette", "Type what you want to do and press Enter: every action, setting, tool and place.",
+         "☰ → Command palette", "Ctrl+K", lambda w: CommandPalette(w)),
+        ("👯", "Duplicate files", "Finds identical files so you can free space safely.", "Tools → Find duplicate files",
+         "", lambda w: w.duplicates(_here(w))),
+        ("🖼", "Similar photos", "Groups photos that look alike (bursts, resized or edited copies) and keeps the best.",
+         "Tools → Find similar photos", "", lambda w: w.similar_photos()),
+        ("📊", "Disk usage map", "What's filling a drive, as coloured blocks, with the largest and oldest files to "
+         "clean up.", "Tools → Disk usage map", "", lambda w: DiskUsageWindow(w, _here(w))),
+        ("🔀", "Compare", "Compare two files, or two folders side by side (missing, newer, different), then copy or "
+         "sync.", "Tools → Compare two folders", "", lambda w: w.compare_folders_dialog()),
+    ]),
+    ("tags", "🏷", "Tags & notes", "Label files so you can find them again, whatever folder they're in.", [
+        ("🏷", "Colour tags", "Important, To do, Work, Personal, Later, Done: every tagged file in one click from the "
+         "sidebar.", "Right-click → Tags · Preview panel", "", None),
+        ("＋", "Your own tags", "Make tags like “Client Acme” or “Tax 2026” with your own colour; rename or remove them "
+         "any time.", "Right-click → Tags → New tag · Manage tags", "", lambda w: w.manage_tags()),
+        ("✨", "Smart tags", "Suggests Screenshot, Invoice, Camera photo, Scanned document, Code… from names, types, "
+         "folders and sizes. You choose what to apply.", "Preview panel → Suggested · Right-click → Tags → Smart tags",
+         "", lambda w: w.smart_tag_dialog()),
+        ("🗒", "Notes on files", "Write a note on any file (“sent to the bank 12 March”); search finds notes too.",
+         "Preview panel → Note · Sidebar → Files with notes", "", lambda w: _side(w, "notes")),
+    ]),
+    ("tools", "🛠", "Tools", "Change pictures, PDFs, videos and music without another app.", [
+        ("🖼", "Image tools", "Resize, rotate, convert (JPG, PNG, WebP) and compress many pictures at once; photos are "
+         "turned upright first.", "Select pictures → right-click → Image tools", "", None),
+        ("📄", "PDF tools", "Merge PDFs, split into pages, keep only some pages, rotate pages, or make a PDF smaller.",
+         "Select PDFs → right-click → PDF tools", "", None),
+        ("🎞", "Media tools", "Details of a video or song, and convert: video to MP3, to MP4, smaller 720p, M4A, WAV or "
+         "a GIF.", "Right-click a video or song → Media tools", "", None),
+        ("🖥", "Terminal here", "A terminal (or Command Prompt on Windows) already in this folder.", "☰ → Open terminal",
+         "F4", lambda w: w.open_terminal(_here(w))),
+        ("🧩", "Optional features", "One click installs the free extras: PDF thumbnails and tools, video thumbnails and "
+         "conversion, 7-Zip, QR codes.", "Tools → Install optional features (Ubuntu)", "",
+         lambda w: w.features_dialog() if not IS_WIN else w.info("On Windows the extras come with the installer.")),
+    ]),
+    ("safety", "🛡", "Safety", "Nothing is lost by accident, and private things stay private.", [
+        ("🕘", "Version history", "Keeps earlier versions of files in the folders you protect, and brings back deleted "
+         "ones.", "Right-click → Version history · Tools → Version history", "", lambda w: w.version_settings()),
+        ("🔐", "Private vault", "A password-protected, encrypted folder for salary slips, IDs and contracts. It locks "
+         "itself when you leave the PC.", "Sidebar → Private vault", "", lambda w: w.vault_ui.open()),
+        ("🔏", "Secure delete", "Overwrites a file before deleting it, so recovery tools can't bring it back.",
+         "Right-click → Secure delete", "", None),
+        ("🛡", "Ransomware guard", "If many files suddenly get scrambled or renamed to strange extensions, it pauses "
+         "syncing and backups, shows what's writing, and can put earlier versions back.",
+         "Settings → Safety", "", lambda w: w.ransom_alert(["/example/report.docx.x7k2pq"] * 3,
+                                                          ["/example/report.docx.x7k2pq"], [], time.time() - 5)),
+        ("💾", "Backups", "Copies your folders to another drive or a network folder every hour, day or week, keeping "
+         "older versions of what changed.", "☰ → Backups", "", lambda w: w.backups_dialog()),
+        ("🗺", "Journey map", "Where a file has been: renames, moves, copies and size changes, with dates.",
+         "Preview panel → 🗺 Journey", "", None),
+    ]),
+    ("share", "📱", "Sharing & phone", "Files between your PC, nearby devices and your phone, over your own network.", [
+        ("📤", "Send to nearby devices", "Send files to another Arckad-D on the same network; nothing goes through "
+         "the internet.", "Send button in the title bar", "", lambda w: w.open_share(None, "nearby")),
+        ("📥", "Receive", "Let nearby devices send files to this PC for a few minutes.", "Receive button", "",
+         lambda w: w.open_share(None, "receive")),
+        ("🔗", "Share as a link or QR code", "Phones and PCs without Arckad-D open a link in any browser. Add a password "
+         "and choose how long it works (up to a day).", "Right-click → Share as link / QR code", "",
+         lambda w: w.open_share(None, "link")),
+        ("📱", "Phone link", "Your phone's notifications, messages and calls on the PC, and its screen in a window.",
+         "📱 button in the title bar", "", lambda w: w.phone_btn.set_active(True)),
+        ("📋", "Clipboard sync", "Copy on the PC, paste on the phone, and the other way round.", "Settings → Chat, phone "
+         "& sharing", "", None),
+        ("📷", "Scan with the phone", "Photograph paper pages; they're cleaned up into a PDF that lands in your PC's "
+         "Scans folder.", "Phone: ⋮ → Phone link → Scan a document to the PC", "", None),
+        ("📸", "Phone photos to the PC", "New camera photos arrive by themselves on the same Wi-Fi, sorted by year and "
+         "month.", "Phone: ⋮ → Phone link → Send new camera photos", "", None),
+    ]),
+    ("team", "👥", "Team", "Work together on the office network: no cloud, everything encrypted.", [
+        ("💬", "Team chat", "Groups and private chats, files, photos, voice messages, stickers, replies and calls, "
+         "with chat backup and your work card.", "💬 Chat button", "", lambda w: w.chat_btn.set_active(True)),
+        ("📁", "Team folders", "A folder that stays the same on everyone's PC in a chat group. Deletes go to their "
+         "Trash; if two people change a file, both versions are kept.", "☰ → Team folders", "",
+         lambda w: w.team_folders()),
+        ("👥", "People directory", "Everyone's work card: designation, department, extension and email, grouped and "
+         "searchable.", "☰ → People directory", "", lambda w: w.people_directory()),
+        ("📢", "Announcements", "One notice to everyone at once (or just your organisation), as private messages.",
+         "☰ → Send an announcement", "", lambda w: w.announce_dialog()),
+        ("🏢", "Organisation & Pro", "Your organisation's admin can add colleagues directly, find people across "
+         "networks and manage licences.", "☰ → Organisation · Arckad-D Pro", "", lambda w: w.org_dialog()),
+        ("🔗", "Linked devices", "Use the same chats on your phone and other PCs.", "Chat → ⋮ → Linked devices", "", None),
+    ]),
+    ("look", "🎨", "Look & feel", "Make Arckad-D yours.", [
+        ("🎨", "Themes", "Dark and light in many colours, mono, high contrast, or follow the system.",
+         "Theme button in the title bar", "Ctrl+Shift+D", lambda w: w.cycle_theme()),
+        ("🖌", "Your own accent colour", "Any colour you like for buttons and highlights.", "Settings → Appearance", "",
+         lambda w: w.choose_accent()),
+        ("🖼", "Wallpaper", "A picture behind your files, softened so names stay easy to read.",
+         "Settings → Appearance", "", lambda w: w.choose_wallpaper()),
+        ("📐", "Sidebar and title bar", "Sidebar full, icons only or auto-hide; fold Library and Tags; title bar full, "
+         "compact or minimal.", "« » buttons at the top of the sidebar · ☰ → Title bar", "", None),
+        ("✨", "Animations", "The paper ball into the Trash, flying copies, the shredder, the vault door, paper "
+         "planes… with your choice of speed and size.", "Settings → Appearance", "", None),
+        ("🔊", "Sounds", "Soft sounds with the animations, quiet by default, easy to switch off.",
+         "Settings → Appearance → Sound effects", "", lambda w: [GLib.timeout_add(i * 650, lambda n=n: sfx(w, n) or False)
+                                                              for i, n in enumerate(("crumple", "thud", "zip", "ding"))]),
+        ("🎵", "Music player", "A small player for your music while you work.", "Tools → Music player", "",
+         lambda w: w.music_toggle()),
+        ("🖼", "Your logo", "Use your organisation's logo in the title bar and menus.", "☰ → Change logo", "",
+         lambda w: w.choose_logo()),
+    ]),
+    ("access", "♿", "Accessibility", "Comfortable for everyone.", [
+        ("🔠", "Text size", "Make all the text bigger: Larger, Large or Extra large.", "Settings → Accessibility", "",
+         lambda w: w.open_settings()),
+        ("◐", "High contrast", "Pure black and white with bright yellow highlights and strong borders.",
+         "Settings → Accessibility", "", lambda w: w.set_high_contrast(w.cfg.get("theme") != "contrast")),
+        ("🐢", "Calm motion", "Turns the animations off.", "Settings → Accessibility", "", None),
+        ("🗣", "Screen readers", "Every button has a spoken name for Orca (Ubuntu) and Narrator (Windows).",
+         "Automatic", "", None),
+        ("⌨", "Everything from the keyboard", "Shortcuts for every common action, and the command palette for the "
+         "rest.", "☰ → Keyboard shortcuts", "Ctrl+K", lambda w: show_shortcuts(w)),
+    ]),
+]
+
+WHATS_NEW = [
+    ("3.61", "PDF tools, media tools, similar photos, ransomware guard, scheduled backups, scan with the phone, phone "
+             "photos to the PC"),
+    ("3.60", "Your own tags, smart tags, image tools, timeline, compare folders, shared team folders"),
+    ("3.59", "Command palette, secure delete, saved searches, password-protected links, quick edit, your own colour "
+             "and wallpaper, accessibility, people directory, announcements"),
+    ("3.58", "Sound effects, a softer sound set, Trash right-click menu and thumbnails"),
+    ("3.57", "Realistic, material-shaded animations; the Windows Recycle Bin shows everything"),
+    ("3.56", "Animations for every everyday action"),
+    ("3.55", "Restore animation, Trash thumbnails and drive shortcuts, animation speed and size"),
+    ("3.54", "Clipboard sync with the phone, Trash fixes, a new keyboard shortcuts page"),
+    ("3.53", "Collapsible Library and Tags, theme-coloured sidebar icons"),
+]
+
+GUIDE_CSS = b"""
+.guide-card { background-color: alpha(currentColor, 0.05); border-radius: 12px; padding: 12px 14px; }
+.guide-icon { font-size: 22px; }
+.guide-nav row { padding: 8px 10px; border-radius: 8px; }
+"""
+
+
+class GuideWindow(Gtk.Window):
+    """📘 About Arckad-D: every feature explained, page by page, with “Try it” buttons."""
+
+    def __init__(self, win, page="about"):
+        super().__init__(title=f"About {APP_NAME} · everything it can do", transient_for=win)
+        self.win = win
+        self.set_default_size(1080, 740)
+        css = Gtk.CssProvider()
+        css.load_from_data(GUIDE_CSS + SHORTCUT_CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 8)
+        root = Gtk.Paned()
+        self.add(root)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=10)
+        side.set_size_request(230, -1)
+        self.search = Gtk.SearchEntry(placeholder_text="Search the features…")
+        self.search.connect("search-changed", lambda *_: self._search())
+        side.add(self.search)
+        self.nav = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+        self.nav.get_style_context().add_class("guide-nav")
+        nsw = Gtk.ScrolledWindow(vexpand=True)
+        nsw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        nsw.add(self.nav)
+        side.pack_start(nsw, True, True, 0)
+        root.pack1(side, False, False)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        root.pack2(self.stack, True, False)
+        pages = [("about", "📘", "About Arckad-D")] + [(k, i, t) for k, i, t, _intro, _f in GUIDE] + \
+                [("keys", "⌨", "Keyboard shortcuts"), ("new", "🆕", "What's new")]
+        for key, icon, title in pages:
+            row = Gtk.ListBoxRow()
+            row.key = key
+            count = next((len(f) for k, _i, _t, _x, f in GUIDE if k == key), 0)
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup(f"{icon}  {esc(title)}" + (f"  <small>{count}</small>" if count else ""))
+            row.add(lbl)
+            self.nav.add(row)
+        self.stack.add_named(self._about_page(), "about")
+        for key, icon, title, intro, feats in GUIDE:
+            self.stack.add_named(self._page(f"{icon} {title}", intro, [(key, f) for f in feats]), key)
+        self.stack.add_named(self._keys_page(), "keys")
+        self.stack.add_named(self._new_page(), "new")
+        self.results = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.stack.add_named(self.results, "results")
+        self.nav.connect("row-selected", lambda _l, r: r is not None and self.stack.set_visible_child_name(r.key))
+        self.show_all()
+        self.open_page(page)
+        win.label_for_readers(self)
+
+    def open_page(self, key):
+        for r in self.nav.get_children():
+            if r.key == key:
+                self.nav.select_row(r)
+
+    def _scroll(self, child):
+        sw = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.add(child)
+        return sw
+
+    def _card(self, f, page=None):
+        icon, title, text, where, keys, action = f
+        card = Gtk.Box(spacing=14)
+        card.get_style_context().add_class("guide-card")
+        ic = Gtk.Label(label=icon, valign=Gtk.Align.START)
+        ic.get_style_context().add_class("guide-icon")
+        card.add(ic)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        t = Gtk.Label(xalign=0, wrap=True)
+        t.set_markup(f"<b>{esc(title)}</b>" + (f"  <small>· {esc(page)}</small>" if page else ""))
+        col.add(t)
+        d = Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=80)
+        col.add(d)
+        meta = Gtk.Box(spacing=6)
+        wl = Gtk.Label(xalign=0, wrap=True)
+        wl.set_markup(f"<small>📍 <b>Where:</b> {esc(where)}</small>")
+        wl.get_style_context().add_class("dim-label")
+        meta.add(wl)
+        for k in [x.strip() for x in keys.split("·") if x.strip()]:
+            cap = Gtk.Label(label=k)
+            cap.get_style_context().add_class("keycap")
+            meta.add(cap)
+        col.add(meta)
+        card.pack_start(col, True, True, 0)
+        if action:
+            b = Gtk.Button(label="Try it", valign=Gtk.Align.CENTER)
+            b.set_tooltip_text(f"Try {title}")
+
+            def run(_b, a=action):
+                try:
+                    a(self.win)
+                except Exception as ex:
+                    self.win.error(f"Couldn't open that here: {ex}")
+            b.connect("clicked", run)
+            card.add(b)
+        return card
+
+    def _page(self, title, intro, items, show_page=False):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=20)
+        h = Gtk.Label(xalign=0, wrap=True)
+        h.set_markup(f"<span size='xx-large'><b>{esc(title)}</b></span>\n{esc(intro)}")
+        box.add(h)
+        names = {k: t for k, _i, t, _x, _f in GUIDE}
+        for key, f in items:
+            box.add(self._card(f, names.get(key) if show_page else None))
+        return self._scroll(box)
+
+    def _about_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin=24)
+        top = Gtk.Box(spacing=18)
+        logo = logo_pixbuf(96)
+        if logo:
+            top.add(Gtk.Image.new_from_pixbuf(logo))
+        n = sum(len(f) for *_x, f in GUIDE)
+        t = Gtk.Label(xalign=0, wrap=True)
+        t.set_markup(f"<span size='xx-large'><b>{esc(APP_NAME)}</b></span>  <span size='large'>{esc(APP_VERSION)}</span>\n"
+                     "A file manager that remembers what you worked on, keeps folders tidy, finds anything instantly, "
+                     "keeps your files safe, and lets your team chat and share without any cloud.\n\n"
+                     f"<b>{n} features</b> in <b>{len(GUIDE)} areas</b>, explained on the pages at the left. "
+                     "Each one says <b>what it does</b>, <b>where to find it</b>, its <b>shortcut</b>, and most have a "
+                     "<b>Try it</b> button.")
+        top.pack_start(t, True, True, 0)
+        box.add(top)
+        grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3, min_children_per_line=2,
+                           column_spacing=10, row_spacing=10, homogeneous=True)
+        for key, icon, title, intro, feats in GUIDE:
+            b = Gtk.Button()
+            lb = Gtk.Label(xalign=0, wrap=True)
+            lb.set_markup(f"<span size='large'>{icon}  <b>{esc(title)}</b></span>\n<small>{esc(intro)}</small>\n"
+                          f"<small>{len(feats)} features →</small>")
+            b.add(lb)
+            b.get_style_context().add_class("guide-card")
+            b.connect("clicked", lambda _b, k=key: self.open_page(k))
+            grid.add(b)
+        box.add(grid)
+        tip = Gtk.Label(xalign=0, wrap=True)
+        tip.set_markup("💡 <b>Tip:</b> press <b>Ctrl+K</b> anywhere and type what you want to do.")
+        box.add(tip)
+        btns = Gtk.Box(spacing=8)
+        for label, cb in (("🔄 Check for updates", lambda: self.win.check_updates(manual=True)),
+                          ("⌨ Keyboard shortcuts", lambda: self.open_page("keys")),
+                          ("🆕 What's new", lambda: self.open_page("new")),
+                          ("Credits & licence", self._credits)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            btns.add(b)
+        box.add(btns)
+        return self._scroll(box)
+
+    def _credits(self):
+        dlg = Gtk.AboutDialog(transient_for=self, modal=True)
+        dlg.set_program_name(APP_NAME)
+        dlg.set_version(APP_VERSION)
+        logo = logo_pixbuf(128)
+        if logo:
+            dlg.set_logo(logo)
+        dlg.add_credit_section("Emoji", ["Noto Emoji by Google (Apache License 2.0)",
+                                         "images via emoji-data by Cal Henderson (MIT)"])
+        dlg.run()
+        dlg.destroy()
+
+    def _keys_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=20)
+        h = Gtk.Label(xalign=0)
+        h.set_markup("<span size='xx-large'><b>⌨ Keyboard shortcuts</b></span>")
+        box.add(h)
+        for title, rows in SHORTCUTS:
+            sl = Gtk.Label(xalign=0)
+            sl.set_markup(f"<b>{esc(title)}</b>")
+            box.add(sl)
+            g = Gtk.Grid(column_spacing=16, row_spacing=6, margin_start=6)
+            for i, (keys, what) in enumerate(rows):
+                kb = Gtk.Box(spacing=3)
+                if isinstance(keys, str):
+                    kl = Gtk.Label(xalign=0)
+                    kl.set_markup(f"<i>{esc(keys)}</i>")
+                    kb.add(kl)
+                else:
+                    for j, k in enumerate(keys):
+                        if j:
+                            kb.add(Gtk.Label(label="+"))
+                        cap = Gtk.Label(label=k)
+                        cap.get_style_context().add_class("keycap")
+                        kb.add(cap)
+                kb.set_size_request(170, -1)
+                g.attach(kb, 0, i, 1, 1)
+                g.attach(Gtk.Label(label=what, xalign=0), 1, i, 1, 1)
+            box.add(g)
+        return self._scroll(box)
+
+    def _new_page(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=20)
+        h = Gtk.Label(xalign=0)
+        h.set_markup("<span size='xx-large'><b>🆕 What's new</b></span>")
+        box.add(h)
+        for ver, text in WHATS_NEW:
+            c = Gtk.Box(spacing=14)
+            c.get_style_context().add_class("guide-card")
+            v = Gtk.Label(valign=Gtk.Align.START)
+            v.set_markup(f"<b>{esc(ver)}</b>")
+            c.add(v)
+            c.add(Gtk.Label(label=text, xalign=0, wrap=True, max_width_chars=90))
+            box.add(c)
+        return self._scroll(box)
+
+    def _search(self):
+        q = self.search.get_text().strip().lower()
+        if not q:
+            r = self.nav.get_selected_row()
+            self.stack.set_visible_child_name(r.key if r else "about")
+            return
+        hits = [(k, f) for k, _i, _t, _x, feats in GUIDE for f in feats
+                if all(w in " ".join((f[1], f[2], f[3], f[4])).lower() for w in q.split())]
+        old = self.stack.get_child_by_name("results")
+        self.stack.remove(old)
+        page = self._page(f"🔎 “{self.search.get_text().strip()}”",
+                          f"{len(hits)} feature{'s' if len(hits) != 1 else ''} found" if hits else
+                          "Nothing found: try another word, or press Ctrl+K to search actions.", hits, show_page=True)
+        self.stack.add_named(page, "results")
+        page.show_all()
+        self.stack.set_visible_child_name("results")
+
+
 class TabWindow(Gtk.Window):
     """A tab pulled out of Arckad-D (like Chrome): its own window, with its own tab bar. Tabs drag back and forth
     between windows; shortcuts work here too; the window closes when its last tab leaves."""
@@ -25711,7 +26127,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Change logo…", self.choose_logo),
             ("Use the default logo", self.reset_logo),
             ("Check for updates…", lambda: self.check_updates(manual=True)),
-            (f"About {APP_NAME}", self.show_about),
+            (f"📘 About {APP_NAME} · every feature explained", self.show_about),
         ]))
         self.more_btn = Gtk.MenuButton()
         more_lbl = Gtk.Label()
@@ -26355,7 +26771,15 @@ class MainWindow(Gtk.ApplicationWindow):
         self.refresh_logo()
         self.active.flash("Back to the default Arckad-D logo")
 
-    def show_about(self):
+    def show_about(self, page="about"):
+        """📘 About: every feature explained, page by page."""
+        if getattr(self, "_guide", None) is not None and self._guide.get_visible():
+            self._guide.open_page(page)
+            return self._guide.present()
+        self._guide = GuideWindow(self, page)
+        self._guide.connect("destroy", lambda *_: setattr(self, "_guide", None))
+
+    def _old_about(self):
         dlg = Gtk.AboutDialog(transient_for=self, modal=True)
         dlg.set_program_name(APP_NAME)
         dlg.set_version(APP_VERSION)
