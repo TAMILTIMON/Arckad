@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.58.1"
+APP_VERSION = "3.58.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -22411,7 +22411,7 @@ def _an_view_fold(cr, k, a):
 # ---------------------------------------------------------------- 🔊 Sound effects for the animations
 # Made by Arckad-D itself (no sound files to ship): each one is synthesised once into a small WAV in the cache, at the
 # chosen volume, and played with GStreamer (Ubuntu), paplay / pw-play / aplay, or winsound (Windows).
-SFX_VOLUMES = [("low", "Low", 0.35), ("medium", "Medium", 0.6), ("high", "High", 0.9)]
+SFX_VOLUMES = [("low", "Quiet", 0.3), ("medium", "Normal", 0.5), ("high", "Louder", 0.75)]
 _SFX_RATE = 22050
 
 
@@ -22420,143 +22420,162 @@ def _sfx_noise(rnd):
 
 
 def _sfx_render(name):
-    """The samples (floats −1…1) for one sound."""
+    """The samples (floats −1…1) for one sound. Ear-friendly by design: soft attacks (no clicks), mellow tones
+    instead of bright ones, highs filtered away, gentle fade-out, and every sound evened out to the same loudness."""
     import random as _r
     rnd = _r.Random(hash(name) & 0xffff)
     R = _SFX_RATE
     out = []
 
-    def env(t, a, d):                                         # quick attack, exponential decay
-        return min(1.0, t / a) * math.exp(-t / d) if a > 0 else math.exp(-t / d)
+    def env(t, a, d):                                         # soft attack, smooth decay
+        if t < 0:
+            return 0.0
+        rise = 0.5 - 0.5 * math.cos(math.pi * min(1.0, t / a)) if a > 0 else 1.0
+        return rise * math.exp(-max(0.0, t - a) / d)
 
-    if name == "crumple":                                     # paper: lots of little crackles, louder in bursts
-        n = int(R * 0.9)
+    def soft_noise(n, k):
+        """Filtered (rounded) noise: k small = darker, softer."""
+        lp1 = lp2 = 0.0
+        res = []
+        for _ in range(n):
+            lp1 += k * (_sfx_noise(rnd) - lp1)
+            lp2 += k * (lp1 - lp2)
+            res.append(lp2)
+        return res
+
+    if name == "crumple":                                     # paper scrunched gently in the hand
+        n = int(R * 0.7)
+        base = soft_noise(n, 0.18)
         out = [0.0] * n
-        lp = 0.0
-        for _ in range(260):
-            at = int(rnd.random() ** 0.8 * n * 0.95)
-            ln = int(R * (0.002 + rnd.random() * 0.012))
-            amp = 0.25 + rnd.random() * 0.75
+        for _ in range(55):                                   # a few soft rustles, not crackles
+            at = int(rnd.random() ** 0.9 * n * 0.85)
+            ln = int(R * (0.015 + rnd.random() * 0.03))
+            amp = 0.4 + rnd.random() * 0.6
             for j in range(ln):
                 if at + j < n:
-                    out[at + j] += _sfx_noise(rnd) * amp * math.exp(-j / (ln * 0.3 + 1))
-        for i in range(n):                                    # soften it a little (paper, not static)
-            lp = lp * 0.55 + out[i] * 0.45
-            out[i] = lp * 0.8 * min(1, i / (R * 0.02)) * (1 - max(0, i - n * 0.8) / (n * 0.2))
-    elif name == "shred":                                     # motor buzz + paper tearing
-        n = int(R * 1.1)
-        lp = 0.0
-        for i in range(n):
-            t = i / R
-            saw = ((t * 118) % 1) * 2 - 1
-            lp = lp * 0.7 + _sfx_noise(rnd) * 0.3
-            e = min(1, t / 0.06) * min(1, (1.1 - t) / 0.15)
-            out.append((saw * 0.35 + lp * 0.9 * (0.6 + 0.4 * math.sin(t * 60))) * e * 0.7)
-    elif name == "zip":                                       # a zipper: fast ticks rising in pitch
-        n = int(R * 0.55)
-        out = [0.0] * n
-        t, gap = 0.0, 0.016
-        while t < 0.5:
-            at = int(t * R)
-            for j in range(int(R * 0.004)):
-                if at + j < n:
-                    out[at + j] += _sfx_noise(rnd) * math.exp(-j / 18) * 0.8
-            t += gap
-            gap = max(0.006, gap * 0.95)
-    elif name == "whoosh":                                    # air: noise swelling and fading, its tone rising
-        n = int(R * 0.5)
-        lp = bp = 0.0
-        for i in range(n):
-            t = i / n
-            k = 0.05 + 0.25 * t
-            lp += k * (_sfx_noise(rnd) - lp)
-            bp += k * (lp - bp)
-            out.append((lp - bp) * 3.2 * math.sin(math.pi * t) ** 1.5)
-    elif name == "clunk":                                     # vault: heavy door thud, then the bolt clicks
-        n = int(R * 0.7)
-        for i in range(n):
-            t = i / R
-            thud = math.sin(2 * math.pi * 62 * t) * env(t, 0.004, 0.09) * 0.9
-            click = _sfx_noise(rnd) * env(t - 0.32, 0.0005, 0.012) * 0.6 if t > 0.32 else 0
-            ring = math.sin(2 * math.pi * 2100 * t) * env(t - 0.32, 0.001, 0.05) * 0.18 if t > 0.32 else 0
-            out.append(thud + click + ring)
-    elif name == "dial":                                      # a safe dial: a few ratchet ticks
-        n = int(R * 0.45)
-        out = [0.0] * n
-        for k in range(7):
-            at = int((0.03 + k * 0.06) * R)
-            for j in range(int(R * 0.01)):
-                if at + j < n:
-                    out[at + j] += (_sfx_noise(rnd) * 0.5 + math.sin(j * 0.9) * 0.4) * math.exp(-j / 25)
-    elif name == "pop":                                       # a soft rising pop
-        n = int(R * 0.16)
-        ph = 0.0
-        for i in range(n):
-            t = i / R
-            ph += 2 * math.pi * (300 + 900 * t / 0.16) / R
-            out.append(math.sin(ph) * env(t, 0.003, 0.05) * 0.7)
-    elif name == "ding":                                      # a little bell
+                    out[at + j] += base[at + j] * amp * math.sin(math.pi * j / ln)
+    elif name == "shred":                                     # a low, soft motor hum with a little paper
         n = int(R * 0.9)
+        paper = soft_noise(n, 0.12)
         for i in range(n):
             t = i / R
-            out.append((math.sin(2 * math.pi * 1318 * t) * 0.5 + math.sin(2 * math.pi * 1976 * t) * 0.25 +
-                        math.sin(2 * math.pi * 2637 * t) * 0.12) * env(t, 0.002, 0.25) * 0.7)
-    elif name == "slide":                                     # paper sliding on a desk
-        n = int(R * 0.35)
-        lp = 0.0
+            hum = math.sin(2 * math.pi * 92 * t) * 0.5 + math.sin(2 * math.pi * 184 * t) * 0.15
+            e = min(1, t / 0.12) * min(1, (0.9 - t) / 0.25)
+            out.append((hum + paper[i] * 2.0 * (0.7 + 0.3 * math.sin(t * 18))) * e)
+    elif name == "zip":                                       # a soft zipper: muffled ticks speeding up
+        n = int(R * 0.5)
+        tick = soft_noise(int(R * 0.012), 0.25)
+        out = [0.0] * n
+        t, gap = 0.0, 0.026
+        while t < 0.44:
+            at = int(t * R)
+            for j, v in enumerate(tick):
+                if at + j < n:
+                    out[at + j] += v * math.sin(math.pi * j / len(tick)) * 0.8
+            t += gap
+            gap = max(0.012, gap * 0.94)
+    elif name == "whoosh":                                    # a soft breath of air, low and quiet
+        n = int(R * 0.45)
+        air = soft_noise(n, 0.06)
         for i in range(n):
             t = i / n
-            lp = lp * 0.82 + _sfx_noise(rnd) * 0.18
-            out.append(lp * 2.2 * math.sin(math.pi * t))
-    elif name == "flap":                                      # a split-flap / page turning
-        n = int(R * 0.25)
-        out = [0.0] * n
-        for at_s, amp in ((0.0, 0.8), (0.06, 0.5), (0.11, 0.3)):
-            at = int(at_s * R)
-            for j in range(int(R * 0.03)):
-                if at + j < n:
-                    out[at + j] += _sfx_noise(rnd) * amp * math.exp(-j / 90)
-    elif name == "thud":                                      # landing softly
-        n = int(R * 0.22)
+            out.append(air[i] * math.sin(math.pi * t) ** 2)
+    elif name == "clunk":                                     # the vault door: a deep, padded thud
+        n = int(R * 0.5)
         for i in range(n):
             t = i / R
-            out.append((math.sin(2 * math.pi * 95 * t) * 0.8 + _sfx_noise(rnd) * 0.15) * env(t, 0.002, 0.04))
-    elif name == "tick":                                      # a light tap (pin, tag)
-        n = int(R * 0.12)
-        for i in range(n):
-            t = i / R
-            out.append((math.sin(2 * math.pi * 1500 * t) * 0.4 + _sfx_noise(rnd) * 0.3) * env(t, 0.0005, 0.012))
-    elif name == "chime":                                     # sparkly (batch rename, new folder)
-        n = int(R * 0.7)
+            out.append(math.sin(2 * math.pi * 70 * t) * env(t, 0.008, 0.11) * 0.9 +
+                       math.sin(2 * math.pi * 140 * t) * env(t, 0.008, 0.05) * 0.25 +
+                       math.sin(2 * math.pi * 210 * t) * env(t - 0.18, 0.006, 0.05) * 0.3)
+    elif name == "dial":                                      # a few muffled wooden clicks
+        n = int(R * 0.4)
         out = [0.0] * n
-        for k, f in enumerate((1568, 2093, 2637, 3136)):
-            at = int(k * 0.07 * R)
-            for j in range(n - at):
-                t = j / R
-                out[at + j] += math.sin(2 * math.pi * f * t) * env(t, 0.002, 0.12) * 0.22
-    elif name == "blip":                                      # a chat message going out
-        n = int(R * 0.12)
+        for k in range(5):
+            at = (0.03 + k * 0.07)
+            for i in range(n):
+                t = i / R - at
+                out[i] += math.sin(2 * math.pi * 480 * t) * env(t, 0.003, 0.018) * 0.6 if t >= 0 else 0
+    elif name == "pop":                                       # a soft bubble
+        n = int(R * 0.18)
         ph = 0.0
         for i in range(n):
             t = i / R
-            ph += 2 * math.pi * (700 + 500 * t / 0.12) / R
-            out.append(math.sin(ph) * env(t, 0.004, 0.035) * 0.6)
-    elif name == "hum":                                       # magnets pulling together
+            ph += 2 * math.pi * (260 + 340 * t / 0.18) / R
+            out.append(math.sin(ph) * env(t, 0.01, 0.05))
+    elif name == "ding":                                      # a warm marimba note (not a bell)
         n = int(R * 0.6)
         for i in range(n):
             t = i / R
-            f = 140 + 160 * t / 0.6
-            out.append(math.sin(2 * math.pi * f * t) * math.sin(math.pi * t / 0.6) * 0.45)
-    elif name == "swipe":                                     # a quick soft sweep (theme, views)
+            out.append(math.sin(2 * math.pi * 587 * t) * env(t, 0.006, 0.16) +
+                       math.sin(2 * math.pi * 1174 * t) * env(t, 0.006, 0.05) * 0.18 +
+                       math.sin(2 * math.pi * 880 * t) * env(t - 0.11, 0.006, 0.18) * 0.7)
+    elif name == "slide":                                     # paper sliding softly
         n = int(R * 0.3)
-        lp = 0.0
+        air = soft_noise(n, 0.09)
         for i in range(n):
             t = i / n
-            k = 0.08 + 0.4 * t
-            lp += k * (_sfx_noise(rnd) - lp)
-            out.append(lp * 1.4 * math.sin(math.pi * t) ** 2)
-    peak = max((abs(v) for v in out), default=0) or 1.0
-    return [v / peak for v in out]
+            out.append(air[i] * math.sin(math.pi * t) ** 1.5)
+    elif name == "flap":                                      # a page turning: one soft tap
+        n = int(R * 0.16)
+        air = soft_noise(n, 0.15)
+        for i in range(n):
+            t = i / R
+            out.append(air[i] * env(t, 0.006, 0.03))
+    elif name == "thud":                                      # landing on a soft desk
+        n = int(R * 0.2)
+        for i in range(n):
+            t = i / R
+            out.append(math.sin(2 * math.pi * 110 * t) * env(t, 0.006, 0.045))
+    elif name == "tick":                                      # a gentle wooden tap
+        n = int(R * 0.1)
+        for i in range(n):
+            t = i / R
+            out.append(math.sin(2 * math.pi * 620 * t) * env(t, 0.003, 0.02) +
+                       math.sin(2 * math.pi * 1240 * t) * env(t, 0.003, 0.008) * 0.15)
+    elif name == "chime":                                     # three soft marimba notes going up
+        n = int(R * 0.6)
+        out = [0.0] * n
+        for k, f in enumerate((523, 659, 784)):
+            at = k * 0.09
+            for i in range(n):
+                t = i / R - at
+                if t >= 0:
+                    out[i] += math.sin(2 * math.pi * f * t) * env(t, 0.006, 0.12) * 0.5
+    elif name == "blip":                                      # a chat message going out: soft and short
+        n = int(R * 0.12)
+        ph = 0.0
+        for i in range(n):
+            t = i / R
+            ph += 2 * math.pi * (440 + 220 * t / 0.12) / R
+            out.append(math.sin(ph) * env(t, 0.01, 0.035))
+    elif name == "hum":                                       # magnets: a low, rounded rising hum
+        n = int(R * 0.5)
+        for i in range(n):
+            t = i / R
+            f = 110 + 70 * t / 0.5
+            out.append(math.sin(2 * math.pi * f * t) * math.sin(math.pi * t / 0.5) ** 2)
+    elif name == "swipe":                                     # a very soft sweep
+        n = int(R * 0.28)
+        air = soft_noise(n, 0.05)
+        for i in range(n):
+            t = i / n
+            out.append(air[i] * math.sin(math.pi * t) ** 2)
+    # finishing, for every sound: roll off the highs, soft edges, even loudness
+    lp = 0.0
+    for i in range(len(out)):
+        lp += 0.45 * (out[i] - lp)
+        out[i] = lp
+    fin, fout = int(R * 0.006), int(R * 0.04)
+    for i in range(min(fin, len(out))):
+        out[i] *= i / fin
+    for i in range(min(fout, len(out))):
+        out[-1 - i] *= i / fout
+    rms = math.sqrt(sum(v * v for v in out) / max(1, len(out))) or 1.0
+    gain = 0.22 / rms                                         # every sound about as loud as the others
+    peak = max((abs(v) for v in out), default=0) * gain
+    if peak > 0.85:
+        gain *= 0.85 / peak
+    return [v * gain for v in out]
 
 
 def _sfx_file(name, volume):
@@ -22564,7 +22583,7 @@ def _sfx_file(name, volume):
     import wave
     import struct
     folder = CACHE_DIR / "sounds"
-    path = folder / f"{name}-{int(volume * 100)}-v1.wav"
+    path = folder / f"{name}-{int(volume * 100)}-v2.wav"     # v2: the softer set
     if path.exists():
         return path
     folder.mkdir(parents=True, exist_ok=True)
@@ -22603,7 +22622,7 @@ class SoundFX:
     def play(self, win, name):
         if not win.cfg.get("sounds", True) or self.busy >= 4:
             return
-        vol = next((v for k, _l, v in SFX_VOLUMES if k == win.cfg.get("sound_volume", "medium")), 0.6)
+        vol = next((v for k, _l, v in SFX_VOLUMES if k == win.cfg.get("sound_volume", "low")), 0.3)
         self.busy += 1
 
         def work():
@@ -22662,17 +22681,15 @@ def sfx(win, name):
 
 
 # which sounds go with which animation: [(sound, when, as a fraction of the animation)]
-ANIM_SOUNDS = {"copy": [("slide", 0.1), ("thud", 0.82)], "move": [("slide", 0.15), ("thud", 0.8)],
-               "rename": [("flap", 0.0), ("flap", 0.45)], "ripple": [("chime", 0.0)], "new_folder": [("pop", 0.0)],
-               "duplicate": [("pop", 0.3)], "vault": [("whoosh", 0.05), ("clunk", 0.5), ("dial", 0.65)],
-               "empty_trash": [("crumple", 0.15), ("whoosh", 0.3)], "shred": [("shred", 0.15)],
-               "zip": [("slide", 0.0), ("zip", 0.45)], "unzip": [("zip", 0.0), ("pop", 0.38)],
-               "plane": [("whoosh", 0.3)], "clip": [("whoosh", 0.05), ("tick", 0.78)], "bubble": [("blip", 0.0)],
-               "tag": [("tick", 0.3)], "pin": [("tick", 0.33), ("whoosh", 0.55)], "rules": [("slide", 0.05), ("thud", 0.78)],
-               "download": [("whoosh", 0.0), ("thud", 0.55), ("ding", 0.6)], "magnet": [("hum", 0.1)],
-               "search": [("swipe", 0.0)], "reassemble": [("crumple", 0.0), ("chime", 0.7)],
-               "versions": [("flap", 0.05), ("flap", 0.3), ("flap", 0.55)], "wipe": [("swipe", 0.0)],
-               "fold": [("swipe", 0.0)], "vault_open": [("dial", 0.05), ("clunk", 0.32), ("whoosh", 0.6)]}
+ANIM_SOUNDS = {"copy": [("slide", 0.15)], "move": [("thud", 0.8)], "rename": [("flap", 0.4)],
+               "ripple": [("chime", 0.0)], "new_folder": [("pop", 0.05)], "duplicate": [("pop", 0.3)],
+               "vault": [("clunk", 0.5)], "vault_open": [("clunk", 0.3)], "empty_trash": [("crumple", 0.15)],
+               "shred": [("shred", 0.15)], "zip": [("zip", 0.45)], "unzip": [("zip", 0.0)],
+               "plane": [("whoosh", 0.3)], "clip": [("tick", 0.78)], "bubble": [("blip", 0.0)],
+               "tag": [("tick", 0.3)], "pin": [("tick", 0.33)], "rules": [("thud", 0.78)],
+               "download": [("ding", 0.58)], "magnet": [("hum", 0.15)], "search": [],
+               "reassemble": [("chime", 0.65)], "versions": [("flap", 0.1), ("flap", 0.5)], "wipe": [],
+               "fold": []}
 
 
 def anim_sounds(win, kind, dur):
@@ -22712,7 +22729,6 @@ def fly_to_trash(win, start, count):
     t0 = time.time()
     arc = max(30, min(140, min(sy, ty) - size))                     # stays inside the window
     sfx(win, "crumple")
-    GLib.timeout_add(int((crumple + hold) * 1000), lambda: sfx(win, "whoosh") or False)
     GLib.timeout_add(int((crumple + hold + fly) * 1000), lambda: sfx(win, "thud") or False)
 
     def frame():
@@ -22764,8 +22780,7 @@ def fly_from_trash(win, count, landed=None):
     t0 = time.time()
     arc = max(30, min(140, min(sy, ty) - size))
     state = {"landed": False}
-    sfx(win, "whoosh")
-    GLib.timeout_add(int(fly * 1000), lambda: (sfx(win, "thud"), sfx(win, "crumple")) and False)
+    GLib.timeout_add(int(fly * 1000), lambda: sfx(win, "thud") or False)
 
     def frame():
         t = time.time() - t0
@@ -22873,11 +22888,11 @@ def settings_entries(win):
            lambda: win.cfg.get("sounds", True),
            lambda v: (win.cfg.__setitem__("sounds", v), write_json(CONFIG_FILE, win.cfg), v and sfx(win, "pop"))),
           ("appearance", "Sound volume", "How loud the sound effects are.", "choice",
-           [(k, label) for k, label, _v in SFX_VOLUMES], lambda: win.cfg.get("sound_volume", "medium"),
+           [(k, label) for k, label, _v in SFX_VOLUMES], lambda: win.cfg.get("sound_volume", "low"),
            lambda k: (win.cfg.__setitem__("sound_volume", k), write_json(CONFIG_FILE, win.cfg), sfx(win, "ding"))),
           ("appearance", "Hear the sounds", "Plays a few of them, one after another.", "button", "▶ Play",
            lambda: [GLib.timeout_add(i * 650, lambda n=n: sfx(win, n) or False)
-                    for i, n in enumerate(("crumple", "whoosh", "shred", "zip", "clunk", "ding"))]),
+                    for i, n in enumerate(("crumple", "thud", "zip", "clunk", "ding"))]),
           ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
            "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
           ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
