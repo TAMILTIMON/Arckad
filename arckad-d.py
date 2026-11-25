@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.54.3"
+APP_VERSION = "3.55.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20483,6 +20483,7 @@ def trash_items():
             except Exception:
                 it = None
             if it:
+                it["drive"] = str(top) if top is not None else ""      # "" = your home Trash
                 items.append(it)
     items.sort(key=lambda i: -i["when"])
     return items
@@ -20579,6 +20580,10 @@ def _win_trash_call(what, item):
 
 
 class TrashView(Gtk.Box):
+    """🗑 The Trash of every drive: a list or a grid of thumbnails, with one-click shortcuts per drive."""
+    COLS = (str, str, str, str, str, float, GObject.TYPE_INT64, int, GdkPixbuf.Pixbuf, str)
+    # icon name · name · was in · deleted · size · when · bytes · index in self.items · picture · drive
+
     def __init__(self, win):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.win = win
@@ -20586,6 +20591,17 @@ class TrashView(Gtk.Box):
         top = Gtk.Box(spacing=8)
         self.title = Gtk.Label(xalign=0, hexpand=True)
         top.pack_start(self.title, True, True, 0)
+        views = Gtk.Box()
+        views.get_style_context().add_class("linked")
+        self.list_btn = Gtk.RadioButton.new(None)
+        self.grid_btn = Gtk.RadioButton.new_from_widget(self.list_btn)
+        for b, icon, tip in ((self.list_btn, "view-list-symbolic", "List"),
+                             (self.grid_btn, "view-grid-symbolic", "Thumbnails")):
+            b.set_mode(False)
+            b.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+            b.set_tooltip_text(tip)
+            views.add(b)
+        top.add(views)
         for label, cb, cls in (("↩ Restore", self.restore, "suggested-action"),
                                ("Delete permanently", self.delete, None), ("Empty Trash", self.empty, "destructive-action")):
             b = Gtk.Button(label=label)
@@ -20594,11 +20610,20 @@ class TrashView(Gtk.Box):
             b.connect("clicked", lambda _b, cb=cb: cb())
             top.add(b)
         self.add(top)
+        # drive shortcuts: All · This PC · each drive's own Trash
+        self.drive_bar = Gtk.Box(spacing=8)
+        self.chips = Gtk.Box()
+        self.chips.get_style_context().add_class("linked")
+        self.drive_bar.add(self.chips)
+        self.open_drive_btn = Gtk.Button(label="📂 Open this drive")
+        self.open_drive_btn.set_tooltip_text("Go to the drive's files")
+        self.open_drive_btn.connect("clicked", lambda *_: self.open_drive())
+        self.drive_bar.add(self.open_drive_btn)
+        self.add(self.drive_bar)
         self.hint = Gtk.Label(xalign=0)
         self.hint.get_style_context().add_class("dim-label")
         self.add(self.hint)
-        self.store = Gtk.ListStore(str, str, str, str, str, float, GObject.TYPE_INT64, int)   # icon name, cols, idx
-        self.tv = Gtk.TreeView(model=self.store)
+        self.tv = Gtk.TreeView()
         self.tv.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         ic = Gtk.TreeViewColumn("", Gtk.CellRendererPixbuf(), icon_name=0)
         self.tv.append_column(ic)
@@ -20610,18 +20635,127 @@ class TrashView(Gtk.Box):
             c.set_sort_column_id(sort)
             self.tv.append_column(c)
         self.tv.connect("row-activated", lambda *_: self.restore())
-        sw = Gtk.ScrolledWindow(vexpand=True)
-        sw.add(self.tv)
-        self.pack_start(sw, True, True, 0)
-        self.items = []
+        self.icons = Gtk.IconView(pixbuf_column=8, item_width=112, column_spacing=6,
+                                  row_spacing=10, margin=6)
+        self.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        cell = next((c for c in self.icons.get_cells() if isinstance(c, Gtk.CellRendererText)), None)
+        if cell is None:
+            cell = Gtk.CellRendererText()
+            self.icons.pack_end(cell, False)
+        cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
+        cell.set_property("wrap-mode", Pango.WrapMode.WORD_CHAR)
+        cell.set_property("alignment", Pango.Alignment.CENTER)
+        cell.set_property("xalign", 0.5)
+        self.icons.add_attribute(cell, "text", 1)
+        self.icons.connect("item-activated", lambda *_: self.restore())
+        self.views = Gtk.Stack()
+        for name, w in (("list", self.tv), ("grid", self.icons)):
+            sw = Gtk.ScrolledWindow(vexpand=True)
+            sw.add(w)
+            self.views.add_named(sw, name)
+        self.pack_start(self.views, True, True, 0)
+        self.items, self.drive, self.gen = [], None, 0    # drive: None = all drives
+        self._icon_cache = {}
+        self._new_model()
+        mode = win.cfg.get("trash_view", "list")
+        (self.grid_btn if mode == "grid" else self.list_btn).set_active(True)
+        self.views.set_visible_child_name(mode)
+        self.list_btn.connect("toggled", lambda b: b.get_active() and self.set_view("list"))
+        self.grid_btn.connect("toggled", lambda b: b.get_active() and self.set_view("grid"))
 
+    def _new_model(self):
+        """A fresh model for every refresh (clearing one under a filter + sort upsets GTK)."""
+        self.store = Gtk.ListStore(*self.COLS)
+        self.filter = self.store.filter_new()
+        self.filter.set_visible_func(lambda m, it, _d: self.drive is None or m[it][9] == self.drive)
+        self.sorted = Gtk.TreeModelSort(model=self.filter)
+        self.sorted.set_sort_column_id(5, Gtk.SortType.DESCENDING)          # newest first
+
+    def _attach(self):
+        self.tv.set_model(self.sorted)
+        self.icons.set_model(self.sorted)
+        self.icons.set_pixbuf_column(8)
+
+    def set_view(self, mode):
+        self.views.set_visible_child_name(mode)
+        self.win.cfg["trash_view"] = mode
+        write_json(CONFIG_FILE, self.win.cfg)
+        self._load_thumbs()
+
+    # ---------- drives
+    @staticmethod
+    def _drive_names():
+        names = {}
+        try:
+            for m in Gio.VolumeMonitor.get().get_mounts():
+                root = m.get_root().get_path() if m.get_root() else None
+                if root:
+                    names[root] = m.get_name()
+        except Exception:
+            pass
+        return names
+
+    def _drive_label(self, drive, names):
+        if not drive:
+            return "This PC"
+        if drive == "/":
+            return "Computer"
+        return names.get(drive) or os.path.basename(drive.rstrip(os.sep)) or drive
+
+    def _build_chips(self, items):
+        for c in self.chips.get_children():
+            self.chips.remove(c)
+        names = self._drive_names()
+        counts = {}
+        for it in items:
+            counts[it.get("drive", "")] = counts.get(it.get("drive", ""), 0) + 1
+        if self.drive is not None and self.drive not in counts:
+            self.drive = None
+        first = None
+        for drive, label in [(None, f"All ({len(items)})")] + [
+                (d, f"{self._drive_label(d, names)} ({n})") for d, n in sorted(counts.items(), key=lambda x: x[0])]:
+            b = Gtk.RadioButton.new_with_label_from_widget(first, label)
+            b.set_mode(False)
+            b.set_tooltip_text("Everything in the Trash" if drive is None else
+                               ("Deleted from your home folder" if not drive else f"The Trash of {drive}"))
+            first = first or b
+            b.set_active(drive == self.drive)
+            b.connect("toggled", lambda btn, d=drive: btn.get_active() and self.set_drive(d))
+            self.chips.add(b)
+        self.drive_bar.set_visible(bool(items))
+        self._drive_button()
+        self.chips.show_all()
+
+    def set_drive(self, drive):
+        self.drive = drive
+        self.tv.set_model(None)                            # refilter while detached (GTK's sort-over-filter quirk)
+        self.icons.set_model(None)
+        self.filter.refilter()
+        self._attach()
+        self._drive_button()
+        self._update_title()
+
+    def _drive_button(self):
+        on_drive = bool(self.drive)                        # a drive's own Trash is selected
+        self.open_drive_btn.set_label("📂 Open this drive" if on_drive else "📂 Open Home")
+        self.open_drive_btn.set_tooltip_text(f"Go to {self.drive}" if on_drive else "Go to your home folder")
+
+    def open_drive(self):
+        folder = self.drive if self.drive and os.path.isdir(self.drive) else str(HOME)
+        self.win.show_files()
+        self.win.active.go(folder)
+
+    # ---------- loading
     def refresh(self):
+        self.gen += 1
+        gen = self.gen
+
         def work():
             try:
                 items, err = trash_items(), None
             except Exception as ex:                        # never a blank page: say what went wrong
                 items, err = [], f"{type(ex).__name__}: {ex}"
-            GLib.idle_add(lambda: self._show(items, err) or False)
+            GLib.idle_add(lambda: gen == self.gen and self._show(items, err) or False)
         threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
@@ -20635,9 +20769,30 @@ class TrashView(Gtk.Box):
         except UnicodeEncodeError:
             return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
 
+    def _icon(self, name, is_dir):
+        key = "/" if is_dir else ext_of(name)
+        if key not in self._icon_cache:
+            pb = None
+            try:
+                info = Gtk.IconTheme.get_default().lookup_by_gicon(icon_for(name, is_dir), 64,
+                                                                   Gtk.IconLookupFlags.FORCE_SIZE)
+                pb = info.load_icon() if info else None
+            except Exception:
+                pb = None
+            if pb is None:
+                try:
+                    pb = Gtk.IconTheme.get_default().load_icon("folder" if is_dir else "text-x-generic", 64,
+                                                               Gtk.IconLookupFlags.FORCE_SIZE)
+                except GLib.Error:
+                    pb = None
+            self._icon_cache[key] = pb
+        return self._icon_cache[key]
+
     def _show(self, items, err=None):
-        self.store.clear()
-        shown, total = [], 0
+        self.tv.set_model(None)
+        self.icons.set_model(None)
+        self._new_model()
+        shown = []
         for it in items:
             try:
                 when = time.strftime("%d %b %Y, %H:%M", time.localtime(it["when"]))
@@ -20647,25 +20802,69 @@ class TrashView(Gtk.Box):
                 self.store.append(["folder" if it["is_dir"] else "text-x-generic", self._text(it["name"]),
                                    self._text(short(os.path.dirname(it["orig"]))), when,
                                    "—" if it["is_dir"] else human_size(it["size"]), float(it["when"]),
-                                   int(it["size"]), len(shown)])
+                                   int(it["size"]), len(shown), self._icon(self._text(it["name"]), it["is_dir"]),
+                                   it.get("drive", "")])
             except Exception:
                 continue                                   # one odd item never hides the rest
             shown.append(it)
-            total += it["size"]
-        self.items = items = shown
-        if err:
-            self.hint.set_text("Couldn't read the Trash: " + err)
-        self.title.set_markup(f"<span size='x-large'><b>🗑 Trash</b></span>  <small>{len(items)} item"
-                              f"{'s' if len(items) != 1 else ''} · {human_size(total)}</small>")
-        if not err:
+        self.items = shown
+        self._err = err
+        self._build_chips(shown)
+        self.filter.refilter()
+        self._attach()
+        self._update_title()
+        self.win.update_trash_count(len(shown))
+        self._load_thumbs()
+        return False
+
+    def _update_title(self):
+        vis = [self.items[r[7]] for r in self.filter]
+        total = sum(it["size"] for it in vis)
+        self.title.set_markup(f"<span size='x-large'><b>🗑 Trash</b></span>  <small>{len(vis)} item"
+                              f"{'s' if len(vis) != 1 else ''} · {human_size(total)}</small>")
+        if getattr(self, "_err", None):
+            self.hint.set_text("Couldn't read the Trash: " + self._err)
+        else:
             self.hint.set_text("Select items and click Restore (or double-click) to put them back where they were."
-                               if items else "The Trash is empty.")
-        self.win.update_trash_count(len(items))
+                               if vis else "The Trash is empty.")
+
+    def _load_thumbs(self):
+        if self.views.get_visible_child_name() != "grid":
+            return
+        gen = self.gen
+        todo = [(i, it["key"]) for i, it in enumerate(self.items)
+                if not it["is_dir"] and category_of(self._text(it["name"])) in THUMB_KINDS][:600]
+        if not todo:
+            return
+
+        def work():
+            for i, path in todo:
+                if gen != self.gen or self.views.get_visible_child_name() != "grid":
+                    return
+                try:
+                    pb = thumbnail_for(path, 96)
+                except Exception:
+                    pb = None
+                if pb:
+                    GLib.idle_add(self._set_thumb, gen, i, pb)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_thumb(self, gen, idx, pb):
+        if gen == self.gen:
+            for row in self.store:
+                if row[7] == idx:
+                    row[8] = pb
+                    break
+        return False
 
     def _selected(self):
-        model, rows = self.tv.get_selection().get_selected_rows()
-        return [self.items[model[r][7]] for r in rows]
+        if self.views.get_visible_child_name() == "grid":
+            paths = self.icons.get_selected_items()
+        else:
+            _m, paths = self.tv.get_selection().get_selected_rows()
+        return [self.items[self.sorted[p][7]] for p in paths]
 
+    # ---------- actions
     def restore(self):
         sel = self._selected()
         if not sel:
@@ -20675,12 +20874,13 @@ class TrashView(Gtk.Box):
             try:
                 back.append(trash_restore(it))
             except (OSError, subprocess.SubprocessError) as ex:
-                self.win.error(f"Couldn't restore {it['name']}: {getattr(ex, 'strerror', None) or ex}")
+                self.win.error(f"Couldn't restore {self._text(it['name'])}: {getattr(ex, 'strerror', None) or ex}")
         self.refresh()
         self.win.refresh_all()
         if back:
             self.win.flash_all(f"↩ Restored {len(back)} item{'s' if len(back) != 1 else ''}"
-                               + (f" to {short(os.path.dirname(back[0]))}" if back[0] else ""))
+                               + (f" to {self._text(short(os.path.dirname(back[0])))}" if back[0] else ""))
+            self.win.after_restore(back)
 
     def delete(self):
         sel = self._selected()
@@ -20691,40 +20891,97 @@ class TrashView(Gtk.Box):
             self.refresh()
 
     def empty(self):
-        if self.items and self.win.confirm(f"Empty the Trash ({len(self.items)} items)?\n\nThis can't be undone."):
-            if IS_WIN:
+        vis = [self.items[r[7]] for r in self.filter]
+        where = "" if not self.drive else " of this drive"
+        if vis and self.win.confirm(f"Empty the Trash{where} ({len(vis)} items)?\n\nThis can't be undone."):
+            if IS_WIN and not self.drive:
                 _ps("Clear-RecycleBin -Force -ErrorAction SilentlyContinue")
             else:
-                for it in self.items:
+                for it in vis:
                     trash_delete(it)
             self.refresh()
 
 
 # ---------- the crumple-and-throw animation
-def _paper_svg(t, angle, count, size):
-    """A sheet of paper crumpling into a ball (t: 0 = flat sheet … 1 = tight ball)."""
+def _paper_svg(t, angle, count, size, seed=7):
+    """A sheet of paper crumpling into a ball (t: 0 = flat sheet … 1 = tight ball).
+    The edge folds in unevenly (corners first), facets catch the light, creases appear, the writing fades."""
+    import random as _r
     s = size
-    w = s * (0.72 - 0.30 * t)
-    h = s * (0.92 - 0.50 * t)
-    r = min(w, h) * (0.06 + 0.44 * t)
-    x, y = (s - w) / 2, (s - h) / 2
+    t = max(0.0, min(1.0, t))
+    rnd = _r.Random(seed)
+    cx = cy = s / 2
+    W, H = s * 0.60, s * 0.78                         # an A4-like sheet
+    flat = []                                         # each side starts at a corner, so the sheet is square-cut
+    for (x0, y0), (x1, y1), n in (((-W / 2, -H / 2), (W / 2, -H / 2), 6), ((W / 2, -H / 2), (W / 2, H / 2), 8),
+                                  ((W / 2, H / 2), (-W / 2, H / 2), 6), ((-W / 2, H / 2), (-W / 2, -H / 2), 8)):
+        for j in range(n):
+            flat.append((x0 + (x1 - x0) * j / n, y0 + (y1 - y0) * j / n))
+    N = len(flat)
+    R = s * 0.27                                      # the ball
+    pts, shades = [], []
+    for i, (x, y) in enumerate(flat):
+        a = math.atan2(y, x) + (rnd.random() - 0.5) * 0.35
+        r = R * (0.72 + 0.42 * rnd.random())
+        bx, by = r * math.cos(a), r * math.sin(a)
+        lag = rnd.random() * 0.35
+        corner = 0.0 if abs(abs(x) - W / 2) < 1e-6 and abs(abs(y) - H / 2) < 1e-6 else 0.12
+        k = max(0.0, min(1.0, (t * (1 + lag + corner) - lag - corner * 0.5)))
+        e = k * k * (3 - 2 * k)
+        wob = math.sin(math.pi * e) * s * 0.07          # wrinkles while it's being squeezed
+        jx, jy = (rnd.random() - 0.5) * wob, (rnd.random() - 0.5) * wob
+        pts.append((cx + x + (bx - x) * e + jx, cy + y + (by - y) * e + jy))
+        shades.append(rnd.random())
+    poly = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
+    ox, oy = cx + (rnd.random() - 0.5) * s * 0.08 * t, cy + (rnd.random() - 0.5) * s * 0.08 * t
+    facets = ""
+    for i in range(N):                                # light and shadow on each fold
+        (x1, y1), (x2, y2) = pts[i], pts[(i + 1) % N]
+        dark = shades[i]
+        col = "#5b6573" if dark > 0.45 else "#ffffff"
+        op = t * (0.10 + 0.32 * abs(dark - 0.45))
+        facets += (f'<polygon points="{ox:.1f},{oy:.1f} {x1:.1f},{y1:.1f} {x2:.1f},{y2:.1f}" fill="{col}" '
+                   f'fill-opacity="{op:.2f}"/>')
     creases = ""
-    if t > 0.15:
-        import random as _r
-        rnd = _r.Random(7)
-        for _ in range(int(3 + 6 * t)):
-            x1, y1 = x + rnd.random() * w, y + rnd.random() * h
-            x2, y2 = x + rnd.random() * w, y + rnd.random() * h
-            creases += f'<path d="M{x1:.1f},{y1:.1f} L{x2:.1f},{y2:.1f}" stroke="#9aa3ad" stroke-width="1" opacity="{0.3 + 0.5 * t:.2f}"/>'
-    lines = "" if t > 0.4 else "".join(
-        f'<rect x="{x + w * 0.15:.1f}" y="{y + h * (0.2 + i * 0.14):.1f}" width="{w * 0.7:.1f}" height="{max(1, h * 0.04):.1f}" '
-        f'fill="#c9ced6" opacity="{1 - t * 2.5:.2f}"/>' for i in range(5))
-    badge = (f'<circle cx="{s * 0.78:.1f}" cy="{s * 0.22:.1f}" r="{s * 0.16:.1f}" fill="#ff7a1a" stroke="#fff" stroke-width="2"/>'
-             f'<text x="{s * 0.78:.1f}" y="{s * 0.28:.1f}" text-anchor="middle" font-size="{s * 0.18:.1f}" font-weight="800" '
+    if t > 0.08:
+        for _ in range(int(3 + 9 * t)):
+            i1, i2 = rnd.randrange(N), rnd.randrange(N)
+            (x1, y1), (x2, y2) = pts[i1], pts[i2]
+            mx = (x1 + x2) / 2 * 0.7 + ox * 0.3 + (rnd.random() - 0.5) * s * 0.06     # folds run inward
+            my = (y1 + y2) / 2 * 0.7 + oy * 0.3 + (rnd.random() - 0.5) * s * 0.06
+            creases += (f'<path d="M{x1:.1f},{y1:.1f} L{mx:.1f},{my:.1f} L{x2:.1f},{y2:.1f}" fill="none" '
+                        f'stroke="#8b94a1" stroke-width="0.8" opacity="{min(0.55, (t - 0.08) * 0.7):.2f}"/>')
+    lines = ""
+    if t < 0.5:                                       # the writing on the page fades as it folds
+        sc = 1 - t * 0.9
+        for i in range(6):
+            lw = W * (0.66 if i % 3 != 2 else 0.42) * sc
+            lines += (f'<rect x="{cx - W * 0.33 * sc:.1f}" y="{cy - H * 0.34 * sc + i * H * 0.12 * sc:.1f}" '
+                      f'width="{lw:.1f}" height="{max(1.0, H * 0.035 * sc):.1f}" rx="1" fill="#c3cad3" '
+                      f'opacity="{1 - t * 2:.2f}"/>')
+    shadow = (f'<ellipse cx="{cx:.1f}" cy="{cy + s * (0.40 - 0.12 * t):.1f}" rx="{s * (0.30 - 0.08 * t):.1f}" '
+              f'ry="{s * 0.04:.1f}" fill="#000" opacity="{0.10 + 0.08 * t:.2f}"/>')
+    badge = (f'<circle cx="{s * 0.80:.1f}" cy="{s * 0.20:.1f}" r="{s * 0.15:.1f}" fill="#ff7a1a" stroke="#fff" stroke-width="2"/>'
+             f'<text x="{s * 0.80:.1f}" y="{s * 0.26:.1f}" text-anchor="middle" font-size="{s * 0.17:.1f}" font-weight="800" '
              f'fill="#fff" font-family="Segoe UI, Ubuntu, Arial, sans-serif">{count}</text>') if count > 1 else ""
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}"><g transform="rotate({angle:.1f} {s / 2} {s / 2})">'
-            f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" rx="{r:.1f}" fill="#f8f9fb" stroke="#aab2bd" '
-            f'stroke-width="1.5"/>{lines}{creases}</g>{badge}</svg>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{s}" height="{s}">{shadow}'
+            f'<g transform="rotate({angle:.1f} {cx:.1f} {cy:.1f})">'
+            f'<polygon points="{poly}" fill="#f8f9fb" stroke="#9aa3ad" stroke-width="1.2" stroke-linejoin="round"/>'
+            f'{lines}{facets}{creases}</g>{badge}</svg>')
+
+
+# How long the paper-ball takes (Settings → Appearance → Trash animation speed)
+TRASH_ANIM_SPEEDS = [("slow", "🐢 Slow", 1.7), ("normal", "Normal", 1.0), ("fast", "⚡ Fast", 0.5)]
+
+
+def _trash_anim_scale(win):
+    want = win.cfg.get("trash_anim_speed", "normal")
+    return next((f for k, _l, f in TRASH_ANIM_SPEEDS if k == want), 1.0)
+
+
+def animations_on(win):
+    return bool(win.cfg.get("animations", True)) and \
+        bool(Gtk.Settings.get_default().get_property("gtk-enable-animations"))
 
 
 def _svg_pixbuf(svg):
@@ -20735,37 +20992,101 @@ def _svg_pixbuf(svg):
 
 
 def fly_to_trash(win, start, count):
-    """The paper ball: crumple at the file (0.25 s), then an arc into the sidebar's Trash, which jumps (0.6 s)."""
+    """The paper ball: the sheet crumples slowly at the file, then flies in an arc into the sidebar's Trash,
+    which jumps as it lands. Speed: Settings → Appearance → Trash animation speed."""
     target_row = getattr(win, "trash_row", None)
     if target_row is None or not target_row.get_mapped():
         return
     tx, ty = target_row.translate_coordinates(win.overlay, 18, target_row.get_allocated_height() // 2) or (0, 0)
     sx, sy = start
-    size = 60
+    size = 72
+    f = _trash_anim_scale(win)
+    crumple, hold, fly = 1.0 * f, 0.15 * f, 0.75 * f
     img = Gtk.Image(halign=Gtk.Align.START, valign=Gtk.Align.START)
     win.overlay.add_overlay(img)
     win.overlay.set_overlay_pass_through(img, True)
     img.show()
     t0 = time.time()
-    crumple, fly = 0.25, 0.6
     arc = max(30, min(140, min(sy, ty) - size))                     # stays inside the window
 
     def frame():
         t = time.time() - t0
         if t < crumple:
             k = t / crumple
-            pb = _svg_pixbuf(_paper_svg(k, k * 40, count, size))
+            k = 1 - (1 - k) ** 2                                    # quick grab, then slow squeezing
+            pb = _svg_pixbuf(_paper_svg(k, k * 25, count, size))
             x, y = sx, sy
-        elif t < crumple + fly:
-            k = (t - crumple) / fly
+        elif t < crumple + hold:                                    # a last squeeze
+            pb = _svg_pixbuf(_paper_svg(1, 25, count, int(size * 0.96)))
+            x, y = sx, sy
+        elif t < crumple + hold + fly:
+            k = (t - crumple - hold) / fly
             ease = k * k * (3 - 2 * k)
             x = sx + (tx - sx) * ease
             y = sy + (ty - sy) * ease - math.sin(math.pi * ease) * arc       # the arc
-            pb = _svg_pixbuf(_paper_svg(1, 40 + k * 540, count, int(size * (1 - 0.45 * k))))
+            pb = _svg_pixbuf(_paper_svg(1, 25 + k * 540, count, int(size * (1 - 0.5 * k))))
         else:
             win.overlay.remove(img)
             _bounce(target_row)
             return False
+        img.set_from_pixbuf(pb)
+        img.set_margin_start(max(0, int(x - pb.get_width() / 2)))
+        img.set_margin_top(max(0, int(y - pb.get_height() / 2)))
+        return True
+    GLib.timeout_add(16, frame)
+
+
+def fly_from_trash(win, count, landed=None):
+    """Restoring: the reverse. A ball hops out of the sidebar's Trash, flies back over the files, lands (the folder
+    it came from opens), then unfolds into a flat sheet and fades away."""
+    row = getattr(win, "trash_row", None)
+    if row is None or not row.get_mapped():
+        if landed:
+            landed()
+        return
+    sx, sy = row.translate_coordinates(win.overlay, 18, row.get_allocated_height() // 2) or (0, 0)
+    a = win.lib_stack.get_allocation()
+    tx, ty = win.lib_stack.translate_coordinates(win.overlay, a.width // 2, a.height // 3) or (sx + 300, sy)
+    size = 72
+    f = _trash_anim_scale(win)
+    fly, unfold, fade = 0.75 * f, 1.0 * f, 0.35 * f
+    _bounce(row)
+    img = Gtk.Image(halign=Gtk.Align.START, valign=Gtk.Align.START)
+    win.overlay.add_overlay(img)
+    win.overlay.set_overlay_pass_through(img, True)
+    img.show()
+    t0 = time.time()
+    arc = max(30, min(140, min(sy, ty) - size))
+    state = {"landed": False}
+
+    def frame():
+        t = time.time() - t0
+        if t < fly:
+            k = t / fly
+            ease = k * k * (3 - 2 * k)
+            x = sx + (tx - sx) * ease
+            y = sy + (ty - sy) * ease - math.sin(math.pi * ease) * arc
+            pb = _svg_pixbuf(_paper_svg(1, 565 - k * 540, count, int(size * (0.5 + 0.5 * k))))
+        else:
+            if not state["landed"]:
+                state["landed"] = True
+                if landed:
+                    try:
+                        landed()                                    # the folder it came from opens underneath
+                    except Exception:
+                        pass
+            x, y = tx, ty
+            if t < fly + unfold:
+                k = (t - fly) / unfold
+                k = k * k                                           # slow at first, then it springs open
+                pb = _svg_pixbuf(_paper_svg(1 - k, 25 * (1 - k), count, size))
+            elif t < fly + unfold + fade:
+                k = (t - fly - unfold) / fade
+                pb = _svg_pixbuf(_paper_svg(0, 0, count, size))
+                img.set_opacity(1 - k)
+            else:
+                win.overlay.remove(img)
+                return False
         img.set_from_pixbuf(pb)
         img.set_margin_start(max(0, int(x - pb.get_width() / 2)))
         img.set_margin_top(max(0, int(y - pb.get_height() / 2)))
@@ -20829,6 +21150,10 @@ def settings_entries(win):
           ("appearance", "Animations", "The paper ball that flies into the Trash, and other small motions.", "switch",
            lambda: win.cfg.get("animations", True),
            lambda v: (win.cfg.__setitem__("animations", v), write_json(CONFIG_FILE, win.cfg))),
+          ("appearance", "Trash animation speed", "How fast the paper crumples into a ball and flies into the Trash "
+           "(and back out when you restore).", "choice", [(k, label) for k, label, _f in TRASH_ANIM_SPEEDS],
+           lambda: win.cfg.get("trash_anim_speed", "normal"),
+           lambda k: (win.cfg.__setitem__("trash_anim_speed", k), write_json(CONFIG_FILE, win.cfg))),
           ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
            "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
           ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
@@ -22725,6 +23050,24 @@ class MainWindow(Gtk.ApplicationWindow):
             a = pane.get_allocation()
             return pane.translate_coordinates(self.overlay, a.width // 2, a.height // 3) or (200, 200)
 
+    def after_restore(self, paths):
+        """Back where they came from: open that folder (on whichever drive) with the restored files selected."""
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        folder = os.path.dirname(paths[0])
+        same = [p for p in paths if os.path.dirname(p) == folder]
+
+        def land():
+            self.show_files()
+            pane = self.active
+            pane.pending_select = list(same)
+            pane.go(folder)
+        if animations_on(self):
+            fly_from_trash(self, len(paths), land)
+        else:
+            land()
+
     def show_library(self, section):
         self.lib_stack.set_visible_child_name("library")
         self.library.show(section)
@@ -23939,7 +24282,7 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.refresh()
 
     def trash(self, pane, paths):
-        if paths and self.cfg.get("animations", True) and Gtk.Settings.get_default().get_property("gtk-enable-animations"):
+        if paths and animations_on(self):
             fly_to_trash(self, self._trash_start_point(pane), len(paths))     # crumple, fly into the Trash
         done = 0
         for p in paths:
