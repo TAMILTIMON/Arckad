@@ -53,7 +53,7 @@ jobs:
             pacman -S --noconfirm --needed mingw-w64-ucrt-x86_64-gcc
             python -m pip install --break-system-packages pyinstaller
           }
-          python -m pip install --break-system-packages qrcode
+          python -m pip install --break-system-packages qrcode pypdf
 
       - name: Build Arckad-D.exe
         shell: msys2 {0}

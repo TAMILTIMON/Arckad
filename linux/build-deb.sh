@@ -15,6 +15,11 @@ src = open("arckad-d.py", encoding="utf-8").read()
 svg = re.search(r'LOGO_SVG = """(.*?)"""', src, re.S).group(1)
 open(sys.argv[1] + "/usr/share/icons/hicolor/scalable/apps/arckad-d.svg", "w").write(svg)
 EOF
+if [ -d branding/fonts ]; then
+  # the monochrome icon font (Noto Emoji, SIL Open Font License) for the “Professional” icons
+  install -d "$PKG/opt/arckad-d/fonts"
+  install -m 644 branding/fonts/* "$PKG/opt/arckad-d/fonts/"
+fi
 if [ -f branding/logo.png ]; then
   # your own logo (branding/logo.png): the app shows it, and the menu icons are made from it
   python3 branding/make-icons.py

@@ -54,11 +54,69 @@ def _clear_forced_theme():
             theme = json.load(f).get("theme", "midnight")
     except (OSError, ValueError, AttributeError):
         theme = "midnight"
-    if theme in ("midnight", "snow", "mono") or theme.startswith(("dark-", "light-")):
+    if theme in ("midnight", "snow", "mono", "glass", "contrast") or theme.startswith(("dark-", "light-")):
         os.environ.pop("GTK_THEME", None)
 
 
 _clear_forced_theme()
+
+
+def _font_dir():
+    """Arckad-D's own fonts (the monochrome icon font), wherever this copy of Arckad-D is installed."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.path.join(getattr(sys, "_MEIPASS", here), "fonts"), os.path.join(here, "branding", "fonts"),
+              os.path.join(here, "fonts"), "/opt/arckad-d/fonts"):
+        if os.path.isfile(os.path.join(d, "NotoEmoji.ttf")):
+            return d
+    return None
+
+
+def _professional_icons():
+    """“Professional” icons: emoji drawn as clean single-colour line icons that take the theme's text colour,
+    instead of colourful phone emoji. Linux: a font setup for Arckad-D alone (other apps are untouched)."""
+    base = (os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) if sys.platform == "win32" else \
+        (os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+    try:
+        with open(os.path.join(base, "arckad-d", "config.json"), encoding="utf-8") as f:
+            style = json.load(f).get("icon_style", "pro")
+    except (OSError, ValueError, AttributeError):
+        style = "pro"
+    fonts = _font_dir()
+    if style != "pro" or not fonts:
+        return None
+    if sys.platform == "win32":
+        try:                                               # loaded for this program only
+            import ctypes
+            ctypes.windll.gdi32.AddFontResourceExW(os.path.join(fonts, "NotoEmoji.ttf"), 0x10, 0)
+        except Exception:
+            pass
+        return "win"
+    if os.environ.get("FONTCONFIG_FILE"):
+        return None                                        # someone set up fonts on purpose: leave it alone
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "arckad-d")
+    try:
+        os.makedirs(cache, exist_ok=True)
+        conf = os.path.join(cache, "fonts.conf")
+        rejects = "".join(f"<pattern><patelt name=\"family\"><string>{n}</string></patelt></pattern>"
+                          for n in ("Noto Color Emoji", "Apple Color Emoji", "Twitter Color Emoji", "Twemoji",
+                                    "JoyPixels", "EmojiOne Color", "Segoe UI Emoji", "Blobmoji"))
+        xml = ("<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n<fontconfig>\n"
+               "  <include ignore_missing=\"yes\">/etc/fonts/fonts.conf</include>\n"
+               f"  <dir>{fonts}</dir>\n"
+               f"  <selectfont><rejectfont>{rejects}</rejectfont></selectfont>\n"
+               "  <alias binding=\"strong\"><family>emoji</family><prefer><family>Noto Emoji</family></prefer></alias>\n"
+               "</fontconfig>\n")
+        old = open(conf, encoding="utf-8").read() if os.path.exists(conf) else ""
+        if old != xml:
+            with open(conf, "w", encoding="utf-8") as f:
+                f.write(xml)
+        os.environ["FONTCONFIG_FILE"] = conf               # read once when GTK starts; removed again right after,
+        return "linux"                                     # so apps opened from Arckad-D keep their usual fonts
+    except OSError:
+        return None
+
+
+ICON_FONTS = _professional_icons()
 if sys.platform == "win32":
     os.environ.setdefault("GDK_WIN32_USE_EXPERIMENTAL_OLE2_DND", "1")     # drops from Explorer and other apps
 
@@ -97,7 +155,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.62.2"
+APP_VERSION = "3.63.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -23378,6 +23436,12 @@ def settings_entries(win):
            "Open…", win.people_directory),
           ("org", "Announcement", "Send one notice to all your contacts (or everyone in your organisation).", "button",
            "Send…", win.announce_dialog),
+          ("appearance", "Icons", "Professional: clean single-colour line icons that match the theme. Colourful: the "
+           "phone-style emoji. (Takes effect when Arckad-D starts again.)", "choice",
+           [("pro", "Professional (line icons)"), ("emoji", "Colourful (emoji)")],
+           lambda: win.cfg.get("icon_style", "pro"),
+           lambda k: (win.cfg.__setitem__("icon_style", k), write_json(CONFIG_FILE, win.cfg),
+                      win.confirm("Restart Arckad-D now to change the icons?") and win.restart_app())),
           ("appearance", "Your accent colour", "Pick any colour for buttons and highlights (then choose “Your colour” "
            "as the theme).", "button", "Choose…", win.choose_accent),
           ("appearance", "Wallpaper behind your files", "A picture behind the file list, softened so names stay easy to "
@@ -23808,6 +23872,83 @@ def make_custom_skins(colour):
 make_custom_skins("#14b8a6")
 
 
+def make_glass_skin():
+    """🪟 Glass: pure white, see-through panels, soft edges and a calm blue. Pop-ups and dialogs stay solid white."""
+    s = _accent_skin("snow", "#2563eb")
+    s.update(bg="#f6f8fb", bg2="#ffffff", surface="#ffffff", surface_hi="#f3f6fb", side="#f7f9fc", text="#0f172a",
+             dim="#5b6475", border="rgba(15,23,42,0.10)", hdr1="#ffffff", hdr2="#f6f8fb", btn1="#ffffff", btn2="#f4f6fa",
+             menu="#ffffff", scroll="rgba(15,23,42,0.22)", glow="rgba(37,99,235,0.22)", glow_soft="rgba(37,99,235,0.09)",
+             glass=True)
+    SKINS["glass"] = s
+
+
+make_glass_skin()
+
+# Only Arckad-D's own windows are see-through (they're given a transparent canvas); everything else stays solid.
+_GLASS_CSS = """
+window.glass-window.background { background-color: rgba(255,255,255,0.72); background-image: none; }
+window.glass-window decoration { background-color: transparent; background-image: none; }
+window.glass-window headerbar, window.glass-window .titlebar { background-color: rgba(255,255,255,0.55);
+  background-image: none; border-bottom: 1px solid rgba(255,255,255,0.55); box-shadow: 0 1px 0 rgba(15,23,42,0.05); }
+window.glass-window .arckad-sidebar, window.glass-window .arckad-sidebar row { background-color: rgba(255,255,255,0.10); }
+window.glass-window .arckad-sidebar row:selected { background-color: #2563eb;
+  background-image: linear-gradient(to right, #2563eb, #3b7bff); }
+window.glass-window list, window.glass-window scrolledwindow, window.glass-window viewport,
+window.glass-window notebook > stack { background-color: transparent; }
+window.glass-window notebook > header { background-color: rgba(255,255,255,0.30); background-image: none;
+  border-color: rgba(255,255,255,0.5); }
+window.glass-window treeview.view, window.glass-window iconview { background-color: rgba(255,255,255,0.80); }
+window.glass-window treeview.view header button { background-color: rgba(255,255,255,0.55); background-image: none; }
+window.glass-window infobar, window.glass-window infobar > revealer > box { background-color: rgba(255,255,255,0.45); }
+window.glass-window button { background-color: rgba(255,255,255,0.62); background-image: none;
+  border: 1px solid rgba(255,255,255,0.75); box-shadow: 0 1px 3px rgba(15,23,42,0.10), inset 0 1px rgba(255,255,255,0.9); }
+window.glass-window button:hover { background-color: rgba(255,255,255,0.92); border-color: rgba(37,99,235,0.40); }
+window.glass-window button.suggested-action, window.glass-window button:checked {
+  background-image: linear-gradient(to bottom, #3b7bff, #2563eb); border-color: #1d4ed8; }
+window.glass-window entry, window.glass-window combobox button { background-color: rgba(255,255,255,0.72);
+  box-shadow: inset 0 1px 2px rgba(15,23,42,0.06); }
+window.glass-window paned > separator { background-color: rgba(255,255,255,0.35); }
+window.glass-window .fm-preview, window.glass-window .fm-preview viewport { background-color: rgba(255,255,255,0.30); }
+menu, .menu, popover, popover.background, tooltip, tooltip.background, dialog, messagedialog,
+window.popup { background-color: #ffffff; background-image: none; }
+"""
+
+
+def glass_canvas(window):
+    """Gives a window a see-through canvas when the desktop can show one (a compositor), for the Glass theme."""
+    try:
+        scr = window.get_screen()
+        vis = scr.get_rgba_visual()
+        if vis is not None and scr.is_composited():
+            window.set_visual(vis)                          # GTK still draws the (see-through) background itself
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def windows_backdrop(window, on):
+    """Windows 11: ask Windows to blur what's behind Arckad-D's window (its own “acrylic” glass)."""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        gdkwin = window.get_window()
+        if gdkwin is None:
+            return
+        ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+        ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+        ptr = ctypes.pythonapi.PyCapsule_GetPointer(gdkwin.__gpointer__, None)
+        gdk = ctypes.CDLL("libgdk-3-0.dll")
+        gdk.gdk_win32_window_get_handle.restype = ctypes.c_void_p
+        gdk.gdk_win32_window_get_handle.argtypes = [ctypes.c_void_p]
+        hwnd = gdk.gdk_win32_window_get_handle(ptr)
+        value = ctypes.c_int(3 if on else 1)               # 3 = acrylic, 1 = none
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), 38, ctypes.byref(value), 4)
+    except Exception:
+        pass
+
+
 def make_contrast_skin():
     """♿ High contrast: pure black, white text, bright yellow highlights, strong borders."""
     s = _accent_skin("midnight", "#ffe500")
@@ -23821,7 +23962,7 @@ def make_contrast_skin():
 make_contrast_skin()
 
 _SKIN_TEMPLATE = """
-* { font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", sans-serif; }
+* { font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", $emoji_font sans-serif; }
 window, dialog, messagedialog, .background { background-color: $bg; color: $text; }
 window.background { background-image: radial-gradient(circle at 100% 0%, $glow_soft, transparent 42%),
                                       linear-gradient(to bottom, $bg2, $bg); }
@@ -23935,7 +24076,11 @@ def skin_color(key):
 
 def skin_css(name):
     from string import Template
-    return Template(_SKIN_TEMPLATE).safe_substitute(SKINS[name]).encode()
+    s = dict(SKINS[name], emoji_font='"Noto Emoji",' if ICON_FONTS else "")
+    css = Template(_SKIN_TEMPLATE).safe_substitute(s)
+    if s.get("glass"):
+        css += Template(_GLASS_CSS).safe_substitute(s)
+    return css.encode()
 
 
 def recent_downloads_in(folder, minutes=30, limit=12):
@@ -25627,7 +25772,11 @@ GUIDE = [
         ("🔗", "Linked devices", "Use the same chats on your phone and other PCs.", "Chat → ⋮ → Linked devices", "", None),
     ]),
     ("look", "🎨", "Look & feel", "Make Arckad-D yours.", [
-        ("🎨", "Themes", "Dark and light in many colours, mono, high contrast, or follow the system.",
+        ("🪟", "Glass theme", "Pure white and see-through, like frosted glass. On Windows 11 the desktop behind is "
+         "blurred too.", "Theme button → Glass", "", lambda w: w.theme_items["glass"].set_active(True)),
+        ("✒", "Professional icons", "Clean single-colour line icons that match the theme, instead of colourful phone "
+         "emoji (switch back any time).", "Settings → Appearance → Icons", "", None),
+        ("🎨", "Themes", "Dark and light in many colours, glass, mono, high contrast, or follow the system.",
          "Theme button in the title bar", "Ctrl+Shift+D", lambda w: w.cycle_theme()),
         ("🖌", "Your own accent colour", "Any colour you like for buttons and highlights.", "Settings → Appearance", "",
          lambda w: w.choose_accent()),
@@ -25659,6 +25808,8 @@ GUIDE = [
 ]
 
 WHATS_NEW = [
+    ("3.63", "Professional line icons everywhere, the new Glass theme (white, see-through, blurred on Windows 11), "
+             "PDF tools built into the Windows app, optional features on Windows, Move out of the vault"),
     ("3.62", "See and control your PC from the phone (full screen, touch), the phone as a remote for slides, music "
              "and volume, and reply to phone messages from a pop-up on the PC"),
     ("3.61", "PDF tools, media tools, similar photos, ransomware guard, scheduled backups, scan with the phone, phone "
@@ -26558,6 +26709,7 @@ class MainWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title=APP_NAME)
         self.cfg = read_json(CONFIG_FILE, {})
         load_custom_tags(self.cfg)
+        self._glass_ok = glass_canvas(self)
         for key, default in (("pinned", []), ("show_hidden", False), ("view", "list"), ("dual", False),
                              ("preview", True), ("autosort", False), ("autosort_background", False),
                              ("autosort_delay", 5)):
@@ -26611,6 +26763,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.setup_clip_sync()
         TEAM.start(self)
         GUARD.start(self)
+        if ICON_FONTS == "linux":
+            GLib.timeout_add(2500, lambda: os.environ.pop("FONTCONFIG_FILE", None) and False)
         BACKUPS.start(self)
         self.apply_text_size()
         GLib.timeout_add(1500, lambda: self.label_for_readers() and False)
@@ -27331,6 +27485,29 @@ class MainWindow(Gtk.ApplicationWindow):
         d.destroy()
         return False
 
+    def restart_app(self):
+        """Start a fresh Arckad-D and close this one (for changes that need a new start)."""
+        env = dict(os.environ)
+        env.pop("FONTCONFIG_FILE", None)
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable]
+        elif shutil.which("arckad-d") and INSTALLED:
+            cmd = ["arckad-d"]
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__)]
+        if IS_WIN:                                          # starts a moment after this copy has closed
+            later = ["cmd", "/c", "ping -n 3 127.0.0.1 >nul & start \"\" " + " ".join(f'"{c}"' for c in cmd)]
+        else:
+            later = ["sh", "-c", 'sleep 1.5; exec "$0" "$@"'] + cmd
+        try:
+            subprocess.Popen(later, start_new_session=not IS_WIN, env=env,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as ex:
+            return self.error(f"Couldn't restart: {ex}. Please close and open {APP_NAME} again.")
+        self.quitting = True
+        self.on_close()
+        self.get_application().quit()
+
     def _deb_installed(self, dlg, ok, msg, path):
         dlg.destroy()
         self.update_bar.set_revealed(False)
@@ -27349,7 +27526,8 @@ class MainWindow(Gtk.ApplicationWindow):
               [(f"dark-{k}", i, f"Dark · {n}") for k, i, n, d, _l in ACCENTS if d] +
               [("snow", "🔆", "Light · Orange")] +
               [(f"light-{k}", i, f"Light · {n}") for k, i, n, d, _l in ACCENTS if d] +
-              [("dark-custom", "🎨", "Dark · Your colour"), ("light-custom", "🎨", "Light · Your colour"),
+              [("glass", "🪟", "Glass (white, see-through)"),
+               ("dark-custom", "🎨", "Dark · Your colour"), ("light-custom", "🎨", "Light · Your colour"),
                ("contrast", "♿", "High contrast"),
                ("mono", "◐", "Mono (black + white)"), ("system", "🖥", "Classic: follow system"),
                ("light", "☀", "Classic light"), ("dark", "🌙", "Classic dark")])
@@ -27500,6 +27678,8 @@ class MainWindow(Gtk.ApplicationWindow):
         skin = SKINS.get(self.cfg.get("theme"))
         dark = skin["dark"] if skin else Gtk.Settings.get_default().get_property("gtk-application-prefer-dark-theme")
         base = (skin or {}).get("bg2") or ("#1b1b20" if dark else "#ffffff")
+        if not str(base).startswith("#"):
+            base = "#ffffff"
         r, g, b = (round(v * 255) for v in _rgb(base))
         veil = f"rgba({r},{g},{b},{0.80 if dark else 0.82})"
         uri = Path(path).as_uri()
@@ -27512,6 +27692,10 @@ class MainWindow(Gtk.ApplicationWindow):
             self._wall_css.load_from_data(b"")
 
     def apply_theme(self, mode):
+        glass = mode == "glass" and getattr(self, "_glass_ok", False)
+        for w in [self] + [t for t in Gtk.Window.list_toplevels() if isinstance(t, TabWindow)]:
+            (w.get_style_context().add_class if glass else w.get_style_context().remove_class)("glass-window")
+        GLib.idle_add(lambda: windows_backdrop(self, glass) or False)
         if mode == "dark-custom" or mode == "light-custom":
             make_custom_skins(self.cfg.get("custom_accent", "#14b8a6"))
         GLib.idle_add(lambda: self.apply_wallpaper() or False)

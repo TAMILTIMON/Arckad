@@ -48,7 +48,8 @@ a = Analysis(
            if os.path.exists(os.path.join(here, "..", "branding", "logo.png")) else []) + [
            (os.path.join(here, "arckad-d.png"), "."),
            (os.path.join(here, "arckad-d.ico"), "."),
-           (os.path.join(root, "emoji"), "emoji")],
+           (os.path.join(root, "emoji"), "emoji"),
+           (os.path.join(root, "branding", "fonts"), "fonts")],
     hiddenimports=["pypdf", "gi.repository.Gtk", "gi.repository.Gdk", "gi.repository.GdkPixbuf",
                    "gi.repository.Gio", "gi.repository.GLib", "gi.repository.GObject",
                    "gi.repository.Pango", "qrcode", "winreg"],
