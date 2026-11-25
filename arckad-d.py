@@ -84,15 +84,47 @@ def _professional_icons():
     fonts = _font_dir()
     if style != "pro" or not fonts:
         return None
-    if sys.platform == "win32":
-        try:                                               # loaded for this program only
-            import ctypes
-            ctypes.windll.gdi32.AddFontResourceExW(os.path.join(fonts, "NotoEmoji.ttf"), 0x10, 0)
-        except Exception:
-            pass
-        return "win"
     if os.environ.get("FONTCONFIG_FILE"):
         return None                                        # someone set up fonts on purpose: leave it alone
+    rejects = "".join(f"<pattern><patelt name=\"family\"><string>{n}</string></patelt></pattern>"
+                      for n in ("Noto Color Emoji", "Apple Color Emoji", "Twitter Color Emoji", "Twemoji", "JoyPixels",
+                                "EmojiOne Color", "Segoe UI Emoji", "Blobmoji"))
+    if sys.platform == "win32":
+        # GTK on Windows normally draws text with Windows' own font system, which always picks the colourful
+        # “Segoe UI Emoji”. For Arckad-D alone it switches to fontconfig (as GIMP on Windows does), reads the
+        # Windows fonts and sets the colour emoji font aside. Text stays in Segoe UI.
+        cache = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "Arckad-D")
+        try:
+            os.makedirs(os.path.join(cache, "fontcache"), exist_ok=True)
+            conf = os.path.join(cache, "fonts.conf")
+            xml = ("<?xml version=\"1.0\"?>\n<!DOCTYPE fontconfig SYSTEM \"fonts.dtd\">\n<fontconfig>\n"
+                   "  <dir>WINDOWSFONTDIR</dir>\n  <dir>WINDOWSUSERFONTDIR</dir>\n"
+                   f"  <dir>{fonts}</dir>\n"
+                   f"  <cachedir>{os.path.join(cache, 'fontcache')}</cachedir>\n"
+                   f"  <selectfont><rejectfont>{rejects}</rejectfont></selectfont>\n"
+                   "  <alias><family>sans-serif</family><prefer><family>Segoe UI</family><family>Arial</family>"
+                   "</prefer></alias>\n"
+                   "  <alias><family>serif</family><prefer><family>Cambria</family><family>Times New Roman</family>"
+                   "</prefer></alias>\n"
+                   "  <alias><family>monospace</family><prefer><family>Cascadia Mono</family><family>Consolas</family>"
+                   "<family>Courier New</family></prefer></alias>\n"
+                   "  <alias binding=\"strong\"><family>emoji</family><prefer><family>Noto Emoji</family></prefer>"
+                   "</alias>\n"
+                   "  <match target=\"font\"><edit name=\"antialias\" mode=\"assign\"><bool>true</bool></edit>"
+                   "<edit name=\"hinting\" mode=\"assign\"><bool>true</bool></edit>"
+                   "<edit name=\"hintstyle\" mode=\"assign\"><const>hintslight</const></edit>"
+                   "<edit name=\"rgba\" mode=\"assign\"><const>rgb</const></edit>"
+                   "<edit name=\"lcdfilter\" mode=\"assign\"><const>lcddefault</const></edit></match>\n"
+                   "</fontconfig>\n")
+            old = open(conf, encoding="utf-8").read() if os.path.exists(conf) else ""
+            if old != xml:
+                with open(conf, "w", encoding="utf-8") as f:
+                    f.write(xml)
+            os.environ["FONTCONFIG_FILE"] = conf
+            os.environ["PANGOCAIRO_BACKEND"] = "fc"            # text through fontconfig, for this program only
+            return "win"
+        except OSError:
+            return None
     cache = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "arckad-d")
     try:
         os.makedirs(cache, exist_ok=True)
@@ -183,7 +215,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.63.1"
+APP_VERSION = "3.63.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -23468,8 +23500,7 @@ def settings_entries(win):
            "phone-style emoji. (Takes effect when Arckad-D starts again.)", "choice",
            [("pro", "Professional (line icons)"), ("emoji", "Colourful (emoji)")],
            lambda: win.cfg.get("icon_style", "pro"),
-           lambda k: (win.cfg.__setitem__("icon_style", k), write_json(CONFIG_FILE, win.cfg),
-                      win.confirm("Restart Arckad-D now to change the icons?") and win.restart_app())),
+           lambda k: win.set_icon_style(k)),
           ("appearance", "Your accent colour", "Pick any colour for buttons and highlights (then choose “Your colour” "
            "as the theme).", "button", "Choose…", win.choose_accent),
           ("appearance", "Wallpaper behind your files", "A picture behind the file list, softened so names stay easy to "
@@ -23617,6 +23648,22 @@ class SettingsWindow(Gtk.Window):
         sw.show_all()
         return sw
 
+    @staticmethod
+    def _wheel_to_page(widget, ev):
+        """The mouse wheel over a drop-down scrolls the page instead of changing the drop-down."""
+        sw = widget.get_ancestor(Gtk.ScrolledWindow)
+        if sw is not None:
+            adj = sw.get_vadjustment()
+            ok, _dx, dy = ev.get_scroll_deltas()
+            if ev.direction == Gdk.ScrollDirection.UP:
+                dy = -1
+            elif ev.direction == Gdk.ScrollDirection.DOWN:
+                dy = 1
+            step = adj.get_step_increment() or 40
+            adj.set_value(max(adj.get_lower(), min(adj.get_upper() - adj.get_page_size(),
+                                                   adj.get_value() + dy * step * 2)))
+        return True
+
     def _card(self, e, show_cat=False):
         cat, title, desc, kind = e[:4]
         card = Gtk.Box(spacing=12)
@@ -23638,6 +23685,7 @@ class SettingsWindow(Gtk.Window):
                     c.append(k, label)
                 c.set_active_id(e[5]())
                 c.connect("changed", lambda cb, setter=e[6]: cb.get_active_id() and setter(cb.get_active_id()))
+                c.connect("scroll-event", self._wheel_to_page)    # scrolling past it must not change it
                 card.add(c)
             elif kind == "button":
                 b = Gtk.Button(label=e[4], valign=Gtk.Align.CENTER)
@@ -26791,8 +26839,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.setup_clip_sync()
         TEAM.start(self)
         GUARD.start(self)
-        if ICON_FONTS == "linux":
-            GLib.timeout_add(2500, lambda: os.environ.pop("FONTCONFIG_FILE", None) and False)
+        if ICON_FONTS:
+            GLib.timeout_add(2500, lambda: (os.environ.pop("FONTCONFIG_FILE", None),
+                                            os.environ.pop("PANGOCAIRO_BACKEND", None)) and False)
         BACKUPS.start(self)
         self.apply_text_size()
         GLib.timeout_add(1500, lambda: self.label_for_readers() and False)
@@ -27513,10 +27562,19 @@ class MainWindow(Gtk.ApplicationWindow):
         d.destroy()
         return False
 
+    def set_icon_style(self, k):
+        if k == self.cfg.get("icon_style", "pro"):
+            return                                          # nothing changed: nothing to do
+        self.cfg["icon_style"] = k
+        write_json(CONFIG_FILE, self.cfg)
+        if self.confirm("The new icons appear when Arckad-D starts again.\n\nRestart it now?"):
+            self.restart_app()
+
     def restart_app(self):
         """Start a fresh Arckad-D and close this one (for changes that need a new start)."""
         env = dict(os.environ)
         env.pop("FONTCONFIG_FILE", None)
+        env.pop("PANGOCAIRO_BACKEND", None)
         if getattr(sys, "frozen", False):
             cmd = [sys.executable]
         elif shutil.which("arckad-d") and INSTALLED:
