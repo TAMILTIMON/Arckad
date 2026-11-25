@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.57.0"
+APP_VERSION = "3.57.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20586,31 +20586,68 @@ def trash_delete(item):
     Path(item["info"]).unlink(missing_ok=True)
 
 
-def _ps(script, timeout=60):
+def _ps(script, timeout=90):
+    """Runs PowerShell and reads its output as UTF-8 (names in any language come through intact)."""
+    script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; " + script
     r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
-                       text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                       encoding="utf-8", errors="replace", timeout=timeout,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return r.stdout
 
 
+# Every item is read on its own (one odd item can't drop the others) and the date is the real "Date deleted".
+_WIN_TRASH_PS = r"""
+$s = New-Object -ComObject Shell.Application
+$out = @()
+foreach ($i in $s.NameSpace(10).Items()) {
+  try {
+    $d = $null; try { $d = $i.ExtendedProperty('System.Recycle.DateDeleted') } catch {}
+    if (-not $d) { try { $d = $i.ModifyDate } catch {} }
+    $ds = ''; if ($d) { try { $ds = ([datetime]$d).ToString('s') } catch {} }
+    $f = ''; try { $f = [string]$i.ExtendedProperty('System.Recycle.DeletedFrom') } catch {}
+    $sz = 0; try { $sz = [int64]$i.ExtendedProperty('System.Size') } catch {}
+    if (-not $sz) { try { $sz = [int64]$i.Size } catch {} }
+    $out += [pscustomobject]@{n = [string]$i.Name; p = [string]$i.Path; f = $f; d = $ds; s = $sz; dir = [bool]$i.IsFolder}
+  } catch {}
+}
+ConvertTo-Json -InputObject $out -Compress -Depth 3
+"""
+
+
 def _win_trash_items():
+    import ntpath                                            # Windows path rules, whatever we run on
     try:
-        out = _ps("$s=New-Object -ComObject Shell.Application; @($s.NameSpace(10).Items() | ForEach-Object { "
-                  "[pscustomobject]@{n=$_.Name; p=$_.Path; f=$_.ExtendedProperty('System.Recycle.DeletedFrom'); "
-                  "d=(Get-Item -LiteralPath $_.Path).LastWriteTime.ToString('s'); s=$_.Size; dir=$_.IsFolder } }) | "
-                  "ConvertTo-Json -Compress")
-        data = json.loads(out or "[]")
+        out = _ps(_WIN_TRASH_PS)
+        start = (out or "").find("[")
+        data = json.loads(out[start:] if start >= 0 else "[]")
     except (OSError, ValueError, subprocess.SubprocessError):
         return []
     if isinstance(data, dict):
         data = [data]
     items = []
-    for d in data:
+    for d in data or []:
         try:
-            when = time.mktime(time.strptime(str(d.get("d", ""))[:19], "%Y-%m-%dT%H:%M:%S"))
-        except ValueError:
-            when = 0
-        items.append({"key": d.get("p", ""), "name": d.get("n", "?"), "orig": os.path.join(d.get("f") or "", d.get("n", "")),
-                      "when": when, "size": int(d.get("s") or 0), "is_dir": bool(d.get("dir")), "info": ""})
+            path, name = str(d.get("p") or ""), str(d.get("n") or "?")
+            is_dir = bool(d.get("dir"))
+            ext = ntpath.splitext(path)[1]                      # Explorer may hide extensions: take it from the file
+            if ext and not is_dir and not name.lower().endswith(ext.lower()):
+                name += ext
+            try:
+                when = time.mktime(time.strptime(str(d.get("d") or "")[:19], "%Y-%m-%dT%H:%M:%S"))
+            except (ValueError, OverflowError):
+                when = 0.0
+            if not when:
+                try:
+                    when = os.path.getmtime(path)
+                except OSError:
+                    when = 0.0
+            frm = str(d.get("f") or "")
+            orig = ntpath.join(frm, name) if frm else name
+            drive = ntpath.splitdrive(frm or path)[0]
+            items.append({"key": path, "name": name, "orig": orig, "when": when, "size": int(d.get("s") or 0),
+                          "is_dir": is_dir, "info": "", "drive": (drive + "\\") if drive else ""})
+        except Exception:
+            continue
     items.sort(key=lambda i: -i["when"])
     return items
 
@@ -20748,6 +20785,8 @@ class TrashView(Gtk.Box):
             return "This PC"
         if drive == "/":
             return "Computer"
+        if len(drive) <= 3 and drive[1:2] == ":":                 # Windows: C:\ → "Drive C:"
+            return names.get(drive) or f"Drive {drive[:2].upper()}"
         return names.get(drive) or os.path.basename(drive.rstrip(os.sep)) or drive
 
     def _build_chips(self, items):
