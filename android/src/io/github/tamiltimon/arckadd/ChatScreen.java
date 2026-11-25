@@ -2067,6 +2067,10 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         vids.setOnCheckedChangeListener((v, yes) -> PhotoImport.setVideos(a, yes));
         box.addView(vids, Ui.matchWrap(a, 4));
         box.addView(Ui.button(a, "📷 Scan a document to the PC", true, v -> Scanner.start(a)), Ui.matchWrap(a, 10));
+        box.addView(Ui.button(a, "🖥 See and control my PC (full screen)", true, v -> PcActivity.open(a, "screen")),
+                Ui.matchWrap(a, 10));
+        box.addView(Ui.button(a, "🎛 Phone as a remote (slides, music, volume)", false, v -> PcActivity.open(a, "remote")),
+                Ui.matchWrap(a, 6));
         box.addView(Ui.button(a, (PhoneControl.instance != null ? "✓ " : "") + "Turn on Arckad-D in Accessibility (needed for control)",
                 PhoneControl.instance == null, v -> a.startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))),
                 Ui.matchWrap(a, 6));

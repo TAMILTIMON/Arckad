@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.61.1"
+APP_VERSION = "3.62.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -11910,6 +11910,26 @@ class LinkedDevices:
                 c._schedule_rewrite(gid)
                 c.ui("on_chat_changed", None)
             return reply({"ok": True})
+        if path.startswith("/t/pc/"):                     # 🖥 the phone sees / controls this PC (or is its remote)
+            if not self.is_local(h.client_address[0]):
+                return reply({"ok": False, "reason": "only on the same network"})
+            who = (self.twins().get(inst) or {}).get("name") or "your phone"
+            try:
+                if path == "/t/pc/start":
+                    return reply(PC_REMOTE.start(inst, who, bool(req.get("screen", True))))
+                if path == "/t/pc/frame":
+                    return reply(PC_REMOTE.frame(inst, req.get("maxw")))
+                if path == "/t/pc/input":
+                    return reply(PC_REMOTE.input(inst, req.get("events")))
+                if path == "/t/pc/remote":
+                    return reply(PC_REMOTE.remote(inst, str(req.get("action", ""))))
+                if path == "/t/pc/stop":
+                    if PC_REMOTE.inst == inst:
+                        PC_REMOTE.stop()
+                    return reply({"ok": True})
+            except Exception as ex:
+                return reply({"ok": False, "reason": str(ex)[:200]})
+            return reply({"ok": False, "reason": "unknown"})
         if path == "/t/phone/upload":                 # 📷 a scan or 📸 a camera photo from the phone
             if not self.is_local(h.client_address[0]):
                 return reply({"ok": False, "reason": "only on the same network"})
@@ -16078,6 +16098,8 @@ OPTIONAL_FEATURES = [  # (packages, any one of them is enough), what it adds, gr
     (["qpdf"], "PDF tools: merge, split, rotate and extract pages", "files"),
     (["ghostscript"], "PDF tools: make PDFs smaller", "files"),
     (["ffmpeg"], "Media tools: convert videos and audio, extract MP3", "media"),
+    (["gstreamer1.0-pipewire"], "Your phone sees this PC's screen (Wayland)", "chat"),
+    (["playerctl"], "Phone remote: play / pause and skip songs", "chat"),
     (["pulseaudio-utils", "pipewire-bin"], "Intercom calls and voice messages", "chat"),
     (["gir1.2-ayatanaappindicator3-0.1"], "Icon in the top bar (keep running in the tray)", "chat"),
 ]
@@ -23247,6 +23269,17 @@ def settings_entries(win):
            "versions.", "button", "Open…", win.backups_dialog),
           ("files", "Find similar photos", "Groups photos that look alike (bursts, edited copies) and keeps the best.",
            "button", "Find…", lambda: win.similar_photos()),
+          ("chat", "Phone message pop-ups", "When a message arrives on your phone, a pop-up on the PC lets you reply "
+           "straight away.", "switch", lambda: win.cfg.get("phone_popups", True),
+           lambda v: (win.cfg.__setitem__("phone_popups", v), write_json(CONFIG_FILE, win.cfg))),
+          ("chat", "Control this PC from the phone", "Lets your linked phone see this screen and use it with touch, or "
+           "work as a remote (slides, music, volume). You're asked before it connects; a bar with Stop shows while it "
+           "does.", "switch", lambda: win.cfg.get("remote_control", True),
+           lambda v: (win.cfg.__setitem__("remote_control", v), write_json(CONFIG_FILE, win.cfg),
+                      None if v else PC_REMOTE.stop())),
+          ("chat", "Forget phones that are always allowed", "Every phone will have to ask again.", "button", "Forget",
+           lambda: (win.cfg.pop("remote_always", None), PC_REMOTE.allowed.clear(), write_json(CONFIG_FILE, win.cfg),
+                    win.flash_all("Phones will ask again"))),
           ("chat", "Phone scans go to", "Where documents you scan with the phone are saved.", "button", "Choose…",
            lambda: win.choose_phone_folder("scan_folder", "Phone scans go to")),
           ("chat", "Phone photos go to", "Where photos imported from the phone are saved (in year / month folders).",
@@ -25365,6 +25398,14 @@ GUIDE = [
          lambda w: w.open_share(None, "link")),
         ("📱", "Phone link", "Your phone's notifications, messages and calls on the PC, and its screen in a window.",
          "📱 button in the title bar", "", lambda w: w.phone_btn.set_active(True)),
+        ("💬", "Reply to phone messages from the PC", "When a message arrives on your phone, a pop-up on the PC shows "
+         "it with a reply box: type and press Enter.", "Automatic (Settings → Phone message pop-ups)", "", None),
+        ("🖥", "See and control the PC from the phone", "The PC's whole screen on your phone, full screen: tap to "
+         "click, double-tap, long-press for right-click, drag, two fingers to scroll, pinch to zoom, and a keyboard. "
+         "The PC asks you first and shows a Stop bar while connected.",
+         "Phone: ⋮ → Phone link → See and control my PC", "", None),
+        ("🎛", "Phone as a remote", "Big buttons for slides (next, previous, start, end, black screen), music and "
+         "volume. The phone's volume buttons flip slides too.", "Phone: ⋮ → Phone link → Phone as a remote", "", None),
         ("📋", "Clipboard sync", "Copy on the PC, paste on the phone, and the other way round.", "Settings → Chat, phone "
          "& sharing", "", None),
         ("📷", "Scan with the phone", "Photograph paper pages; they're cleaned up into a PDF that lands in your PC's "
@@ -25419,6 +25460,8 @@ GUIDE = [
 ]
 
 WHATS_NEW = [
+    ("3.62", "See and control your PC from the phone (full screen, touch), the phone as a remote for slides, music "
+             "and volume, and reply to phone messages from a pop-up on the PC"),
     ("3.61", "PDF tools, media tools, similar photos, ransomware guard, scheduled backups, scan with the phone, phone "
              "photos to the PC"),
     ("3.60", "Your own tags, smart tags, image tools, timeline, compare folders, shared team folders"),
@@ -25659,6 +25702,575 @@ class GuideWindow(Gtk.Window):
         self.stack.add_named(page, "results")
         page.show_all()
         self.stack.set_visible_child_name("results")
+
+
+
+# ---------------------------------------------------------------- 🖥 The PC from the phone: screen, touch control, remote
+# The phone sees this PC's screen and controls it with touch, or works as a remote (slides, music, volume). Only a
+# phone linked to this PC, on the same network, over the encrypted link — and only after you allow it here.
+REMOTE_KEYS = {"next": "Next", "prev": "Prior", "start": "F5", "end": "Escape", "black": "b", "fullscreen": "F11",
+               "play": "XF86AudioPlay", "track_next": "XF86AudioNext", "track_prev": "XF86AudioPrev",
+               "vol_up": "XF86AudioRaiseVolume", "vol_down": "XF86AudioLowerVolume", "mute": "XF86AudioMute"}
+
+
+def _jpeg(pb, maxw, quality=62):
+    w, h = pb.get_width(), pb.get_height()
+    if maxw and w > maxw:
+        pb = pb.scale_simple(maxw, max(1, round(h * maxw / w)), GdkPixbuf.InterpType.BILINEAR)
+    if pb.get_has_alpha():
+        flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, pb.get_width(), pb.get_height())
+        pb.composite(flat, 0, 0, pb.get_width(), pb.get_height(), 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
+        pb = flat
+    ok, data = pb.save_to_bufferv("jpeg", ["quality"], [str(quality)])
+    return bytes(data)
+
+
+def _on_main(fn, timeout=5):
+    """Runs fn on the GTK thread (screen grabs must) and waits for its answer."""
+    box, ev = {}, threading.Event()
+
+    def run():
+        try:
+            box["v"] = fn()
+        except Exception as ex:
+            box["e"] = ex
+        ev.set()
+        return False
+    GLib.idle_add(run)
+    if not ev.wait(timeout):
+        raise OSError("the PC is busy")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
+class _X11Screen:
+    """Ubuntu on X11 (and Xorg sessions): the screen from GDK, input through XTest."""
+    name = "x11"
+
+    def __init__(self, screen=True):
+        import ctypes
+        import ctypes.util
+        self.ct = ctypes
+        self.x = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        self.t = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+        self.x.XOpenDisplay.restype = ctypes.c_void_p
+        self.x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x.XStringToKeysym.restype = ctypes.c_ulong
+        self.x.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        self.x.XKeysymToKeycode.restype = ctypes.c_ubyte
+        self.x.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.x.XFlush.argtypes = [ctypes.c_void_p]
+        self.x.XDisplayWidth.argtypes = self.x.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.t.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+        self.t.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.t.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.d = self.x.XOpenDisplay(None)
+        if not self.d:
+            raise OSError("no X display")
+        self.w, self.h = self.x.XDisplayWidth(self.d, 0), self.x.XDisplayHeight(self.d, 0)
+
+    def frame(self, maxw):
+        def grab():
+            root = Gdk.get_default_root_window()
+            return Gdk.pixbuf_get_from_window(root, 0, 0, root.get_width(), root.get_height())
+        pb = _on_main(grab)
+        if pb is None:
+            raise OSError("couldn't read the screen")
+        self.w, self.h = pb.get_width(), pb.get_height()
+        return _jpeg(pb, maxw), self.w, self.h
+
+    def move(self, x, y):
+        self.t.XTestFakeMotionEvent(self.d, -1, int(x * (self.w - 1)), int(y * (self.h - 1)), 0)
+        self.x.XFlush(self.d)
+
+    def button(self, b, down):
+        self.t.XTestFakeButtonEvent(self.d, int(b), 1 if down else 0, 0)
+        self.x.XFlush(self.d)
+
+    def scroll(self, steps):
+        b = 4 if steps < 0 else 5
+        for _ in range(min(20, abs(int(steps)))):
+            self.button(b, True)
+            self.button(b, False)
+
+    def _code(self, keysym):
+        return self.x.XKeysymToKeycode(self.d, keysym)
+
+    def key(self, name, down=None):
+        ks = self.x.XStringToKeysym(name.encode())
+        code = self._code(ks) if ks else 0
+        if not code:
+            return
+        for state in ((True, False) if down is None else (down,)):
+            self.t.XTestFakeKeyEvent(self.d, code, 1 if state else 0, 0)
+        self.x.XFlush(self.d)
+
+    def text(self, s):
+        km = Gdk.Keymap.get_for_display(Gdk.Display.get_default())
+        shift = self._code(self.x.XStringToKeysym(b"Shift_L"))
+        for ch in s:
+            if ch == "\n":
+                self.key("Return")
+                continue
+            kv = Gdk.unicode_to_keyval(ord(ch))
+            ok, entries = km.get_entries_for_keyval(kv)
+            code = self._code(kv)
+            if not code:
+                continue
+            need_shift = bool(ok and entries and entries[0].level == 1)
+            if need_shift:
+                self.t.XTestFakeKeyEvent(self.d, shift, 1, 0)
+            self.t.XTestFakeKeyEvent(self.d, code, 1, 0)
+            self.t.XTestFakeKeyEvent(self.d, code, 0, 0)
+            if need_shift:
+                self.t.XTestFakeKeyEvent(self.d, shift, 0, 0)
+        self.x.XFlush(self.d)
+
+    def close(self):
+        pass
+
+
+class _PortalScreen:
+    """Ubuntu on Wayland (the default): the system's own “Remote desktop” permission (xdg-desktop-portal). Ubuntu
+    asks you once to allow it; the screen comes over PipeWire."""
+    name = "wayland"
+    BUS, PATH = "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop"
+
+    def __init__(self, cfg, screen=True):
+        self.cfg = cfg
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.sender = self.bus.get_unique_name()[1:].replace(".", "_")
+        self.session = None
+        self.node = None
+        self.w = self.h = 0
+        self.pipe = self.sink = None
+        r = self._request("org.freedesktop.portal.RemoteDesktop", "CreateSession",
+                          lambda t: GLib.Variant("(a{sv})", ({"handle_token": GLib.Variant("s", t),
+                                                              "session_handle_token": GLib.Variant("s", t + "s")},)))
+        self.session = r.get("session_handle")
+        if not self.session:
+            raise OSError("the remote desktop permission isn't available")
+        opts = {"types": GLib.Variant("u", 3), "persist_mode": GLib.Variant("u", 2)}
+        token = cfg.get("remote_restore_token")
+        if token:
+            opts["restore_token"] = GLib.Variant("s", token)
+        self._request("org.freedesktop.portal.RemoteDesktop", "SelectDevices",
+                      lambda t: GLib.Variant("(oa{sv})", (self.session, dict(opts, handle_token=GLib.Variant("s", t)))))
+        if screen:
+            self._request("org.freedesktop.portal.ScreenCast", "SelectSources",
+                          lambda t: GLib.Variant("(oa{sv})", (self.session, {
+                              "handle_token": GLib.Variant("s", t), "types": GLib.Variant("u", 1),
+                              "multiple": GLib.Variant("b", False), "cursor_mode": GLib.Variant("u", 2)})))
+        r = self._request("org.freedesktop.portal.RemoteDesktop", "Start",
+                          lambda t: GLib.Variant("(osa{sv})", (self.session, "", {"handle_token": GLib.Variant("s", t)})),
+                          timeout=120)
+        if r.get("restore_token"):
+            cfg["remote_restore_token"] = r["restore_token"]
+            write_json(CONFIG_FILE, cfg)
+        streams = r.get("streams") or []
+        if screen:
+            if not streams:
+                raise OSError("no screen was shared")
+            self.node, props = streams[0][0], streams[0][1]
+            size = props.get("size") or (1920, 1080)
+            self.w, self.h = int(size[0]), int(size[1])
+            self._start_pipewire()
+
+    def _request(self, iface, method, args_for, timeout=30):
+        token = "arckad" + secrets.token_hex(4)
+        path = f"/org/freedesktop/portal/desktop/request/{self.sender}/{token}"
+        box, ev = {}, threading.Event()
+
+        def on_resp(_c, _s, _p, _i, _sig, params):
+            code, results = params.unpack()
+            box["code"], box["res"] = code, results
+            ev.set()
+        sub = self.bus.signal_subscribe(self.BUS, "org.freedesktop.portal.Request", "Response", path, None,
+                                        Gio.DBusSignalFlags.NO_MATCH_RULE, on_resp)
+        try:
+            self.bus.call_sync(self.BUS, self.PATH, iface, method, args_for(token), None, Gio.DBusCallFlags.NONE,
+                               -1, None)
+            if not ev.wait(timeout):
+                raise OSError("no answer from the system (was the permission window closed?)")
+        finally:
+            self.bus.signal_unsubscribe(sub)
+        if box.get("code") != 0:
+            raise PermissionError("remote control wasn't allowed on the PC")
+        return box.get("res") or {}
+
+    def _start_pipewire(self):
+        r, fds = self.bus.call_with_unix_fd_list_sync(
+            self.BUS, self.PATH, "org.freedesktop.portal.ScreenCast", "OpenPipeWireRemote",
+            GLib.Variant("(oa{sv})", (self.session, {})), GLib.VariantType("(h)"), Gio.DBusCallFlags.NONE, -1, None, None)
+        fd = fds.get(r.unpack()[0])
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst
+        Gst.init(None)
+        if not Gst.ElementFactory.find("pipewiresrc"):
+            raise FileNotFoundError("gstreamer1.0-pipewire")
+        tw = min(self.w, 1600)
+        th = max(2, round(self.h * tw / self.w)) // 2 * 2
+        self.pipe = Gst.parse_launch(
+            f"pipewiresrc fd={fd} path={self.node} always-copy=true do-timestamp=true ! videoconvert ! videoscale ! "
+            f"video/x-raw,format=RGB,width={tw},height={th} ! appsink name=sink max-buffers=1 drop=true sync=false")
+        self.sink = self.pipe.get_by_name("sink")
+        self.pipe.set_state(Gst.State.PLAYING)
+        self.Gst = Gst
+        self.tw, self.th = tw, th
+
+    def frame(self, maxw):
+        if not self.sink:
+            raise OSError("the screen isn't shared")
+        sample = self.sink.emit("try-pull-sample", 2 * 10 ** 9)
+        if sample is None:
+            sample = getattr(self, "last", None)
+            if sample is None:
+                raise OSError("waiting for the screen")
+        self.last = sample
+        buf = sample.get_buffer()
+        ok, info = buf.map(self.Gst.MapFlags.READ)
+        try:
+            data = bytes(info.data)
+        finally:
+            buf.unmap(info)
+        stride = len(data) // self.th
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(data), GdkPixbuf.Colorspace.RGB, False, 8, self.tw, self.th,
+                                             stride)
+        return _jpeg(pb, maxw), self.w, self.h
+
+    def _notify(self, method, sig, args):
+        self.bus.call_sync(self.BUS, self.PATH, "org.freedesktop.portal.RemoteDesktop", method,
+                           GLib.Variant(sig, (self.session, {}) + tuple(args)), None, Gio.DBusCallFlags.NONE, 3000, None)
+
+    def move(self, x, y):
+        if self.node is not None:
+            self._notify("NotifyPointerMotionAbsolute", "(oa{sv}udd)", (self.node, x * self.w, y * self.h))
+
+    def button(self, b, down):
+        self._notify("NotifyPointerButton", "(oa{sv}iu)", ({1: 272, 2: 274, 3: 273}.get(int(b), 272), 1 if down else 0))
+
+    def scroll(self, steps):
+        self._notify("NotifyPointerAxisDiscrete", "(oa{sv}ui)", (0, int(steps)))
+
+    def key(self, name, down=None):
+        ks = Gdk.keyval_from_name(name)
+        if not ks:
+            return
+        for state in ((True, False) if down is None else (down,)):
+            self._notify("NotifyKeyboardKeysym", "(oa{sv}iu)", (ks, 1 if state else 0))
+
+    def text(self, s):
+        for ch in s:
+            if ch == "\n":
+                self.key("Return")
+                continue
+            ks = Gdk.unicode_to_keyval(ord(ch))
+            self._notify("NotifyKeyboardKeysym", "(oa{sv}iu)", (ks, 1))
+            self._notify("NotifyKeyboardKeysym", "(oa{sv}iu)", (ks, 0))
+
+    def close(self):
+        try:
+            if self.pipe:
+                self.pipe.set_state(self.Gst.State.NULL)
+            if self.session:
+                self.bus.call_sync(self.BUS, self.session, "org.freedesktop.portal.Session", "Close", None, None,
+                                   Gio.DBusCallFlags.NONE, 2000, None)
+        except Exception:
+            pass
+
+
+class _WinScreen:
+    """Windows: the screen through GDI, the mouse and keyboard through SendInput."""
+    name = "windows"
+    VK = {"Return": 0x0D, "BackSpace": 0x08, "Tab": 0x09, "Escape": 0x1B, "space": 0x20, "Prior": 0x21, "Next": 0x22,
+          "End": 0x23, "Home": 0x24, "Left": 0x25, "Up": 0x26, "Right": 0x27, "Down": 0x28, "Delete": 0x2E,
+          "Super_L": 0x5B, "Control_L": 0x11, "Alt_L": 0x12, "Shift_L": 0x10, "XF86AudioPlay": 0xB3,
+          "XF86AudioNext": 0xB0, "XF86AudioPrev": 0xB1, "XF86AudioRaiseVolume": 0xAF, "XF86AudioLowerVolume": 0xAE,
+          "XF86AudioMute": 0xAD, **{f"F{i}": 0x6F + i for i in range(1, 13)}}
+
+    def __init__(self, screen=True):
+        import ctypes
+        from ctypes import wintypes
+        self.ct, self.wt = ctypes, wintypes
+        self.u, self.g = ctypes.windll.user32, ctypes.windll.gdi32
+        try:
+            self.u.SetProcessDPIAware()
+        except Exception:
+            pass
+        self.w, self.h = self.u.GetSystemMetrics(0), self.u.GetSystemMetrics(1)
+
+        class KI(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class MI(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class U(ctypes.Union):
+            _fields_ = [("ki", KI), ("mi", MI), ("pad", ctypes.c_byte * 32)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", U)]
+        self.KI, self.MI, self.INPUT = KI, MI, INPUT
+
+    def _send(self, *inputs):
+        arr = (self.INPUT * len(inputs))(*inputs)
+        self.u.SendInput(len(inputs), arr, self.ct.sizeof(self.INPUT))
+
+    def frame(self, maxw):
+        ct, u, g = self.ct, self.u, self.g
+        w, h = u.GetSystemMetrics(0), u.GetSystemMetrics(1)
+        self.w, self.h = w, h
+        hdc = u.GetDC(0)
+        mem = g.CreateCompatibleDC(hdc)
+        bmp = g.CreateCompatibleBitmap(hdc, w, h)
+        old = g.SelectObject(mem, bmp)
+        g.BitBlt(mem, 0, 0, w, h, hdc, 0, 0, 0x00CC0020 | 0x40000000)
+
+        class BIH(ct.Structure):
+            _fields_ = [("biSize", ct.c_uint32), ("biWidth", ct.c_int32), ("biHeight", ct.c_int32),
+                        ("biPlanes", ct.c_uint16), ("biBitCount", ct.c_uint16), ("biCompression", ct.c_uint32),
+                        ("biSizeImage", ct.c_uint32), ("a", ct.c_int32), ("b", ct.c_int32), ("c", ct.c_uint32),
+                        ("d", ct.c_uint32)]
+        bih = BIH(ct.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        buf = (ct.c_char * (w * h * 4))()
+        g.GetDIBits(mem, bmp, 0, h, buf, ct.byref(bih), 0)
+        g.SelectObject(mem, old)
+        g.DeleteObject(bmp)
+        g.DeleteDC(mem)
+        u.ReleaseDC(0, hdc)
+        ba = bytearray(buf.raw)
+        ba[0::4], ba[2::4] = ba[2::4], ba[0::4]                 # BGRA → RGBA
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(ba)), GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4)
+        return _jpeg(pb, maxw), w, h
+
+    def move(self, x, y):
+        self.u.SetCursorPos(int(x * (self.w - 1)), int(y * (self.h - 1)))
+
+    def button(self, b, down):
+        flag = {1: (0x2, 0x4), 3: (0x8, 0x10), 2: (0x20, 0x40)}.get(int(b), (0x2, 0x4))[0 if down else 1]
+        self._send(self._mi(flag))
+
+    def _mi(self, flags, data=0):
+        inp = self.INPUT()
+        inp.type = 0
+        inp.u.mi = self.MI(0, 0, data & 0xFFFFFFFF, flags, 0, 0)
+        return inp
+
+    def scroll(self, steps):
+        self._send(self._mi(0x0800, -120 * int(steps)))
+
+    def _ki(self, vk=0, scan=0, flags=0):
+        inp = self.INPUT()
+        inp.type = 1
+        inp.u.ki = self.KI(vk, scan, flags, 0, 0)
+        return inp
+
+    def key(self, name, down=None):
+        vk = self.VK.get(name) or (ord(name.upper()) if len(name) == 1 and name.isalnum() else 0)
+        if not vk:
+            return
+        ext = 0x1 if vk in (0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2E, 0x5B) else 0
+        if down is None:
+            self._send(self._ki(vk, 0, ext), self._ki(vk, 0, ext | 0x2))
+        else:
+            self._send(self._ki(vk, 0, ext | (0 if down else 0x2)))
+
+    def text(self, s):
+        for ch in s:
+            if ch == "\n":
+                self.key("Return")
+                continue
+            raw = ch.encode("utf-16-le")                       # emoji etc. are two UTF-16 units
+            for i in range(0, len(raw), 2):
+                unit = int.from_bytes(raw[i:i + 2], "little")
+                self._send(self._ki(0, unit, 0x4), self._ki(0, unit, 0x4 | 0x2))     # KEYEVENTF_UNICODE
+
+    def close(self):
+        pass
+
+
+class PcRemote:
+    """One phone at a time sees / controls this PC. The PC owner allows it (once or always) and can stop it."""
+
+    def __init__(self):
+        self.win = None
+        self.backend = None
+        self.inst = None
+        self.lock = threading.Lock()
+        self.asking = None
+        self.allowed = set()                                  # phones allowed this time (until Arckad-D restarts)
+        self.last_frame = (0, None)
+        self.last_seen = 0
+
+    def kind(self):
+        if IS_WIN:
+            return "windows"
+        if os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+            return "wayland"
+        return "x11"
+
+    def _allowed(self, inst, who):
+        if inst in self.allowed or inst in (self.win.cfg.get("remote_always") or []):
+            return True
+        if self.asking != inst:
+            self.asking = inst
+            GLib.idle_add(lambda: self.win.remote_ask(inst, who) or False)
+        return False
+
+    def allow(self, inst, always):
+        self.asking = None
+        self.allowed.add(inst)
+        if always:
+            self.win.cfg.setdefault("remote_always", [])
+            if inst not in self.win.cfg["remote_always"]:
+                self.win.cfg["remote_always"].append(inst)
+            write_json(CONFIG_FILE, self.win.cfg)
+
+    def deny(self, inst):
+        self.asking = None
+        self.denied = (inst, time.time())
+
+    def start(self, inst, who, screen):
+        if not self.win.cfg.get("remote_control", True):
+            return {"ok": False, "reason": "Remote control is switched off on the PC (Settings → Chat, phone & sharing)"}
+        d = getattr(self, "denied", (None, 0))
+        if d[0] == inst and time.time() - d[1] < 30:
+            return {"ok": False, "reason": "The PC said no"}
+        if not self._allowed(inst, who):
+            return {"ok": False, "asking": True, "reason": "Waiting for someone at the PC to allow it…"}
+        with self.lock:
+            if self.backend is not None and (self.inst != inst or (screen and not getattr(self.backend, "has_screen", True))):
+                self.stop(quiet=True)
+            if self.backend is None:
+                try:
+                    k = self.kind()
+                    if k == "windows":
+                        self.backend = _WinScreen(screen)
+                    elif k == "wayland":
+                        self.backend = _PortalScreen(self.win.cfg, screen)
+                    else:
+                        self.backend = _X11Screen(screen)
+                    self.backend.has_screen = screen
+                except FileNotFoundError as ex:
+                    return {"ok": False, "reason": f"The PC needs {ex} (Tools → Install optional features)"}
+                except Exception as ex:
+                    self.backend = None
+                    return {"ok": False, "reason": f"{ex}"}
+                self.inst = inst
+                GLib.idle_add(lambda: self.win.remote_banner(who, screen) or False)
+        self.last_seen = time.time()
+        return {"ok": True, "w": self.backend.w, "h": self.backend.h, "kind": self.backend.name}
+
+    def check(self, inst):
+        if self.backend is None or self.inst != inst:
+            return {"ok": False, "reason": "Control was stopped on the PC"}
+        self.last_seen = time.time()
+        return None
+
+    def frame(self, inst, maxw):
+        bad = self.check(inst)
+        if bad:
+            return bad
+        maxw = max(320, min(int(maxw or 1280), 1920))
+        t, cached = self.last_frame
+        if cached and time.time() - t < 0.06:
+            data, w, h = cached
+        else:
+            with self.lock:
+                data, w, h = self.backend.frame(maxw)
+            self.last_frame = (time.time(), (data, w, h))
+        return {"ok": True, "w": w, "h": h, "jpg": base64.b64encode(data).decode()}
+
+    def input(self, inst, events):
+        bad = self.check(inst)
+        if bad:
+            return bad
+        b = self.backend
+        for e in (events or [])[:200]:
+            t = e.get("t")
+            try:
+                x, y = max(0.0, min(1.0, float(e.get("x", 0)))), max(0.0, min(1.0, float(e.get("y", 0))))
+            except (TypeError, ValueError):
+                continue
+            if t in ("move", "click", "down", "up", "rclick") and "x" in e:
+                b.move(x, y)
+            if t == "click":
+                b.button(1, True)
+                b.button(1, False)
+            elif t == "dclick":
+                for _ in range(2):
+                    b.button(1, True)
+                    b.button(1, False)
+            elif t == "rclick":
+                b.button(3, True)
+                b.button(3, False)
+            elif t == "down":
+                b.button(int(e.get("b", 1)), True)
+            elif t == "up":
+                b.button(int(e.get("b", 1)), False)
+            elif t == "scroll":
+                b.scroll(int(e.get("dy", 0)))
+            elif t == "key":
+                name = str(e.get("k", ""))[:40]
+                mods = [m for m in (e.get("mods") or []) if m in ("Control_L", "Alt_L", "Shift_L", "Super_L")]
+                for m in mods:
+                    b.key(m, True)
+                b.key(name)
+                for m in reversed(mods):
+                    b.key(m, False)
+            elif t == "text":
+                b.text(str(e.get("s", ""))[:500])
+        return {"ok": True}
+
+    def remote(self, inst, action):
+        """🎛 Slides, music and volume. Music and volume use the system's own tools where they exist."""
+        if not IS_WIN:
+            media = {"play": ["playerctl", "play-pause"], "track_next": ["playerctl", "next"],
+                     "track_prev": ["playerctl", "previous"]}
+            vol = {"vol_up": [["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+5%"], ["wpctl", "set-volume",
+                                                                                      "@DEFAULT_AUDIO_SINK@", "5%+"]],
+                   "vol_down": [["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-5%"], ["wpctl", "set-volume",
+                                                                                        "@DEFAULT_AUDIO_SINK@", "5%-"]],
+                   "mute": [["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"], ["wpctl", "set-mute",
+                                                                                     "@DEFAULT_AUDIO_SINK@", "toggle"]]}
+            for cmd in ([media[action]] if action in media else vol.get(action, [])):
+                if shutil.which(cmd[0]):
+                    try:
+                        subprocess.run(cmd, timeout=5, capture_output=True)
+                        return {"ok": True}
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+        name = REMOTE_KEYS.get(action)
+        if not name:
+            return {"ok": False, "reason": "unknown button"}
+        if self.backend is None or self.inst != inst:
+            r = self.start(inst, self.win.chat.linked.twins().get(inst, {}).get("name", "your phone"), screen=False)
+            if not r.get("ok"):
+                return r
+        self.backend.key(name)
+        self.last_seen = time.time()
+        return {"ok": True}
+
+    def stop(self, quiet=False):
+        b, self.backend, self.inst = self.backend, None, None
+        if b:
+            try:
+                b.close()
+            except Exception:
+                pass
+        if not quiet and self.win:
+            GLib.idle_add(lambda: self.win.remote_banner(None, False) or False)
+
+    def watchdog(self):
+        if self.backend is not None and time.time() - self.last_seen > 20:      # the phone went away
+            self.stop()
+        return True
+
+
+PC_REMOTE = PcRemote()
 
 
 class TabWindow(Gtk.Window):
@@ -30221,6 +30833,8 @@ class MainWindow(Gtk.ApplicationWindow):
         if ev.get("type") == "clip":
             self._clip_from_phone(ev.get("text"))
             return False
+        if ev.get("type") == "posted":
+            self.phone_popup(ev.get("item"))                # 🔔 a message: reply right from the pop-up
         self.phone_panel.phone_event(ev)
         locked = self.chat.is_locked()
         if ev.get("type") == "call":
@@ -31810,6 +32424,127 @@ class MainWindow(Gtk.ApplicationWindow):
             write_json(CONFIG_FILE, self.cfg)
             self.flash_all(f"Phone {('scans' if key == 'scan_folder' else 'photos')} will go to {short(d.get_filename())}")
         d.destroy()
+
+
+    # ---------- 🖥 the phone sees / controls this PC
+    def remote_ask(self, inst, who):
+        self.show_from_tray()
+        d = Gtk.MessageDialog(transient_for=self, modal=False, message_type=Gtk.MessageType.QUESTION,
+                              text=f"📱 Allow “{who}” to see and control this PC?")
+        d.format_secondary_text("Your phone will see this screen and can use the mouse and keyboard, over your own "
+                                "network. A bar at the top shows while it's connected, with a Stop button.")
+        d.add_buttons("Don't allow", 1, "Allow this time", 2, "Always allow this phone", 3)
+        d.set_keep_above(True)
+
+        def answer(dlg, r):
+            if r in (2, 3):
+                PC_REMOTE.allow(inst, r == 3)
+            else:
+                PC_REMOTE.deny(inst)
+            dlg.destroy()
+        d.connect("response", answer)
+        d.show_all()
+        d.present()
+
+    def remote_banner(self, who, screen):
+        if not hasattr(self, "_remote_bar"):
+            self._remote_bar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, show_close_button=False)
+            self._remote_lbl = Gtk.Label(xalign=0)
+            self._remote_bar.get_content_area().add(self._remote_lbl)
+            self._remote_bar.add_button("Stop", 1)
+            self._remote_bar.connect("response", lambda *_: (PC_REMOTE.stop(), self.flash_all("🖥 Stopped the phone's "
+                                                                                             "control")))
+            self._remote_bar.set_no_show_all(True)
+            try:
+                self.infobar.get_parent().pack_start(self._remote_bar, False, False, 0)
+                self.infobar.get_parent().reorder_child(self._remote_bar, 0)
+            except Exception:
+                self.overlay.add_overlay(self._remote_bar)
+                self._remote_bar.set_valign(Gtk.Align.START)
+            GLib.timeout_add_seconds(5, PC_REMOTE.watchdog)
+        if who:
+            self._remote_lbl.set_markup(f"📱 <b>{esc(who)}</b> is " + ("seeing and controlling this PC" if screen else
+                                                                     "using this PC as a remote (slides, music, volume)"))
+            self._remote_bar.set_no_show_all(False)
+            self._remote_bar.show_all()
+            self.notify_desktop("📱 Your phone is connected", f"{who} is " + ("controlling this PC" if screen else
+                                                                            "using it as a remote"), None,
+                                lambda: self.show_from_tray())
+        else:
+            self._remote_bar.hide()
+
+    # ---------- 🔔 phone messages pop up on the PC, with a reply box
+    def phone_popup(self, item):
+        if not self.cfg.get("phone_popups", True) or not item or not item.get("reply"):
+            return
+        if not hasattr(self, "_pp"):
+            w = Gtk.Window(type_hint=Gdk.WindowTypeHint.NOTIFICATION, decorated=False, skip_taskbar_hint=True,
+                           skip_pager_hint=True, resizable=False)
+            w.set_keep_above(True)
+            w.get_style_context().add_class("background")
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=12)
+            w.add(box)
+            self._pp_title = Gtk.Label(xalign=0, wrap=True, max_width_chars=44)
+            self._pp_text = Gtk.Label(xalign=0, wrap=True, max_width_chars=44, selectable=True)
+            box.add(self._pp_title)
+            box.add(self._pp_text)
+            row = Gtk.Box(spacing=6)
+            self._pp_entry = Gtk.Entry(hexpand=True, placeholder_text="Reply from the PC…")
+            send = Gtk.Button(label="↩ Reply")
+            send.get_style_context().add_class("suggested-action")
+            row.pack_start(self._pp_entry, True, True, 0)
+            row.add(send)
+            box.add(row)
+            low = Gtk.Box(spacing=6)
+            for label, cb in (("Open the phone panel", lambda: (self.show_from_tray(),
+                                                               self.phone_btn.set_active(True), w.hide())),
+                              ("Dismiss on the phone", lambda: (self.phone_panel._ask(
+                                  "/t/phone/dismiss", {"key": self._pp_item["key"]}, lambda r, e: None), w.hide())),
+                              ("✕", lambda: w.hide())):
+                b = Gtk.Button(label=label, relief=Gtk.ReliefStyle.NONE)
+                b.connect("clicked", lambda _b, cb=cb: cb())
+                low.add(b)
+            box.add(low)
+
+            def do_send(*_):
+                text = self._pp_entry.get_text().strip()
+                if not text:
+                    return
+                send.set_sensitive(False)
+
+                def done(r, err):
+                    send.set_sensitive(True)
+                    if err:
+                        self._pp_text.set_text("✗ " + err)
+                        return
+                    self._pp_entry.set_text("")
+                    w.hide()
+                    self.flash_all("↩ Replied from the PC")
+                self.phone_panel._ask("/t/phone/reply", {"key": self._pp_item["key"], "text": text}, done)
+            send.connect("clicked", do_send)
+            self._pp_entry.connect("activate", do_send)
+            self._pp_entry.connect("changed", lambda *_: setattr(self, "_pp_typing", time.time()))
+            w.connect("enter-notify-event", lambda *_: setattr(self, "_pp_typing", time.time()) or False)
+            self._pp = w
+        self._pp_item = item
+        self._pp_title.set_markup(f"📱 <b>{esc(item.get('app', ''))}</b> · {esc(item.get('title', ''))}")
+        self._pp_text.set_text((item.get("text") or "")[:300])
+        self._pp_entry.set_text("")
+        w = self._pp
+        w.show_all()
+        scr = Gdk.Display.get_default().get_monitor_at_window(self.get_window()) if self.get_window() else None
+        geo = scr.get_workarea() if scr else None
+        if geo:
+            w.move(geo.x + geo.width - 420, geo.y + geo.height - 230)
+        self._pp_shown = time.time()
+        self._pp_typing = 0
+
+        def maybe_hide():
+            if time.time() - max(self._pp_shown, self._pp_typing) >= 14 and not self._pp_entry.has_focus():
+                self._pp.hide()
+                return False
+            return self._pp.get_visible()
+        GLib.timeout_add_seconds(2, maybe_hide)
 
     # ---------- 📁 team folders
     def team_folders(self):

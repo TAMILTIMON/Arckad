@@ -74,6 +74,9 @@
             </intent-filter>
         </receiver>
         <service android:name=".ScreenShare" android:exported="false" android:foregroundServiceType="mediaProjection" />
+        <activity android:name=".PcActivity" android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" android:windowSoftInputMode="adjustNothing" />
         <activity android:name=".ScreenConsent" android:exported="false" android:excludeFromRecents="true"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <service android:name=".PhoneControl" android:exported="true" android:label="Arckad-D (control from your PC)"
