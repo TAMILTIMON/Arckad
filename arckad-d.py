@@ -68,6 +68,10 @@ try:
     gi.require_version("Gdk", "3.0")
     gi.require_version("GdkPixbuf", "2.0")
     from gi.repository import Gdk, GdkPixbuf, Gio, GLib, GObject, Gtk, Pango
+    try:
+        import cairo                                     # gradients for the animations (python3-gi-cairo)
+    except ImportError:
+        cairo = None
 except Exception:                       # also broken installs, not just missing GTK
     import traceback
     _err = traceback.format_exc()
@@ -93,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.55.1"
+APP_VERSION = "3.57.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3672,6 +3676,11 @@ class FilePane(Gtk.Box):
 
     def content_search(self):
         """🔎 Inside files: documents that contain the words, with the matching line."""
+        try:
+            x, y = self.translate_coordinates(self.win.overlay, 0, 0)
+            self.win.play("search", rect=(x, y + 90, self.get_allocated_width(), max(120, self.get_allocated_height() - 120)))
+        except Exception:
+            pass
         self.mode = "search"
         self.gen += 1
         gen, q = self.gen, self.filters.query
@@ -3977,6 +3986,10 @@ class FilePane(Gtk.Box):
     def set_view(self, mode):
         if mode == self.view_mode:
             return
+        if animations_on(self.win) and self.get_mapped():
+            pb, at = self.win.snapshot(self.view_stack)
+            if pb:
+                self.win.play("fold", pb=pb, at=at)
         keep = self.selected_paths()
         self.view_mode = mode
         self.attach_model()
@@ -14704,6 +14717,11 @@ class ChatPanel(Gtk.Box):
                 self.chat.edit_message(self.gid, self.editing, text)
             else:
                 self.chat.send_text(self.gid, text, once=self.once_btn.get_active(), reply=self.reply_to)
+                top = self.get_toplevel()
+                if hasattr(top, "play"):
+                    at = top.pt_widget(self.entry, 0.8, 0.0)
+                    if at:
+                        top.play("bubble", at=at)
             self.cancel_reply()
             self.once_btn.set_active(False)
             self.chat.start()
@@ -18073,6 +18091,10 @@ class DownloadWatcher:
         if size != last:                                     # still being written: look again shortly
             GLib.timeout_add(1500, self._check, path, size)
             return False
+        try:
+            self.win.play("download", at=self.win.pt_row(os.path.dirname(path)) or self.win.pt_pane(None, 0.4))
+        except Exception:
+            pass
         if self.win.cfg.get("download_popups", True):
             name = os.path.basename(path)
             self.win.show_toast(f"⬇ {name}", f"Downloaded · {human_size(size)} · click to show it in {APP_NAME}", None,
@@ -19574,7 +19596,9 @@ class BatchRenameDialog(Gtk.Dialog):
     def run_rename(self):
         if self.run() == Gtk.ResponseType.OK:
             try:
+                rows, width = self.win.pane_rows(self.win.active)
                 done = batch_apply(self.pairs())
+                self.win.play("ripple", rows=rows, w=width)
                 self.win.undo_btn.set_sensitive(True)
                 self.win.refresh_all()
                 self.win.flash_all(f"✏ Renamed {len(done)} items (Undo puts the old names back)")
@@ -19722,8 +19746,21 @@ class DiskUsageWindow(Gtk.Window):
         self.title.set_markup(f"<b>{esc(short(folder))}</b>  ·  {human_size(self.sizes.get(folder, 0))}")
         self.status.set_text(f"{len(self.kids[folder])} items · click a folder to look inside · the biggest blocks "
                              f"take the most space")
+        if not getattr(self, "_grown", False) and animations_on(self.win):
+            self._grown = True                                # the first map rises like a skyline
+            self._grow = (time.time(), 1.1 * _trash_anim_scale(self.win))
+            GLib.timeout_add(30, self._grow_step)
         self._queue_draw()
         self._fill_files()
+
+    def _grow_step(self):
+        t0, dur = self._grow
+        self._draw()
+        if time.time() - t0 >= dur:
+            self._grow = None
+            self._draw()
+            return False
+        return True
 
     def _queue_draw(self):
         if getattr(self, "_draw_id", None) is None:
@@ -19740,8 +19777,15 @@ class DiskUsageWindow(Gtk.Window):
             big.append((f"{len(rest)} smaller items", sum(r[1] for r in rest), None))
         self.rects = squarify(big, 0, 0, W, H)
         fg = "#ffffff"
+        grow = getattr(self, "_grow", None)
+        gk = min(1.0, (time.time() - grow[0]) / grow[1]) if grow else 1.0
+        n = max(1, len(self.rects))
         parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">']
-        for (name, size, is_dir), x, y, w, h in self.rects:
+        for idx, ((name, size, is_dir), x, y, w, h) in enumerate(self.rects):
+            if gk < 1:                                       # smallest first, the biggest rise last and tallest
+                rank = (n - 1 - idx) / n
+                ki = _ease_out(_seg(gk, rank * 0.5, rank * 0.5 + 0.5))
+                y, h = y + h * (1 - ki), h * ki
             if is_dir:
                 hue = int(hashlib.md5(name.encode()).hexdigest()[:2], 16)
                 col = f"hsl({210 + hue % 60}, 55%, {38 + hue % 14}%)"
@@ -19751,7 +19795,7 @@ class DiskUsageWindow(Gtk.Window):
                 col = _DU_FILE_COLOURS.get(category_of(name), "#6b7280")
             parts.append(f'<rect x="{x + 1:.1f}" y="{y + 1:.1f}" width="{max(0, w - 2):.1f}" height="{max(0, h - 2):.1f}" '
                          f'rx="6" fill="{col}"/>')
-            if w > 70 and h > 34:
+            if w > 70 and h > 34 and gk >= 1:
                 label = (("📁 " if is_dir else "") + name)[: max(4, int(w / 7.5))]
                 parts.append(f'<text x="{x + 8:.1f}" y="{y + 20:.1f}" fill="{fg}" font-size="13" font-weight="700" '
                              f'font-family="Segoe UI, Ubuntu, Arial, sans-serif">{esc(label)}</text>'
@@ -19995,7 +20039,9 @@ class FolderRules:
         self.log = self.log[-200:]
         write_json(RULES_LOG, self.log)
         if self.win and not result.startswith("✗"):
-            GLib.idle_add(lambda: (self.win.flash_all(f"⚙ {name}: {result}"), self.win.refresh_all()) and False)
+            GLib.idle_add(lambda: (self.win.flash_all(f"⚙ {name}: {result}"), self.win.refresh_all(),
+                                   self.win.play("rules", at=(self.win.overlay.get_allocated_width() - 170,
+                                                              self.win.overlay.get_allocated_height() - 80))) and False)
         return not result.startswith("✗")
 
 
@@ -20335,6 +20381,7 @@ class VaultUI:
         self.win.show_files()
         self.win.new_tab(self.win.left_nb, path)
         self.win.flash_all("🔓 Vault open")
+        self.win.play("vault", at=self.win.pt_pane(None, 0.4), lock=False)
 
     def lock_now(self, why="Vault locked"):
         if not VAULT.is_open():
@@ -20346,6 +20393,7 @@ class VaultUI:
         VAULT.close()
         self.bar.hide()
         self.win.flash_all(f"🔐 {why}")
+        self.win.play("vault", at=self.win.pt_pane(None, 0.4), lock=True)
 
     def create(self):
         d = Gtk.Dialog(title="Create your private vault", transient_for=self.win, modal=True)
@@ -20899,6 +20947,8 @@ class TrashView(Gtk.Box):
             else:
                 for it in vis:
                     trash_delete(it)
+            at = self.win.pt_row("trash:") or self.win.pt_pane(None, 0.3)
+            self.win.play("empty_trash", at=at, n=min(6, len(vis)))
             self.refresh()
 
 
@@ -20998,6 +21048,1141 @@ def _svg_pixbuf(svg):
     loader.write(svg.encode())
     loader.close()
     return loader.get_pixbuf()
+
+
+# ---------------------------------------------------------------- ✨ Animations for everyday actions
+# One transparent drawing layer over the window; each animation is a small cairo drawing that runs for a moment.
+# They follow Settings → Appearance: Animations (on/off), Trash animation speed and size (used for all of them).
+
+def _ease(k):
+    k = max(0.0, min(1.0, k))
+    return k * k * (3 - 2 * k)
+
+
+def _ease_out(k):
+    k = max(0.0, min(1.0, k))
+    return 1 - (1 - k) ** 3
+
+
+def _back(k):
+    """Overshoots a little, then settles (for things that pop)."""
+    k = max(0.0, min(1.0, k))
+    c = 1.70158
+    return 1 + (c + 1) * (k - 1) ** 3 + c * (k - 1) ** 2
+
+
+def _seg(k, a, b):
+    """0…1 progress of k inside the window a…b."""
+    return 0.0 if k <= a else 1.0 if k >= b else (k - a) / (b - a)
+
+
+def _lerp(a, b, k):
+    return a + (b - a) * k
+
+
+def _arc_pt(p0, p1, k, lift):
+    e = _ease(k)
+    return (_lerp(p0[0], p1[0], e), _lerp(p0[1], p1[1], e) - math.sin(math.pi * e) * lift)
+
+
+def _argb(hexcol, a=1.0):
+    h = hexcol.lstrip("#")
+    return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255, a
+
+
+def _rrect(cr, x, y, w, h, r):
+    r = min(r, w / 2, h / 2)
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+    cr.close_path()
+
+
+# ---------- the little drawings (all centred on x, y; s = size in pixels). Lit from the top left: gradients for
+# material, a highlight on the lit edges, and a soft contact shadow underneath, so they read as real objects.
+def _grad_v(y0, y1, stops):
+    g = cairo.LinearGradient(0, y0, 0, y1)
+    for off, col in stops:
+        g.add_color_stop_rgba(off, *col)
+    return g
+
+
+def _grad_h(x0, x1, stops):
+    g = cairo.LinearGradient(x0, 0, x1, 0)
+    for off, col in stops:
+        g.add_color_stop_rgba(off, *col)
+    return g
+
+
+def _d_shadow(cr, x, y, w, alpha=0.3, h=None):
+    """A soft contact shadow (an ellipse that fades out at its edge)."""
+    h = h or w * 0.22
+    cr.save()
+    cr.translate(x, y)
+    cr.scale(1, h / max(1.0, w))
+    g = cairo.RadialGradient(0, 0, 0, 0, 0, w)
+    g.add_color_stop_rgba(0, 0, 0, 0, alpha)
+    g.add_color_stop_rgba(0.6, 0, 0, 0, alpha * 0.45)
+    g.add_color_stop_rgba(1, 0, 0, 0, 0)
+    cr.set_source(g)
+    cr.arc(0, 0, w, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def _d_page(cr, x, y, s, alpha=1.0, rot=0.0, lines=True, tint=None, shadow=True):
+    w, h = s * 0.62, s * 0.80
+    ear = w * 0.28
+    cr.save()
+    cr.translate(x, y)
+    cr.rotate(rot)
+    if shadow:                                                                # soft drop shadow behind the sheet
+        for i, a in ((3, 0.05), (2, 0.07), (1, 0.09)):
+            cr.set_source_rgba(0, 0, 0, a * alpha)
+            _rrect(cr, -w / 2 + i * 0.6, -h / 2 + i * 1.1, w + i * 0.4, h + i * 0.4, 2 + i)
+            cr.fill()
+    cr.move_to(-w / 2, -h / 2)
+    cr.line_to(w / 2 - ear, -h / 2)
+    cr.line_to(w / 2, -h / 2 + ear)
+    cr.line_to(w / 2, h / 2)
+    cr.line_to(-w / 2, h / 2)
+    cr.close_path()
+    if tint:
+        r, g, b, _a = _argb(tint)
+        cr.set_source(_grad_v(-h / 2, h / 2, [(0, (min(1, r * 1.15), min(1, g * 1.15), min(1, b * 1.15), alpha)),
+                                              (1, (r * 0.85, g * 0.85, b * 0.85, alpha))]))
+    else:                                                                     # paper: bright at the top, a touch warmer below
+        cr.set_source(_grad_v(-h / 2, h / 2, [(0, (1, 1, 1, alpha)), (1, (0.93, 0.94, 0.95, alpha))]))
+    cr.fill_preserve()
+    cr.set_source_rgba(0.58, 0.62, 0.67, alpha * 0.9)
+    cr.set_line_width(max(0.8, s / 80))
+    cr.stroke()
+    cr.move_to(w / 2 - ear, -h / 2)                                          # the folded corner, shaded
+    cr.line_to(w / 2 - ear, -h / 2 + ear * 0.9)
+    cr.line_to(w / 2, -h / 2 + ear)
+    cr.close_path()
+    cr.set_source(_grad_v(-h / 2, -h / 2 + ear, [(0, (0.80, 0.82, 0.85, alpha)), (1, (0.92, 0.93, 0.95, alpha))]))
+    cr.fill()
+    if lines:
+        cr.set_source_rgba(0.62, 0.66, 0.72, alpha * 0.55)
+        for i in range(5):
+            lw = w * (0.62 if i % 3 != 2 else 0.4)
+            _rrect(cr, -w * 0.32, -h * 0.2 + i * h * 0.12, lw, max(1.0, h * 0.03), 0.6)
+            cr.fill()
+    cr.restore()
+
+
+def _d_folder(cr, x, y, s, open_k=0.0, alpha=1.0, colour="#f6a03c"):
+    w, h = s * 0.86, s * 0.62
+    r, g, b, _a = _argb(colour)
+    cr.save()
+    _d_shadow(cr, x, y + h * 0.52, w * 0.55, 0.28 * alpha)
+    cr.translate(x - w / 2, y - h / 2)
+    cr.move_to(0, h * 0.12)                                                   # back and tab, in shade
+    cr.line_to(w * 0.36, h * 0.12)
+    cr.line_to(w * 0.44, 0)
+    cr.line_to(w, 0)
+    cr.line_to(w, h)
+    cr.line_to(0, h)
+    cr.close_path()
+    cr.set_source(_grad_v(0, h, [(0, (r * 0.85, g * 0.85, b * 0.85, alpha)), (1, (r * 0.62, g * 0.62, b * 0.62, alpha))]))
+    cr.fill()
+    cr.set_source(_grad_v(0, h * 0.6, [(0, (1, 1, 1, alpha)), (1, (0.9, 0.91, 0.93, alpha))]))   # a sheet inside
+    cr.rectangle(w * 0.1, h * 0.08 - h * 0.14 * open_k, w * 0.8, h * 0.6)
+    cr.fill()
+    cr.save()                                                                 # the front flap tips forward as it opens
+    cr.translate(0, h)
+    cr.scale(1, 1 - 0.45 * open_k)
+    _rrect(cr, 0, -h * 0.78, w, h * 0.78, s * 0.05)
+    cr.set_source(_grad_v(-h * 0.78, 0, [(0, (min(1, r * 1.12), min(1, g * 1.12), min(1, b * 1.12), alpha)),
+                                         (1, (r * 0.88, g * 0.88, b * 0.88, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, 0.35 * alpha)                                  # light catching the top edge
+    cr.rectangle(s * 0.04, -h * 0.78, w - s * 0.08, max(1.0, s / 70))
+    cr.fill()
+    cr.restore()
+    cr.restore()
+
+
+def _plane_shape(k):
+    """The outline as a sheet folds into a plane: 0 = flat page, 1 = finished plane (pointing right)."""
+    page = [(22, -26), (22, 26), (-22, 26), (-22, -26), (0, -26)]
+    plane = [(30, 0), (-24, 18), (-12, 2), (-24, -18), (30, 0)]
+    e = _ease(k)
+    return [(_lerp(a[0], b[0], e), _lerp(a[1], b[1], e)) for a, b in zip(page, plane)]
+
+
+def _d_plane(cr, x, y, s, angle=0.0, alpha=1.0, fold=1.0):
+    cr.save()
+    cr.translate(x, y)
+    cr.rotate(angle * _ease(fold))
+    k = s / 60
+    cr.scale(k, k)
+    pts = _plane_shape(fold)
+    cr.move_to(*pts[0])
+    for pt in pts[1:]:
+        cr.line_to(*pt)
+    cr.close_path()
+    cr.set_source(_grad_v(-26, 26, [(0, (1, 1, 1, alpha)), (1, (0.86, 0.89, 0.93, alpha))]))
+    cr.fill_preserve()
+    cr.set_source_rgba(0.45, 0.52, 0.62, alpha * 0.9)
+    cr.set_line_width(1.1)
+    cr.stroke()
+    if fold > 0.3:                                                            # the lower wing in shadow, and the keel crease
+        f = _seg(fold, 0.3, 1)
+        cr.move_to(30, 0)
+        cr.line_to(-12, 2)
+        cr.line_to(-24, 18)
+        cr.close_path()
+        cr.set_source_rgba(0.55, 0.62, 0.72, 0.45 * f * alpha)
+        cr.fill()
+        cr.move_to(30, 0)
+        cr.line_to(-14, 6 * f)
+        cr.set_source_rgba(0.40, 0.46, 0.56, 0.8 * f * alpha)
+        cr.set_line_width(1.0)
+        cr.stroke()
+    elif fold > 0:                                                            # crease lines appearing on the flat page
+        cr.set_source_rgba(0.5, 0.55, 0.62, fold * 2.5 * alpha)
+        cr.set_line_width(0.8)
+        cr.move_to(0, -26)
+        cr.line_to(0, 26)
+        cr.move_to(0, -26)
+        cr.line_to(-22, -4)
+        cr.move_to(0, -26)
+        cr.line_to(22, -4)
+        cr.stroke()
+    cr.restore()
+
+
+def _d_bin(cr, x, y, s, tilt=0.0, alpha=1.0, lid=0.0):
+    """A brushed-metal pedal bin."""
+    w, h = s * 0.5, s * 0.6
+    cr.save()
+    _d_shadow(cr, x, y + h / 2 + 2, w * 0.7, 0.3 * alpha)
+    cr.translate(x, y + h / 2)
+    cr.rotate(tilt)
+    cr.move_to(-w / 2, -h)
+    cr.line_to(w / 2, -h)
+    cr.line_to(w * 0.42, 0)
+    cr.line_to(-w * 0.42, 0)
+    cr.close_path()
+    cr.set_source(_grad_h(-w / 2, w / 2, [(0, (0.38, 0.41, 0.46, alpha)), (0.28, (0.80, 0.83, 0.87, alpha)),
+                                          (0.45, (0.62, 0.65, 0.70, alpha)), (1, (0.30, 0.33, 0.38, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(0, 0, 0, 0.18 * alpha)                                 # vertical ribs
+    cr.set_line_width(max(1.0, s / 70))
+    for i in (-2, -1, 0, 1, 2):
+        cr.move_to(i * w * 0.15, -h * 0.9)
+        cr.line_to(i * w * 0.13, -h * 0.08)
+        cr.stroke()
+    cr.save()                                                                 # the lid, hinged at the back
+    cr.translate(-w * 0.55, -h)
+    cr.rotate(-lid)
+    _rrect(cr, 0, -h * 0.13, w * 1.1, h * 0.11, 3)
+    cr.set_source(_grad_v(-h * 0.13, 0, [(0, (0.72, 0.75, 0.80, alpha)), (1, (0.32, 0.35, 0.40, alpha))]))
+    cr.fill()
+    cr.restore()
+    cr.restore()
+
+
+def _d_safe(cr, x, y, s, door=0.0, dial=0.0, alpha=1.0):
+    """A steel safe; door: 0 = shut, 1 = swung open (in perspective, on its left hinge)."""
+    w = s * 0.86
+    m = w * 0.08
+    cr.save()
+    _d_shadow(cr, x, y + w / 2 + 2, w * 0.62, 0.35 * alpha)
+    cr.translate(x - w / 2, y - w / 2)
+    _rrect(cr, 0, 0, w, w, s * 0.08)                                          # the body: dark brushed steel
+    cr.set_source(_grad_v(0, w, [(0, (0.36, 0.39, 0.44, alpha)), (1, (0.16, 0.18, 0.21, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, 0.12 * alpha)
+    _rrect(cr, 1, 1, w - 2, w * 0.4, s * 0.07)
+    cr.fill()
+    _rrect(cr, m, m, w - 2 * m, w - 2 * m, s * 0.04)                          # the inside, lit from the door
+    g = cairo.RadialGradient(m, w / 2, 0, m, w / 2, w)
+    g.add_color_stop_rgba(0, 0.26, 0.24, 0.20, alpha)
+    g.add_color_stop_rgba(1, 0.06, 0.06, 0.07, alpha)
+    cr.set_source(g)
+    cr.fill()
+    cr.set_source_rgba(0.55, 0.45, 0.25, 0.6 * alpha)                         # a shelf
+    cr.rectangle(m * 1.4, w * 0.58, w - 2.8 * m, max(1.5, s / 45))
+    cr.fill()
+    ang = _ease(door) * math.radians(100)                                     # the door swings towards us
+    cosv, sinv = math.cos(ang), math.sin(ang)
+    dw = (w - 2 * m) * cosv
+    persp = (w - 2 * m) * 0.14 * sinv                                         # the far edge looks taller as it comes round
+    hx, top, bot = m, m, w - m
+    if cosv > 0.02:
+        cr.move_to(hx, top)
+        cr.line_to(hx + dw, top - persp)
+        cr.line_to(hx + dw, bot + persp)
+        cr.line_to(hx, bot)
+        cr.close_path()
+        cr.set_source(_grad_h(hx, hx + max(1, dw), [(0, (0.70, 0.74, 0.79, alpha)), (0.5, (0.86, 0.88, 0.92, alpha)),
+                                                    (1, (0.56, 0.60, 0.66, alpha))]))
+        cr.fill()
+        cr.save()                                                             # the dial and handle, foreshortened
+        cr.translate(hx + dw * 0.5, (top + bot) / 2)
+        cr.scale(max(0.05, cosv), 1)
+        g = cairo.RadialGradient(-w * 0.05, -w * 0.05, 0, 0, 0, w * 0.2)
+        g.add_color_stop_rgba(0, 0.95, 0.96, 0.98, alpha)
+        g.add_color_stop_rgba(1, 0.42, 0.45, 0.50, alpha)
+        cr.set_source(g)
+        cr.arc(0, 0, w * 0.17, 0, 2 * math.pi)
+        cr.fill()
+        cr.rotate(dial)
+        cr.set_source_rgba(0.25, 0.27, 0.31, alpha)
+        cr.set_line_width(max(1.5, s / 28))
+        cr.set_line_cap(1)
+        for i in range(3):
+            a = i * math.pi * 2 / 3
+            cr.move_to(0, 0)
+            cr.line_to(w * 0.13 * math.cos(a), w * 0.13 * math.sin(a))
+            cr.stroke()
+        cr.set_source_rgba(0.85, 0.20, 0.18, alpha)
+        cr.arc(0, -w * 0.14, max(1.2, s / 60), 0, 2 * math.pi)
+        cr.fill()
+        cr.restore()
+        cr.set_source_rgba(0.3, 0.32, 0.36, alpha)                            # bolts on the hinge side
+        for yy in (top + w * 0.12, bot - w * 0.12):
+            cr.arc(hx + max(2, dw * 0.08), yy, max(1.2, s / 55), 0, 2 * math.pi)
+            cr.fill()
+    if sinv > 0.05:                                                           # the door's thickness, seen as it opens
+        thick = w * 0.07 * sinv
+        cr.move_to(hx + dw, top - persp)
+        cr.line_to(hx + dw + thick, top - persp + thick * 0.3)
+        cr.line_to(hx + dw + thick, bot + persp - thick * 0.3)
+        cr.line_to(hx + dw, bot + persp)
+        cr.close_path()
+        cr.set_source_rgba(0.38, 0.41, 0.46, alpha)
+        cr.fill()
+    cr.restore()
+
+
+def _d_shredder(cr, x, y, s, alpha=1.0, run=0.0):
+    w, h = s * 0.95, s * 0.38
+    cr.save()
+    _d_shadow(cr, x, y + h + 2, w * 0.55, 0.3 * alpha)
+    cr.translate(x - w / 2, y)
+    _rrect(cr, 0, 0, w, h, s * 0.07)                                          # glossy plastic housing
+    cr.set_source(_grad_v(0, h, [(0, (0.34, 0.36, 0.40, alpha)), (0.5, (0.20, 0.22, 0.25, alpha)),
+                                 (1, (0.12, 0.13, 0.15, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, 0.16 * alpha)
+    _rrect(cr, s * 0.03, 1, w - s * 0.06, h * 0.3, s * 0.05)
+    cr.fill()
+    _rrect(cr, w * 0.12, h * 0.12, w * 0.76, h * 0.15, 2)                     # the slot
+    cr.set_source_rgba(0.02, 0.02, 0.03, alpha)
+    cr.fill()
+    glow = 0.5 + 0.5 * math.sin(run * 40) if run > 0 else 0.3                 # the running light
+    g = cairo.RadialGradient(w * 0.88, h * 0.65, 0, w * 0.88, h * 0.65, s * 0.09)
+    g.add_color_stop_rgba(0, 0.3, 1.0, 0.45, alpha * glow)
+    g.add_color_stop_rgba(1, 0.3, 1.0, 0.45, 0)
+    cr.set_source(g)
+    cr.arc(w * 0.88, h * 0.65, s * 0.09, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgba(0.3, 1.0, 0.45, alpha * (0.4 + 0.6 * glow))
+    cr.arc(w * 0.88, h * 0.65, s * 0.03, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def _d_box(cr, x, y, s, zip_k=0.0, alpha=1.0, lid_open=0.0):
+    """A cardboard parcel with a zipper along the top: zip_k 0 = open … 1 = zipped shut."""
+    w, h = s * 0.9, s * 0.62
+    cr.save()
+    _d_shadow(cr, x, y + h / 2 + 2, w * 0.6, 0.3 * alpha)
+    cr.translate(x - w / 2, y - h / 2)
+    _rrect(cr, 0, h * 0.18, w, h * 0.82, s * 0.04)                            # cardboard: lit front, darker sides
+    cr.set_source(_grad_h(0, w, [(0, (0.66, 0.48, 0.28, alpha)), (0.15, (0.84, 0.64, 0.40, alpha)),
+                                 (0.85, (0.80, 0.60, 0.37, alpha)), (1, (0.62, 0.45, 0.26, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(0.45, 0.32, 0.18, 0.18 * alpha)                        # corrugation lines
+    cr.set_line_width(0.7)
+    for i in range(1, 8):
+        cr.move_to(w * i / 8, h * 0.22)
+        cr.line_to(w * i / 8, h * 0.98)
+        cr.stroke()
+    cr.set_source_rgba(0.93, 0.86, 0.66, 0.85 * alpha)                        # packing tape down the front
+    cr.rectangle(w * 0.43, h * 0.18, w * 0.14, h * 0.82)
+    cr.fill()
+    for side in (0, 1):                                                       # the two flaps
+        cr.save()
+        cr.translate(0 if side == 0 else w, h * 0.18)
+        cr.rotate((-1 if side == 0 else 1) * lid_open * 1.1)
+        cr.rectangle(0 if side == 0 else -w / 2, -h * 0.18, w / 2, h * 0.2)
+        cr.set_source(_grad_v(-h * 0.18, 0, [(0, (0.86, 0.67, 0.43, alpha)), (1, (0.70, 0.51, 0.30, alpha))]))
+        cr.fill()
+        cr.restore()
+    if lid_open < 0.05:
+        zx = w * 0.06 + (w * 0.88) * zip_k
+        cr.set_source_rgba(0.18, 0.18, 0.2, alpha)                            # closed teeth behind the pull
+        cr.set_line_width(max(2.0, s / 22))
+        cr.move_to(w * 0.06, h * 0.12)
+        cr.line_to(zx, h * 0.12)
+        cr.stroke()
+        cr.set_line_width(max(1.0, s / 50))                                   # open teeth ahead of it
+        cr.set_dash([max(1.0, s / 45), max(1.0, s / 45)])
+        cr.move_to(zx, h * 0.07)
+        cr.line_to(w * 0.94, h * 0.07)
+        cr.move_to(zx, h * 0.17)
+        cr.line_to(w * 0.94, h * 0.17)
+        cr.stroke()
+        cr.set_dash([])
+        _rrect(cr, zx - s * 0.045, h * 0.04, s * 0.09, s * 0.18, 2)           # a brass pull
+        cr.set_source(_grad_h(zx - s * 0.045, zx + s * 0.045, [(0, (0.75, 0.55, 0.15, alpha)),
+                                                               (0.5, (1.0, 0.88, 0.45, alpha)),
+                                                               (1, (0.70, 0.50, 0.12, alpha))]))
+        cr.fill()
+    cr.restore()
+
+
+def _d_tag(cr, x, y, s, colour, swing=0.0, alpha=1.0):
+    r, g, b, _a = _argb(colour)
+    cr.save()
+    cr.translate(x, y)
+    cr.rotate(swing)
+    cr.set_source_rgba(0.45, 0.42, 0.38, alpha)                               # a cotton string
+    cr.set_line_width(1.3)
+    cr.move_to(0, 0)
+    cr.curve_to(s * 0.03, s * 0.08, -s * 0.03, s * 0.17, 0, s * 0.25)
+    cr.stroke()
+    w, h = s * 0.42, s * 0.28
+    cr.translate(0, s * 0.25)
+    cr.move_to(0, 0)
+    cr.line_to(w / 2, h * 0.35)
+    cr.line_to(w / 2, h * 1.3)
+    cr.line_to(-w / 2, h * 1.3)
+    cr.line_to(-w / 2, h * 0.35)
+    cr.close_path()
+    cr.set_source(_grad_h(-w / 2, w / 2, [(0, (min(1, r * 1.2), min(1, g * 1.2), min(1, b * 1.2), alpha)),
+                                          (1, (r * 0.75, g * 0.75, b * 0.75, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(0.85, 0.85, 0.88, alpha)                                # a metal eyelet
+    cr.set_line_width(max(1.0, s / 60))
+    cr.arc(0, h * 0.45, s * 0.035, 0, 2 * math.pi)
+    cr.stroke()
+    cr.restore()
+
+
+def _d_pin(cr, x, y, s, alpha=1.0):
+    cr.save()
+    cr.translate(x, y)
+    cr.set_source(_grad_h(-s * 0.02, s * 0.02, [(0, (0.45, 0.47, 0.5, alpha)), (0.5, (0.92, 0.93, 0.95, alpha)),
+                                                (1, (0.45, 0.47, 0.5, alpha))]))
+    cr.move_to(-s * 0.018, -s * 0.22)                                         # a steel needle, tapering
+    cr.line_to(s * 0.018, -s * 0.22)
+    cr.line_to(0, 0)
+    cr.close_path()
+    cr.fill()
+    g = cairo.RadialGradient(-s * 0.05, -s * 0.37, 0, 0, -s * 0.32, s * 0.15)  # a glossy red head
+    g.add_color_stop_rgba(0, 1.0, 0.65, 0.62, alpha)
+    g.add_color_stop_rgba(0.35, 0.92, 0.22, 0.20, alpha)
+    g.add_color_stop_rgba(1, 0.55, 0.08, 0.08, alpha)
+    cr.set_source(g)
+    cr.arc(0, -s * 0.32, s * 0.13, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, alpha * 0.75)
+    cr.arc(-s * 0.05, -s * 0.37, s * 0.03, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def _d_glass(cr, x, y, s, alpha=1.0):
+    cr.save()
+    cr.translate(x, y)
+    _d_shadow(cr, s * 0.1, s * 0.5, s * 0.35, 0.22 * alpha)
+    cr.save()                                                                 # a lacquered handle
+    cr.rotate(math.pi / 4)
+    _rrect(cr, s * 0.26, -s * 0.06, s * 0.3, s * 0.12, s * 0.05)
+    cr.set_source(_grad_v(-s * 0.06, s * 0.06, [(0, (0.45, 0.26, 0.15, alpha)), (0.4, (0.70, 0.45, 0.28, alpha)),
+                                                (1, (0.30, 0.16, 0.09, alpha))]))
+    cr.fill()
+    cr.restore()
+    g = cairo.RadialGradient(-s * 0.08, -s * 0.08, 0, 0, 0, s * 0.26)         # the lens: clear, a little blue at the rim
+    g.add_color_stop_rgba(0, 1, 1, 1, alpha * 0.35)
+    g.add_color_stop_rgba(0.8, 0.75, 0.88, 1.0, alpha * 0.22)
+    g.add_color_stop_rgba(1, 0.55, 0.72, 0.95, alpha * 0.4)
+    cr.set_source(g)
+    cr.arc(0, 0, s * 0.26, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_line_width(max(2.0, s / 14))                                       # a chrome rim
+    cr.set_source(_grad_v(-s * 0.3, s * 0.3, [(0, (0.92, 0.93, 0.95, alpha)), (0.5, (0.45, 0.48, 0.52, alpha)),
+                                              (1, (0.80, 0.82, 0.85, alpha))]))
+    cr.arc(0, 0, s * 0.26, 0, 2 * math.pi)
+    cr.stroke()
+    cr.set_source_rgba(1, 1, 1, alpha * 0.7)                                  # a glint
+    cr.set_line_width(max(1.5, s / 30))
+    cr.arc(0, 0, s * 0.17, math.radians(200), math.radians(250))
+    cr.stroke()
+    cr.restore()
+
+
+def _d_card(cr, x, y, s, alpha=1.0, check=0.0):
+    w, h = s * 0.62, s * 0.76
+    cr.save()
+    _d_shadow(cr, x, y + h / 2 + 2, w * 0.55, 0.25 * alpha)
+    cr.translate(x - w / 2, y - h / 2)
+    _rrect(cr, 0, 0, w, h, s * 0.06)                                          # a hardboard clipboard
+    cr.set_source(_grad_v(0, h, [(0, (0.74, 0.55, 0.36, alpha)), (1, (0.52, 0.37, 0.22, alpha))]))
+    cr.fill()
+    cr.set_source(_grad_v(h * 0.14, h * 0.92, [(0, (1, 1, 1, alpha)), (1, (0.93, 0.94, 0.95, alpha))]))
+    cr.rectangle(w * 0.1, h * 0.14, w * 0.8, h * 0.78)
+    cr.fill()
+    _rrect(cr, w * 0.28, -h * 0.05, w * 0.44, h * 0.16, 3)                    # a chrome clip
+    cr.set_source(_grad_v(-h * 0.05, h * 0.11, [(0, (0.95, 0.96, 0.97, alpha)), (0.5, (0.55, 0.58, 0.62, alpha)),
+                                                (1, (0.78, 0.80, 0.83, alpha))]))
+    cr.fill()
+    if check > 0:
+        cr.set_source_rgba(0.13, 0.70, 0.35, alpha)
+        cr.set_line_width(max(2.0, s / 14))
+        cr.set_line_cap(1)
+        pts = [(w * 0.28, h * 0.55), (w * 0.45, h * 0.72), (w * 0.75, h * 0.36)]
+        cr.move_to(*pts[0])
+        if check < 0.5:
+            k = check / 0.5
+            cr.line_to(_lerp(pts[0][0], pts[1][0], k), _lerp(pts[0][1], pts[1][1], k))
+        else:
+            k = (check - 0.5) / 0.5
+            cr.line_to(*pts[1])
+            cr.line_to(_lerp(pts[1][0], pts[2][0], k), _lerp(pts[1][1], pts[2][1], k))
+        cr.stroke()
+    cr.restore()
+
+
+def _d_bubble(cr, x, y, s, alpha=1.0, stretch=1.0):
+    w, h = s * 0.9, s * 0.5
+    cr.save()
+    cr.translate(x, y)
+    cr.scale(1 / max(0.6, stretch), stretch)
+    cr.set_source_rgba(0, 0, 0, 0.12 * alpha)
+    _rrect(cr, -w / 2 + 1, -h / 2 + 2, w, h, h / 2.2)
+    cr.fill()
+    _rrect(cr, -w / 2, -h / 2, w, h, h / 2.2)
+    cr.move_to(w * 0.25, h * 0.35)
+    cr.line_to(w * 0.42, h * 0.62)
+    cr.line_to(w * 0.38, h * 0.3)
+    cr.set_source(_grad_v(-h / 2, h / 2, [(0, (1.0, 0.62, 0.30, alpha)), (1, (0.90, 0.40, 0.08, alpha))]))
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, 0.3 * alpha)                                  # gloss
+    _rrect(cr, -w * 0.4, -h * 0.42, w * 0.8, h * 0.32, h * 0.16)
+    cr.fill()
+    cr.set_source_rgba(1, 1, 1, alpha * 0.9)
+    for i in range(3):
+        cr.arc(-w * 0.18 + i * w * 0.18, h * 0.04, s * 0.04, 0, 2 * math.pi)
+        cr.fill()
+    cr.restore()
+
+
+def _d_calendar(cr, x, y, s, flip=0.0, alpha=1.0, day="", next_day=""):
+    """A desk calendar; flip 0…1 turns the top page back over its binding (in perspective)."""
+    w, h = s * 0.8, s * 0.82
+    top = h * 0.26
+    cr.save()
+    _d_shadow(cr, x, y + h / 2 + 2, w * 0.6, 0.28 * alpha)
+    cr.translate(x - w / 2, y - h / 2)
+
+    def page(label, shade=1.0):
+        cr.set_source(_grad_v(top, h, [(0, (1 * shade, 1 * shade, 1 * shade, alpha)),
+                                       (1, (0.92 * shade, 0.93 * shade, 0.94 * shade, alpha))]))
+        _rrect(cr, 0, top - 2, w, h - top + 2, s * 0.05)
+        cr.fill()
+        cr.set_source_rgba(0.2, 0.22, 0.26, alpha)
+        cr.select_font_face("Sans", 0, 1)
+        cr.set_font_size(h * 0.38)
+        ext = cr.text_extents(label)
+        cr.move_to(w / 2 - ext.width / 2 - ext.x_bearing, h * 0.8)
+        cr.show_text(label)
+    page(next_day or day)                                                     # the page underneath
+    if flip > 0:
+        e = _ease(flip)
+        ang = e * math.pi
+        cy = math.cos(ang)
+        ph = (h - top) * cy                                                   # height of the turning page as seen
+        lift = (h - top) * 0.12 * math.sin(ang)
+        cr.save()
+        cr.move_to(0, top)
+        cr.line_to(w, top)
+        cr.line_to(w + lift * 0.4, top + ph)
+        cr.line_to(-lift * 0.4, top + ph)
+        cr.close_path()
+        shade = 1.0 if cy > 0 else 0.82                                       # the back of the page is in shadow
+        cr.set_source_rgba(1 * shade, 1 * shade, 1 * shade, alpha)
+        cr.fill_preserve()
+        cr.set_source_rgba(0.6, 0.62, 0.66, alpha * 0.6)
+        cr.set_line_width(0.8)
+        cr.stroke()
+        if cy > 0.15:
+            cr.save()
+            cr.translate(0, top)
+            cr.scale(1, cy)
+            cr.translate(0, -top)
+            cr.set_source_rgba(0.2, 0.22, 0.26, alpha)
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(h * 0.38)
+            ext = cr.text_extents(day)
+            cr.move_to(w / 2 - ext.width / 2 - ext.x_bearing, h * 0.8)
+            cr.show_text(day)
+            cr.restore()
+        cr.restore()
+    else:
+        page(day)
+    _rrect(cr, 0, 0, w, top, s * 0.06)                                        # the red header
+    cr.set_source(_grad_v(0, top, [(0, (0.95, 0.35, 0.30, alpha)), (1, (0.75, 0.16, 0.14, alpha))]))
+    cr.fill()
+    for i in (0.25, 0.5, 0.75):                                               # binding rings
+        cr.set_source(_grad_h(w * i - 3, w * i + 3, [(0, (0.5, 0.52, 0.55, alpha)), (0.5, (0.95, 0.95, 0.97, alpha)),
+                                                     (1, (0.5, 0.52, 0.55, alpha))]))
+        _rrect(cr, w * i - 2.5, -h * 0.06, 5, h * 0.14, 2.5)
+        cr.fill()
+    cr.restore()
+
+
+def _d_sparkle(cr, x, y, r, alpha):
+    cr.save()
+    cr.translate(x, y)
+    g = cairo.RadialGradient(0, 0, 0, 0, 0, r * 1.6)
+    g.add_color_stop_rgba(0, 1.0, 0.95, 0.7, alpha * 0.6)
+    g.add_color_stop_rgba(1, 1.0, 0.8, 0.2, 0)
+    cr.set_source(g)
+    cr.arc(0, 0, r * 1.6, 0, 2 * math.pi)
+    cr.fill()
+    cr.set_source_rgba(1.0, 0.86, 0.35, alpha)
+    cr.move_to(0, -r)
+    for i in range(1, 8):
+        a = i * math.pi / 4
+        rr = r if i % 2 == 0 else r * 0.3
+        cr.line_to(rr * math.sin(a), -rr * math.cos(a))
+    cr.close_path()
+    cr.fill()
+    cr.restore()
+
+
+def _d_ring(cr, x, y, r, alpha, colour="#ff7a1a", width=3.0):
+    cr.set_source_rgba(*_argb(colour, alpha))
+    cr.set_line_width(width)
+    cr.arc(x, y, r, 0, 2 * math.pi)
+    cr.stroke()
+    cr.set_source_rgba(*_argb(colour, alpha * 0.25))                          # a soft halo
+    cr.set_line_width(width * 3)
+    cr.arc(x, y, r, 0, 2 * math.pi)
+    cr.stroke()
+
+
+def _d_text_card(cr, x, y, text, scale_y, dark=True, alpha=1.0):
+    """A split-flap tile (like a station departures board)."""
+    cr.save()
+    cr.select_font_face("Sans", 0, 1)
+    cr.set_font_size(13)
+    ext = cr.text_extents(text)
+    w, h = ext.x_advance + 18, 26
+    cr.translate(x, y)
+    cr.set_source_rgba(0, 0, 0, 0.25 * alpha)
+    _rrect(cr, 1, -h / 2 + 2, w, h, 5)
+    cr.fill()
+    cr.scale(1, max(0.02, scale_y))
+    _rrect(cr, 0, -h / 2, w, h, 5)
+    cr.set_source(_grad_v(-h / 2, h / 2, [(0, (0.20, 0.21, 0.25, 0.96 * alpha)), (0.5, (0.12, 0.13, 0.16, 0.96 * alpha)),
+                                          (0.5, (0.17, 0.18, 0.22, 0.96 * alpha)), (1, (0.10, 0.11, 0.13, 0.96 * alpha))]))
+    cr.fill()
+    cr.set_source_rgba(1, 0.84, 0.35, alpha)
+    cr.move_to(9, 5)
+    cr.show_text(text)
+    cr.set_source_rgba(0, 0, 0, 0.55 * alpha)                                 # the split line
+    cr.rectangle(0, -0.6, w, 1.2)
+    cr.fill()
+    cr.restore()
+
+
+def _blur_trail(cr, draw_at, positions, alpha=0.18):
+    """Motion blur: faint copies where the object just was."""
+    n = len(positions)
+    for i, pt in enumerate(positions):
+        draw_at(cr, pt, alpha * (i + 1) / (n + 1))
+
+
+class AnimLayer(Gtk.Box):
+    """A see-through layer over the window that draws whatever animations are running. It has no window of its own
+    (unlike a DrawingArea), so clicks always go straight through to the files underneath."""
+
+    def __init__(self, win):
+        super().__init__()
+        self.set_has_window(False)
+        self.win = win
+        self.anims = []                                     # always there (sized with the window), draws nothing when idle
+        self.connect("draw", self._draw)
+
+    def add(self, dur, fn, **data):
+        if not MainWindow._cairo_ok():
+            return None
+        a = dict(data, t0=time.time(), dur=max(0.05, dur * _trash_anim_scale(self.win)), fn=fn,
+                 s=_trash_anim_size(self.win))
+        self.anims.append(a)
+        if getattr(self, "_tick", None) is None:
+            self._tick = GLib.timeout_add(16, self._step)
+        return a
+
+    def _step(self):
+        now = time.time()
+        for a in [a for a in self.anims if now - a["t0"] >= a["dur"]]:
+            self.anims.remove(a)
+            if a.get("done"):
+                try:
+                    a["done"]()
+                except Exception:
+                    pass
+        if not self.anims:
+            self._tick = None
+            self.queue_draw()                                # clear the last frame
+            return False
+        self.queue_draw()
+        return True
+
+    def _draw(self, _w, cr):
+        if not self.anims:
+            return False
+        now = time.time()
+        for a in list(self.anims):
+            k = max(0.0, min(1.0, (now - a["t0"]) / a["dur"]))
+            cr.save()
+            try:
+                a["fn"](cr, k, a)
+            except Exception:
+                pass
+            cr.restore()
+        return False
+
+
+# ---------- the animations: fn(cr, k, a) with k = 0 … 1
+def _an_copy(cr, k, a):
+    s = a["s"]
+    lift = a.get("lift", 90)
+    fk = _seg(k, 0.15, 0.85)
+    p = _arc_pt(a["src"], a["dst"], fk, lift)
+    peel = _seg(k, 0, 0.2)
+    _d_page(cr, a["src"][0], a["src"][1], s, 0.5 * (1 - _seg(k, 0.7, 1)))
+    if 0 < fk < 1:                                                            # shadow on the ground under the flying copy
+        gx = _lerp(a["src"][0], a["dst"][0], _ease(fk))
+        gy = _lerp(a["src"][1], a["dst"][1], _ease(fk)) + s * 0.45
+        hgt = math.sin(math.pi * _ease(fk))
+        _d_shadow(cr, gx, gy, s * (0.35 - 0.12 * hgt), 0.25 * (1 - 0.6 * hgt))
+        _blur_trail(cr, lambda c, pt, al: _d_page(c, pt[0], pt[1], s, al, shadow=False),
+                    [_arc_pt(a["src"], a["dst"], max(0, fk - d), lift) for d in (0.09, 0.06, 0.03)])
+    _d_page(cr, p[0] + 6 * peel, p[1] - 6 * peel, s, 0.65 + 0.3 * peel, rot=0.12 * math.sin(math.pi * k))
+    g = _seg(k, 0.82, 1)
+    if g > 0:
+        _d_ring(cr, a["dst"][0], a["dst"][1], s * (0.4 + 0.6 * g), 1 - g, "#22c55e")
+
+
+def _an_move(cr, k, a):
+    s = a["s"]
+    lift = _seg(k, 0, 0.18)
+    fly = _seg(k, 0.18, 0.8)
+    land = _seg(k, 0.8, 1)
+    p = _arc_pt(a["src"], a["dst"], fly, a.get("lift", 110))
+    bounce = math.sin(math.pi * land) * s * 0.12 * (1 - land)
+    hgt = s * 0.12 * lift * (1 - land)
+    cr.set_source_rgba(0, 0, 0, 0.18 * lift * (1 - land))
+    cr.save()
+    cr.translate(p[0] + hgt, p[1] + s * 0.42 + hgt)
+    cr.scale(1, 0.25)
+    cr.arc(0, 0, s * 0.3, 0, 2 * math.pi)
+    cr.restore()
+    cr.fill()
+    if 0 < fly < 1:
+        _blur_trail(cr, lambda c, pt, al: _d_page(c, pt[0], pt[1] - hgt, s, al, shadow=False),
+                    [_arc_pt(a["src"], a["dst"], max(0, fly - d), a.get("lift", 110)) for d in (0.09, 0.06, 0.03)])
+    _d_page(cr, p[0], p[1] - hgt - bounce, s * (1 + 0.08 * lift * (1 - land)), rot=0.1 * math.sin(math.pi * fly))
+
+
+def _an_rename(cr, k, a):
+    x, y = a["at"]
+    if k < 0.45:
+        _d_text_card(cr, x, y, a["old"], 1 - _ease(k / 0.45))
+    else:
+        _d_text_card(cr, x, y, a["new"], _back(_seg(k, 0.45, 0.85)), alpha=1 - _seg(k, 0.88, 1))
+
+
+def _an_ripple(cr, k, a):
+    for i, (x, y) in enumerate(a["rows"]):
+        kk = _seg(k, i * 0.05, i * 0.05 + 0.4)
+        if 0 < kk < 1:
+            cr.set_source_rgba(1.0, 0.6, 0.15, 0.25 * math.sin(math.pi * kk))
+            _rrect(cr, x, y - 12, a["w"], 24, 6)
+            cr.fill()
+            _d_sparkle(cr, x + 14, y, 7 * math.sin(math.pi * kk), math.sin(math.pi * kk))
+
+
+def _an_new_folder(cr, k, a):
+    x, y = a["at"]
+    pop = _back(_seg(k, 0, 0.45))
+    _d_folder(cr, x, y, a["s"] * max(0.01, pop), open_k=_ease(_seg(k, 0.45, 0.8)), alpha=1 - _seg(k, 0.85, 1))
+    if k > 0.4:
+        for i in range(5):
+            ang = i * 2 * math.pi / 5 - math.pi / 2
+            r = a["s"] * (0.5 + 0.4 * _seg(k, 0.4, 1))
+            _d_sparkle(cr, x + r * math.cos(ang), y + r * math.sin(ang), 6, 1 - _seg(k, 0.4, 1))
+
+
+def _an_duplicate(cr, k, a):
+    x, y = a["at"]
+    s = a["s"]
+    shake = math.sin(k * 40) * 3 * (1 - _seg(k, 0, 0.3)) if k < 0.3 else 0
+    split = _back(_seg(k, 0.3, 0.75))
+    alpha = 1 - _seg(k, 0.85, 1)
+    _d_page(cr, x - split * s * 0.35 + shake, y, s, alpha, rot=-0.08 * split)
+    _d_page(cr, x + split * s * 0.35 + shake, y, s, alpha, rot=0.08 * split)
+
+
+def _an_vault(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 1.3
+    lock = a.get("lock", True)
+    kk = k if lock else 1 - k
+    files = _seg(kk, 0, 0.35)
+    door = 1 - _ease(_seg(kk, 0.35, 0.65))                                    # 1 open → 0 shut
+    dial = _seg(kk, 0.65, 0.95) * math.pi * 3
+    alpha = 1 - _seg(k, 0.92, 1)
+    _d_safe(cr, x, y, s, door=door, dial=dial, alpha=alpha)
+    if files < 1:
+        for i in range(3):
+            st = (x - s * (1.1 + 0.25 * i), y - s * (0.5 - 0.35 * i))
+            p = _arc_pt(st, (x, y), files, s * 0.4)
+            _d_page(cr, p[0], p[1], s * 0.45 * (1 - 0.6 * files), alpha * (1 - files * 0.8))
+    if lock and k > 0.93:
+        cr.set_source_rgba(0.13, 0.70, 0.35, 1 - _seg(k, 0.93, 1))
+        cr.arc(x + s * 0.42, y - s * 0.42, s * 0.12, 0, 2 * math.pi)
+        cr.fill()
+
+
+def _an_empty_trash(cr, k, a):
+    x, y = a["at"]
+    s = a["s"]
+    tilt = math.sin(math.pi * _seg(k, 0, 0.7)) * 1.0
+    _d_bin(cr, x, y, s, tilt=tilt, lid=0.9 * math.sin(math.pi * _seg(k, 0, 0.7)), alpha=1 - _seg(k, 0.9, 1))
+    import random as _r
+    rnd = _r.Random(3)
+    for i in range(a.get("n", 5)):
+        kk = _seg(k, 0.15 + i * 0.05, 0.75 + i * 0.03)
+        if kk <= 0:
+            continue
+        vx, vy = s * (0.8 + rnd.random() * 1.2), -s * (0.6 + rnd.random() * 0.6)
+        px = x + vx * kk
+        py = y - s * 0.2 + vy * kk + s * 2.2 * kk * kk
+        if kk < 0.75:
+            pb = _svg_pixbuf(_paper_svg(1, i * 70 + kk * 300, 1, int(s * 0.45)))
+            Gdk.cairo_set_source_pixbuf(cr, pb, px - pb.get_width() / 2, py - pb.get_height() / 2)
+            cr.paint()
+        else:                                                                 # turns to dust
+            d = _seg(kk, 0.75, 1)
+            for j in range(8):
+                cr.set_source_rgba(0.75, 0.77, 0.8, 1 - d)
+                cr.arc(px + math.cos(j) * s * 0.4 * d, py + math.sin(j * 1.7) * s * 0.4 * d - s * 0.3 * d,
+                       2.2 * (1 - d) + 0.5, 0, 2 * math.pi)
+                cr.fill()
+
+
+def _an_shred(cr, k, a):
+    x, y = a["at"]
+    s = a["s"]
+    alpha = 1 - _seg(k, 0.9, 1)
+    feed = _ease(_seg(k, 0.15, 0.75))
+    sy = y + s * 0.2
+    cr.save()                                                                 # the page sinks into the slot
+    cr.rectangle(x - s, y - s * 2, s * 2, sy - (y - s * 2) + s * 0.05)
+    cr.clip()
+    _d_page(cr, x, y - s * 0.45 + feed * s * 0.85, s, alpha)
+    cr.restore()
+    w = s * 0.62
+    for i in range(7):                                                        # strips come out underneath
+        kk = _seg(k, 0.25 + i * 0.02, 1)
+        if kk <= 0:
+            continue
+        ln = s * 0.7 * min(1, kk * 1.6)
+        fall = s * 0.9 * max(0, kk - 0.6) ** 2 * 6
+        sx = x - w / 2 + (i + 0.5) * w / 7
+        cr.set_source_rgba(0.97, 0.97, 0.98, alpha * (1 - _seg(kk, 0.75, 1)))
+        cr.save()
+        cr.translate(sx + math.sin(i * 2.1) * fall * 0.15, sy + s * 0.38 + fall)
+        cr.rotate(math.sin(i * 1.3) * 0.25 * max(0, kk - 0.6))
+        cr.rectangle(-w / 16, 0, w / 8.5, ln)
+        cr.fill()
+        cr.restore()
+    _d_shredder(cr, x, sy, s, alpha, run=k if 0.15 < k < 0.85 else 0.0)
+
+
+def _an_zip(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 1.2
+    alpha = 1 - _seg(k, 0.88, 1)
+    fill = _seg(k, 0, 0.4)
+    for i in range(3):                                                        # files squeezed in
+        st = (x + (i - 1) * s * 0.6, y - s * 0.9)
+        p = _arc_pt(st, (x, y - s * 0.1), fill, s * 0.2)
+        if fill < 1:
+            _d_page(cr, p[0], p[1], s * 0.45 * (1 - 0.5 * fill), 1 - fill * 0.9)
+    squeeze = 1 + 0.06 * math.sin(math.pi * _seg(k, 0.35, 0.5))
+    cr.save()
+    cr.translate(x, y)
+    cr.scale(squeeze, 1 / squeeze)
+    _d_box(cr, 0, 0, s, zip_k=_ease(_seg(k, 0.45, 0.85)), alpha=alpha, lid_open=0.0)
+    cr.restore()
+
+
+def _an_unzip(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 1.2
+    alpha = 1 - _seg(k, 0.9, 1)
+    zipk = 1 - _ease(_seg(k, 0, 0.35))
+    pop = _seg(k, 0.35, 0.5)
+    _d_box(cr, x, y, s, zip_k=zipk, alpha=alpha, lid_open=_back(pop) if k > 0.35 else 0.0)
+    out = _seg(k, 0.45, 0.9)
+    if out > 0:
+        for i in range(3):
+            dst = (x + (i - 1) * s * 0.75, y + s * 0.15)
+            p = _arc_pt((x, y - s * 0.1), dst, out, s * 0.8)
+            _d_page(cr, p[0], p[1], s * 0.45, alpha, rot=(i - 1) * 0.2 * (1 - out))
+
+
+def _an_plane(cr, k, a):
+    """Send: the page folds itself into a paper plane, which flies off with a dotted trail. Receive: a plane flies in,
+    lands, and unfolds back into a page."""
+    s = a["s"]
+    src, dst = a["src"], a["dst"]
+    lift = a.get("lift", 70)
+    receive = a.get("receive", False)
+    if not receive:
+        fold, fly = _seg(k, 0, 0.3), _seg(k, 0.3, 0.88)
+    else:
+        fly, fold = _seg(k, 0, 0.6), 1 - _seg(k, 0.65, 0.95)
+    p0 = src if not receive else src
+    p = _arc_pt(p0, dst, fly, lift)
+    q = _arc_pt(p0, dst, min(1, fly + 0.02), lift)
+    ang = math.atan2(q[1] - p[1], q[0] - p[0]) if 0 < fly < 1 else (0 if not receive else 0)
+    if 0 < fly < 1:
+        cr.set_source_rgba(0.55, 0.6, 0.68, 0.55)                             # the dotted trail
+        for i in range(16):
+            t = fly - i * 0.03
+            if 0 < t < fly:
+                tp = _arc_pt(p0, dst, t, lift)
+                cr.arc(tp[0], tp[1], 1.6 * (1 - i / 18), 0, 2 * math.pi)
+                cr.fill()
+        gx = _lerp(p0[0], dst[0], _ease(fly))
+        gy = max(p0[1], dst[1]) + s * 0.6
+        _d_shadow(cr, gx, gy, s * 0.3, 0.12)
+    if not receive:
+        at = src if fly <= 0 else p
+        alpha = 1 - _seg(k, 0.9, 1)
+        if fly <= 0:
+            _d_page(cr, at[0], at[1], s, 1 - fold * 0.2) if fold < 0.08 else None
+        _d_plane(cr, at[0], at[1], s * 0.8, ang, alpha, fold=fold)
+        if k > 0.86:
+            g = _seg(k, 0.86, 1)
+            _d_ring(cr, dst[0], dst[1], s * 0.2 + s * 0.4 * g, 1 - g, "#3b82f6")
+    else:
+        at = p if fly < 1 else dst
+        if fold > 0.05:
+            _d_plane(cr, at[0], at[1], s * 0.8, ang if fly < 1 else 0, 1.0, fold=fold)
+        else:
+            _d_page(cr, dst[0], dst[1], s, 1 - _seg(k, 0.95, 1))
+
+
+def _an_clip(cr, k, a):
+    s = a["s"] * 0.8
+    p = _arc_pt(a["src"], a["dst"], _seg(k, 0.05, 0.75), 30)
+    _d_card(cr, p[0], p[1], s, alpha=1 - _seg(k, 0.92, 1), check=_seg(k, 0.75, 0.92))
+
+
+def _an_bubble(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 0.7
+    up = _ease_out(_seg(k, 0, 0.8))
+    stretch = 1 + 0.35 * math.sin(math.pi * _seg(k, 0, 0.5))
+    _d_bubble(cr, x, y - up * s * 2.2, s, 1 - _seg(k, 0.6, 1), stretch)
+
+
+def _an_tag(cr, k, a):
+    x, y = a["at"]
+    drop = _ease_out(_seg(k, 0, 0.35))
+    swing = math.sin(_seg(k, 0.3, 1) * math.pi * 4) * 0.55 * (1 - _seg(k, 0.3, 1))
+    _d_tag(cr, x, y - a["s"] * 0.6 * (1 - drop), a["s"], a["colour"], swing, 1 - _seg(k, 0.88, 1))
+
+
+def _an_pin(cr, k, a):
+    s = a["s"]
+    x, y = a["at"]
+    drop = _seg(k, 0, 0.35)
+    py = y - s * 1.4 * (1 - _ease(drop) if drop < 1 else 0)
+    if k < 0.55:
+        _d_page(cr, x, y + s * 0.2, s * 0.8, 1.0, lines=False, tint="#f6a03c")
+        _d_shadow(cr, x + s * 0.05, y + s * 0.05, s * (0.08 + 0.1 * drop), 0.35 * drop)
+        _d_pin(cr, x, py - s * 0.15, s)
+        if 0.35 < k < 0.5:
+            _d_ring(cr, x, y, s * 0.3 + s * 0.4 * _seg(k, 0.35, 0.5), 1 - _seg(k, 0.35, 0.5), "#ef4444", 2)
+    else:
+        dst = a.get("dst", (x, y))
+        p = _arc_pt((x, y), dst, _seg(k, 0.55, 0.95), 60)
+        sc = 1 - 0.5 * _seg(k, 0.55, 0.95)
+        _d_page(cr, p[0], p[1] + s * 0.2 * sc, s * 0.8 * sc, 1 - _seg(k, 0.92, 1), lines=False, tint="#f6a03c")
+        _d_pin(cr, p[0], p[1] - s * 0.15 * sc, s * sc, 1 - _seg(k, 0.92, 1))
+
+
+def _an_rules(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 0.8
+    w = s * 3
+    alpha = 1 - _seg(k, 0.9, 1)
+    cr.set_source_rgba(0.3, 0.33, 0.38, alpha)                                # the belt
+    _rrect(cr, x - w / 2, y, w, s * 0.16, s * 0.08)
+    cr.fill()
+    cr.set_source_rgba(0.6, 0.63, 0.68, alpha)
+    for i in range(7):
+        rx = x - w / 2 + ((i * w / 6 + k * w * 0.5) % w)
+        cr.arc(rx, y + s * 0.08, s * 0.05, 0, 2 * math.pi)
+        cr.fill()
+    _d_folder(cr, x + w / 2 + s * 0.35, y + s * 0.15, s * 0.8, alpha=alpha, colour="#3b82f6")
+    ride = _seg(k, 0.05, 0.7)
+    drop = _seg(k, 0.7, 0.85)
+    px = x - w / 2 + s * 0.3 + (w - s * 0.1) * ride
+    py = y - s * 0.32 + drop * s * 0.4
+    if drop < 1:
+        _d_page(cr, px, py, s * 0.55, alpha * (1 - drop), rot=drop * 0.6)
+
+
+def _an_download(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 0.8
+    fall = _seg(k, 0, 0.55)
+    py = _lerp(y - s * 3, y, fall * fall)
+    land = _seg(k, 0.55, 0.85)
+    bounce = math.sin(math.pi * land) * s * 0.25 * (1 - land)
+    alpha = 1 - _seg(k, 0.85, 1)
+    _d_shadow(cr, x, y + s * 0.36, s * (0.15 + 0.4 * fall * fall), 0.35 * fall * alpha)
+    _d_box(cr, x, py - bounce, s, zip_k=1.0, alpha=alpha)
+    if k > 0.55:
+        for i in range(2):
+            g = _seg(k, 0.55 + i * 0.1, 1)
+            _d_ring(cr, x, y, s * 0.4 + s * 0.8 * g, (1 - g) * 0.8, "#22c55e", 2)
+
+
+def _an_magnet(cr, k, a):
+    x, y = a["at"]
+    s = a["s"]
+    pull = _ease(_seg(k, 0.1, 0.6))
+    gap = s * 1.3 * (1 - pull)
+    alpha = 1 - _seg(k, 0.88, 1)
+    if pull >= 1:
+        cr.set_source_rgba(1.0, 0.8, 0.2, 0.35 * (1 - _seg(k, 0.6, 1)))
+        cr.arc(x, y, s * (0.6 + 0.3 * _seg(k, 0.6, 1)), 0, 2 * math.pi)
+        cr.fill()
+    _d_page(cr, x - gap, y, s, alpha, rot=-0.15 * (1 - pull))
+    _d_page(cr, x + gap + 4 * pull, y + 4 * pull, s, alpha, rot=0.15 * (1 - pull))
+
+
+def _an_search(cr, k, a):
+    x0, y0, w, h = a["rect"]
+    s = a["s"]
+    rows = 3
+    kk = _seg(k, 0, 0.9)
+    row = min(rows - 1, int(kk * rows))
+    t = kk * rows - row
+    dirx = 1 if row % 2 == 0 else -1
+    gx = x0 + w * (0.1 + 0.8 * (t if dirx == 1 else 1 - t))
+    gy = y0 + h * (0.2 + 0.3 * row)
+    cr.set_source_rgba(0.25, 0.55, 1.0, 0.12 * (1 - _seg(k, 0.85, 1)))       # the band it has searched
+    cr.rectangle(x0, gy - s * 0.3, w, s * 0.6)
+    cr.fill()
+    _d_glass(cr, gx, gy, s * 0.9, 1 - _seg(k, 0.9, 1))
+
+
+def _an_reassemble(cr, k, a):
+    x, y = a["at"]
+    s = a["s"]
+    import random as _r
+    rnd = _r.Random(5)
+    come = _ease(_seg(k, 0, 0.7))
+    alpha = 1 - _seg(k, 0.88, 1)
+    if come < 1:
+        for i in range(12):
+            ang = rnd.random() * 2 * math.pi
+            dist = s * (1.0 + rnd.random()) * (1 - come)
+            cr.save()
+            cr.translate(x + math.cos(ang) * dist, y + math.sin(ang) * dist)
+            cr.rotate((1 - come) * (rnd.random() - 0.5) * 4)
+            cr.set_source_rgba(0.97, 0.97, 0.98, alpha)
+            cr.move_to(0, 0)
+            cr.line_to(s * 0.15, s * 0.05)
+            cr.line_to(s * 0.05, s * 0.18)
+            cr.close_path()
+            cr.fill_preserve()
+            cr.set_source_rgba(0.6, 0.63, 0.68, alpha)
+            cr.set_line_width(0.8)
+            cr.stroke()
+            cr.restore()
+    else:
+        _d_page(cr, x, y, s, alpha)
+        g = _seg(k, 0.7, 1)
+        _d_ring(cr, x, y, s * 0.5 + s * 0.4 * g, 1 - g, "#22c55e")
+
+
+def _an_versions(cr, k, a):
+    x, y = a["at"]
+    s = a["s"] * 1.1
+    flips = 4
+    kk = _seg(k, 0, 0.85)
+    i = min(flips - 1, int(kk * flips))
+    day = a.get("day", 25)
+    _d_calendar(cr, x, y, s, flip=kk * flips - i if kk < 1 else 0, alpha=1 - _seg(k, 0.9, 1),
+                day=str(max(1, day - i - (1 if kk >= 1 else 0))), next_day=str(max(1, day - i - 1)))
+
+
+def _an_snapshot_wipe(cr, k, a):
+    """The old look stays outside a growing circle (theme change)."""
+    pb = a["pb"]
+    cx, cy = a["at"]
+    W, H = pb.get_width(), pb.get_height()
+    rmax = math.hypot(max(cx, W - cx), max(cy, H - cy))
+    r = rmax * _ease(k)
+    cr.rectangle(0, 0, W, H)
+    cr.new_sub_path()
+    cr.arc_negative(cx, cy, max(0.1, r), 2 * math.pi, 0)
+    cr.set_fill_rule(0)
+    cr.clip()
+    Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+    cr.paint()
+
+
+def _an_view_fold(cr, k, a):
+    """The old view folds away in rows (switching list ↔ grid)."""
+    pb = a["pb"]
+    x0, y0 = a["at"]
+    W, H = pb.get_width(), pb.get_height()
+    rows = 8
+    rh = H / rows
+    for i in range(rows):
+        kk = _ease(_seg(k, i * 0.06, i * 0.06 + 0.5))
+        if kk >= 1:
+            continue
+        cr.save()
+        cr.rectangle(x0, y0 + i * rh, W, rh)
+        cr.clip()
+        cr.translate(x0, y0 + i * rh + rh / 2)
+        cr.scale(1 - 0.1 * kk, 1 - kk)
+        cr.translate(0, -(i * rh + rh / 2))
+        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+        cr.paint_with_alpha(1 - kk * 0.6)
+        cr.restore()
+
+
+ANIMS = {"copy": (_an_copy, 0.9), "move": (_an_move, 1.0), "rename": (_an_rename, 0.9), "ripple": (_an_ripple, 1.3),
+         "new_folder": (_an_new_folder, 0.9), "duplicate": (_an_duplicate, 0.9), "vault": (_an_vault, 1.7),
+         "empty_trash": (_an_empty_trash, 1.7), "shred": (_an_shred, 1.6), "zip": (_an_zip, 1.4),
+         "unzip": (_an_unzip, 1.4), "plane": (_an_plane, 1.3), "clip": (_an_clip, 1.0), "bubble": (_an_bubble, 0.7),
+         "tag": (_an_tag, 1.1), "pin": (_an_pin, 1.5), "rules": (_an_rules, 1.7), "download": (_an_download, 1.3),
+         "magnet": (_an_magnet, 1.2), "search": (_an_search, 1.5), "reassemble": (_an_reassemble, 1.1),
+         "versions": (_an_versions, 1.3), "wipe": (_an_snapshot_wipe, 0.7), "fold": (_an_view_fold, 0.6)}
 
 
 def fly_to_trash(win, start, count):
@@ -21156,14 +22341,16 @@ def settings_entries(win):
            lambda: win.icons_item.get_active(), lambda v: win.icons_item.set_active(v)),
           ("appearance", "Show hidden files", "Files whose names start with a dot (Ctrl+H).", "switch",
            lambda: win.hidden_item.get_active(), lambda v: win.hidden_item.set_active(v)),
-          ("appearance", "Animations", "The paper ball that flies into the Trash, and other small motions.", "switch",
+          ("appearance", "Animations", "Little motions for what you do: the paper ball into the Trash, copying, moving, "
+           "renaming, the shredder, the vault door, zipping, paper planes for sending, tags, pins and more.", "switch",
            lambda: win.cfg.get("animations", True),
            lambda v: (win.cfg.__setitem__("animations", v), write_json(CONFIG_FILE, win.cfg))),
-          ("appearance", "Trash animation speed", "How fast the paper crumples into a ball and flies into the Trash "
-           "(and back out when you restore).", "choice", [(k, label) for k, label, _f in TRASH_ANIM_SPEEDS],
+          ("appearance", "Animation speed", "How fast all the animations play (the paper ball, copying, the "
+           "shredder, the vault door, paper planes…).", "choice", [(k, label) for k, label, _f in TRASH_ANIM_SPEEDS],
            lambda: win.cfg.get("trash_anim_speed", "normal"),
            lambda k: (win.cfg.__setitem__("trash_anim_speed", k), write_json(CONFIG_FILE, win.cfg))),
-          ("appearance", "Trash animation size", "How big the crumpling paper is.", "choice",
+          ("appearance", "Animation size", "How big the animations are drawn (the paper ball, pages, planes, the "
+           "vault…).", "choice",
            [(k, label) for k, label, _px in TRASH_ANIM_SIZES],
            lambda: win.cfg.get("trash_anim_size", "medium"),
            lambda k: (win.cfg.__setitem__("trash_anim_size", k), write_json(CONFIG_FILE, win.cfg))),
@@ -22212,7 +23399,8 @@ class MainWindow(Gtk.ApplicationWindow):
         sb.add(self.share_label)
         self.share_btn.add(sb)
         self.share_btn.set_tooltip_text("Send the selected files to a nearby Arckad-D, or share a link / QR code")
-        self.share_btn.connect("clicked", lambda *_: self.open_share(self.active.selected_paths() or None, "nearby"))
+        self.share_btn.connect("clicked", lambda *_: (self._anim_send(), self.open_share(self.active.selected_paths() or None,
+                                                                                         "nearby")))
         pair.add(self.share_btn)
         self.recv_btn = Gtk.Button()
         rb = Gtk.Box(spacing=6)
@@ -22378,6 +23566,9 @@ class MainWindow(Gtk.ApplicationWindow):
         # in-window pop-up for new chat messages (top centre)
         self.overlay = Gtk.Overlay()
         self.overlay.add(main)
+        self.anim_layer = AnimLayer(self)                     # ✨ everyday-action animations draw here
+        self.overlay.add_overlay(self.anim_layer)
+        self.overlay.set_overlay_pass_through(self.anim_layer, True)
         self.overlay.add_overlay(self._build_toast())
         outer.pack_start(self.overlay, True, True, 0)
         self.music_slot = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)     # the music bar lives here, inside
@@ -22581,6 +23772,12 @@ class MainWindow(Gtk.ApplicationWindow):
         return self.theme_btn
 
     def on_theme_item(self, item, key):
+        if item.get_active() and self.get_mapped() and animations_on(self) and self.cfg.get("theme") != key:
+            pb, _at = self.snapshot()
+            btn = getattr(self, "_theme_btn", None) or getattr(self, "theme_btn", None)
+            if pb:
+                c = self.pt_widget(btn) if btn else None
+                self.play("wipe", pb=pb, at=c or (pb.get_width() - 60, 10))
         if item.get_active():
             self.cfg["theme"] = key
             self.apply_theme(key)
@@ -23063,6 +24260,81 @@ class MainWindow(Gtk.ApplicationWindow):
             a = pane.get_allocation()
             return pane.translate_coordinates(self.overlay, a.width // 2, a.height // 3) or (200, 200)
 
+    # ---------- ✨ animations: where things are on screen, and playing one
+    def play(self, kind, **kw):
+        if not animations_on(self) or not getattr(self, "anim_layer", None) or not self.get_mapped():
+            return
+        if not self.is_visible() or (self.get_window() and self.get_window().get_state() & Gdk.WindowState.ICONIFIED):
+            return
+        fn, dur = ANIMS[kind]
+        try:
+            self.anim_layer.add(dur, fn, **kw)
+        except Exception:
+            pass
+
+    def pt_widget(self, w, fx=0.5, fy=0.5):
+        try:
+            if w is None or not w.get_mapped():
+                return None
+            a = w.get_allocation()
+            return w.translate_coordinates(self.overlay, int(a.width * fx), int(a.height * fy))
+        except Exception:
+            return None
+
+    def pt_pane(self, pane=None, fy=0.45):
+        pane = pane or self.active
+        return self.pt_widget(pane, 0.5, fy) or self.pt_widget(self.overlay, 0.5, fy) or (300, 300)
+
+    def pt_sel(self, pane=None):
+        pane = pane or self.active
+        if pane is not None and pane.selected_paths():
+            return self._trash_start_point(pane)
+        return self.pt_pane(pane)
+
+    def pt_row(self, key):
+        for row in self.sidebar.get_children():
+            if getattr(row, "key", None) == key and row.get_mapped():
+                return row.translate_coordinates(self.overlay, 22, row.get_allocated_height() // 2)
+        return None
+
+    def _visible_panes(self):
+        return [p for p in self.all_panes() if p.get_mapped()]
+
+    def pane_rows(self, pane, limit=14):
+        """Screen positions of the rows / tiles you can see (for the rename ripple)."""
+        out, width = [], 260
+        try:
+            if pane.view_mode == "grid":
+                for path in sorted(pane.icons.get_selected_items() or [], key=lambda p: p.get_indices())[:limit] or []:
+                    ok, r = pane.icons.get_cell_rect(path, None)
+                    if ok:
+                        out.append(pane.icons.translate_coordinates(self.overlay, r.x, r.y + r.height // 2))
+                width = 110
+            else:
+                vr = pane.tree.get_visible_range()
+                if vr:
+                    start, end = vr[0].get_indices()[0], vr[1].get_indices()[0]
+                    for i in range(start, min(end + 1, start + limit)):
+                        r = pane.tree.get_cell_area(Gtk.TreePath(i), pane.tree.get_column(0))
+                        bx, by = pane.tree.convert_bin_window_to_widget_coords(r.x, r.y + r.height // 2)
+                        out.append(pane.tree.translate_coordinates(self.overlay, bx + 8, by))
+                    width = max(200, pane.tree.get_allocated_width() - 30)
+        except Exception:
+            pass
+        return [p for p in out if p], width
+
+    def snapshot(self, widget=None):
+        """A picture of (part of) the window right now, and where it sits on the animation layer."""
+        try:
+            widget = widget or self.overlay
+            oa = self.overlay.get_allocation()
+            x, y = widget.translate_coordinates(self.overlay, 0, 0)
+            w, h = widget.get_allocated_width(), widget.get_allocated_height()
+            pb = Gdk.pixbuf_get_from_window(self.overlay.get_window(), oa.x + x, oa.y + y, w, h)
+            return pb, (x, y)
+        except Exception:
+            return None, (0, 0)
+
     def after_restore(self, paths):
         """Back where they came from: open that folder (on whichever drive) with the restored files selected."""
         paths = [p for p in paths if p]
@@ -23219,7 +24491,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if not hasattr(MainWindow, "_cairo_state"):
             try:
                 gi.require_foreign("cairo")
-                MainWindow._cairo_state = True
+                MainWindow._cairo_state = cairo is not None
             except Exception:                                # python3-gi-cairo missing: plain characters instead
                 MainWindow._cairo_state = False
         return MainWindow._cairo_state
@@ -23481,9 +24753,15 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def pin(self, path):
         if is_folder_loc(path) and path not in self.cfg["pinned"]:
+            start = self.pt_sel()
             self.cfg["pinned"].append(path)
             write_json(CONFIG_FILE, self.cfg)
             self.build_sidebar()
+
+            def go():
+                self.play("pin", at=start, dst=self.pt_row(path) or start)
+                return False
+            GLib.idle_add(go)                                 # after the sidebar has its new row
 
     def unpin(self, path):
         self.cfg["pinned"] = [p for p in self.cfg["pinned"] if p != path]
@@ -23575,6 +24853,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     # ---------- tags & notes
     def toggle_tag(self, paths, tag, on):
+        if on and paths:
+            self.play("tag", at=self.pt_sel(), colour=TAGS.get(tag, "#ff7800"))
         for p in paths:
             tags = set(TAG_STORE.tags(p))
             (tags.add if on else tags.discard)(tag)
@@ -24046,8 +25326,28 @@ class MainWindow(Gtk.ApplicationWindow):
         paths, move = got
         self.transfer([p for p in paths if os.path.exists(p)], move, dest)
 
+    def _anim_transfer(self, paths, move, dest):
+        try:
+            if not paths:
+                return
+            panes = self._visible_panes()
+            src_dir = os.path.dirname(paths[0].rstrip("/\\"))
+            sp = next((p for p in panes if p.location == src_dir), None)
+            dp = next((p for p in sorted(panes, key=lambda p: p is not self.active) if p.location == dest), None)
+            if sp is not None and set(paths) <= set(sp.selected_paths()):
+                src = self._trash_start_point(sp)
+            else:
+                src = self.pt_pane(sp, 0.3) if sp else self.pt_pane(self.active, 0.3)
+            dst = self.pt_pane(dp, 0.6) if dp else self.pt_pane(self.active, 0.6)
+            if abs(src[0] - dst[0]) + abs(src[1] - dst[1]) < 60:
+                dst = (dst[0] + 140, dst[1] + 40)
+            self.play("move" if move else "copy", src=src, dst=dst)
+        except Exception:
+            pass
+
     def transfer(self, paths, move, dest):
         """Copies or moves items into dest, asking what to do when a name already exists."""
+        self._anim_transfer(paths, move, dest)
         self.spinner.start()
         state = {"file": None, "dir": None, "done": 0, "skipped": 0, "replaced": 0, "errors": [],
                  "cancelled": False, "count": len(paths)}
@@ -24285,12 +25585,14 @@ class MainWindow(Gtk.ApplicationWindow):
         if target.exists():
             self.error(f"“{new}” already exists here.")
             return
+        at = self._trash_start_point(pane)
         try:
             p.rename(target)
         except OSError as ex:
             self.error(f"Couldn't rename: {ex.strerror}")
             return
         TAG_STORE.moved(str(p), str(target))
+        self.play("rename", at=(at[0] - 40, at[1]), old=p.name, new=new)
         pane.pending_select = [str(target)]
         pane.refresh()
 
@@ -24350,6 +25652,8 @@ class MainWindow(Gtk.ApplicationWindow):
                     errors.append(f"{p.name}: {getattr(ex, 'strerror', None) or ex}")
             GLib.idle_add(done, made, errors)
 
+        self.play("duplicate", at=self.pt_sel(pane))
+
         def done(made, errors):
             self.update_spinner()
             pane.pending_select = made
@@ -24367,6 +25671,7 @@ class MainWindow(Gtk.ApplicationWindow):
         if not self.confirm(f"Delete {n} item{'s' if n != 1 else ''} permanently?\n\n{names}\n\n"
                             "They will NOT go to the Trash and can't be restored."):
             return
+        self.play("shred", at=self.pt_sel(pane))
         errors = []
         for p in paths:
             try:
@@ -24524,6 +25829,7 @@ class MainWindow(Gtk.ApplicationWindow):
         except OSError as ex:
             self.error(f"Couldn't create folder: {ex.strerror}")
             return
+        self.play("new_folder", at=self.pt_pane(pane, 0.35))
         pane.pending_select = [str(target)]
         pane.refresh()
 
@@ -24603,6 +25909,7 @@ class MainWindow(Gtk.ApplicationWindow):
             kind, value = outcome
             if kind == "ok":
                 results.append(Path(value))
+                self.play("unzip", at=self.pt_pane(pane, 0.4))
                 self._extract_next(pane, queue[1:], results, None)
             elif kind == "password":
                 pw = self.ask_password(name, wrong=value)
@@ -24773,6 +26080,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 size = result.stat().st_size
                 saved = f", {int((1 - size / total) * 100)}% smaller" if total and size < total else ""
                 pane.flash(f"Created {result.name} ({human_size(size)}{saved})")
+                self.play("zip", at=self.pt_pane(pane, 0.4))
                 if pane.mode == "folder" and str(result.parent) == pane.location:
                     pane.pending_select = [str(result)]
                     pane.refresh()
@@ -24799,6 +26107,10 @@ class MainWindow(Gtk.ApplicationWindow):
         CompareWindow(self, a, b)
 
     def duplicates(self, folder):
+        self.play("magnet", at=self.pt_pane(None, 0.4))
+        return self._duplicates(folder)
+
+    def _duplicates(self, folder):
         DuplicatesWindow(self, folder)
 
     # ---------- organize & undo
@@ -25529,6 +26841,9 @@ class MainWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass                                       # the phone went away: never bother the user about it
         threading.Thread(target=work, daemon=True).start()
+        dst = self.pt_widget(self.phone_btn)
+        if dst:
+            self.play("clip", src=self.pt_pane(None, 0.5), dst=dst)
 
     def _clip_from_phone(self, text):
         if not isinstance(text, str) or not text or len(text) > self.CLIP_MAX or not self._clip_on():
@@ -25538,6 +26853,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self._clip_last = text                             # so it isn't sent straight back
         self._clip.set_text(text, -1)
         self._clip.store()
+        src = self.pt_widget(self.phone_btn)
+        if src:
+            self.play("clip", src=src, dst=self.pt_pane(None, 0.45))
         self.flash_all("📋 Copied from your phone: paste it here (Ctrl+V)")
 
     def on_phone_event(self, ev):
@@ -25781,8 +27099,16 @@ class MainWindow(Gtk.ApplicationWindow):
                 f"({human_size(req['received'])} of {human_size(req['total'])})")
         return False
 
+    def _anim_send(self):
+        if self.active and self.active.selected_paths():
+            dst = self.pt_widget(self.share_btn)
+            if dst:
+                self.play("plane", src=self.pt_sel(), dst=dst, lift=60)
+
     def on_nearby_received(self, req):
         n = len(req["files"])
+        ow = self.overlay.get_allocated_width()
+        self.play("plane", receive=True, src=(ow + 40, 40), dst=self.pt_pane(None, 0.4), lift=40)
         msg = f"Received {n} file{'s' if n != 1 else ''} from {req['from']}"
         if self.share_win:
             self.share_win.log_line("✓ " + msg)
@@ -26299,6 +27625,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 try:
                     VERSIONS.restore(path, vid)
                     self.flash_all(f"🕘 Restored {os.path.basename(path)}")
+                    self.play("versions", at=self.pt_pane(None, 0.4),
+                              day=int(time.strftime("%d", time.localtime())))
                 except OSError as ex:
                     self.error(f"Couldn't restore: {ex}")
                 fill()
@@ -26372,6 +27700,7 @@ class MainWindow(Gtk.ApplicationWindow):
                     VERSIONS.restore(p, last[0])
                     self.flash_all(f"🕘 Brought back {os.path.basename(p)}")
                     self.show_from_tray(folder=os.path.dirname(p), select=p)
+                    GLib.timeout_add(350, lambda: self.play("reassemble", at=self.pt_pane(None, 0.4)) or False)
                 except OSError as ex:
                     self.error(f"Couldn't bring it back: {ex}")
             fill()
