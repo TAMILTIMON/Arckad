@@ -49,7 +49,7 @@ a = Analysis(
            (os.path.join(here, "arckad-d.png"), "."),
            (os.path.join(here, "arckad-d.ico"), "."),
            (os.path.join(root, "emoji"), "emoji")],
-    hiddenimports=["gi.repository.Gtk", "gi.repository.Gdk", "gi.repository.GdkPixbuf",
+    hiddenimports=["pypdf", "gi.repository.Gtk", "gi.repository.Gdk", "gi.repository.GdkPixbuf",
                    "gi.repository.Gio", "gi.repository.GLib", "gi.repository.GObject",
                    "gi.repository.Pango", "qrcode", "winreg"],
     hooksconfig={

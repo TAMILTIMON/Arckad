@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.62.0"
+APP_VERSION = "3.62.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -4301,6 +4301,8 @@ class FilePane(Gtk.Box):
                     menu.append(item)
             if not (VAULT.is_open() and str(self.location).startswith(str(VAULT.work))):
                 add("🔐 Move into the private vault", lambda: win.vault_ui.move_in(paths))
+            else:
+                add("🔓 Move out of the vault…", lambda: win.vault_ui.move_out(paths))
             if len(paths) > 1:
                 add(f"✏ Rename these {len(paths)} items… (F2)", lambda: BatchRenameDialog(win, paths).run_rename())
             else:
@@ -20810,17 +20812,98 @@ class VaultUI:
             if not VAULT.is_open():
                 return
         moved = 0
+        origins = self._origins()
         for p in paths:
             dest = unique_target(Path(VAULT.work) / os.path.basename(p))
             try:
                 shutil.move(p, dest)
                 JOURNEY.removed(p, trash=False)
+                origins[dest.name] = os.path.dirname(os.path.abspath(p))      # remembered (inside the vault)
                 moved += 1
             except OSError as ex:
                 self.win.error(f"Couldn't move {os.path.basename(p)}: {ex.strerror}")
+        self._save_origins(origins)
         threading.Thread(target=VAULT.sync, daemon=True).start()
         self.win.refresh_all()
         self.win.flash_all(f"🔐 Moved {moved} item{'s' if moved != 1 else ''} into the vault")
+
+    # ---------- 🔓 taking files out of the vault again
+    ORIGINS = ".arckad-came-from.json"
+
+    def _origins(self):
+        return read_json(Path(VAULT.work) / self.ORIGINS, {}) if VAULT.is_open() else {}
+
+    def _save_origins(self, origins):
+        if VAULT.is_open():
+            write_json(Path(VAULT.work) / self.ORIGINS, origins)
+
+    def move_out(self, paths):
+        """Move files from the open vault back to a normal folder (where they came from, or one you choose).
+        They're no longer encrypted once they're out."""
+        if not VAULT.is_open() or not paths:
+            return
+        origins = self._origins()
+        work = os.path.realpath(str(VAULT.work))
+        tops = [p for p in paths if os.path.dirname(os.path.realpath(p)) == work]
+        known = {p: origins.get(os.path.basename(p)) for p in tops}
+        known = {p: d for p, d in known.items() if d and os.path.isdir(d)}
+        docs = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS) or str(HOME)
+        d = Gtk.Dialog(title="🔓 Move out of the vault", transient_for=self.win, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Move out", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        n = len(paths)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        intro.set_markup(f"Move <b>{n} item{'s' if n != 1 else ''}</b> out of the vault to:\n<small>Outside the vault "
+                         "they're ordinary files again (not encrypted).</small>")
+        box.add(intro)
+        back = Gtk.RadioButton.new_with_label_from_widget(
+            None, ("Back where they came from" if len(known) > 1 else
+                   f"Back where it came from ({short(next(iter(known.values())))})") if known else
+            "Back where it came from (not known for these)")
+        back.set_sensitive(bool(known))
+        to_docs = Gtk.RadioButton.new_with_label_from_widget(back, f"Documents ({short(docs)})")
+        other = Gtk.RadioButton.new_with_label_from_widget(back, "Another folder:")
+        chooser = Gtk.FileChooserButton(title="Folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        chooser.set_filename(docs)
+        chooser.connect("file-set", lambda *_: other.set_active(True))
+        (back if known else to_docs).set_active(True)
+        for wdg in (back, to_docs):
+            box.add(wdg)
+        row = Gtk.Box(spacing=8)
+        row.add(other)
+        row.pack_start(chooser, True, True, 0)
+        box.add(row)
+        d.show_all()
+        r = d.run()
+        choice = "back" if back.get_active() else "docs" if to_docs.get_active() else "other"
+        target = chooser.get_filename()
+        d.destroy()
+        if r != Gtk.ResponseType.OK:
+            return
+        moved, errors, dest_dirs = [], [], set()
+        for p in paths:
+            folder = (known.get(p) or docs) if choice == "back" else docs if choice == "docs" else (target or docs)
+            try:
+                os.makedirs(folder, exist_ok=True)
+                dest = str(unique_target(Path(folder) / os.path.basename(p)))
+                shutil.move(p, dest)
+                origins.pop(os.path.basename(p), None)
+                moved.append(dest)
+                dest_dirs.add(folder)
+            except OSError as ex:
+                errors.append(f"{os.path.basename(p)}: {ex.strerror or ex}")
+        self._save_origins(origins)
+        threading.Thread(target=VAULT.sync, daemon=True).start()            # the vault forgets them
+        self.win.refresh_all()
+        if moved:
+            self.win.play("vault", at=self.win.pt_center(), lock=False)
+            where = short(next(iter(dest_dirs))) if len(dest_dirs) == 1 else f"{len(dest_dirs)} folders"
+            self.win.flash_all(f"🔓 Moved {len(moved)} item{'s' if len(moved) != 1 else ''} out of the vault to {where}")
+        if errors:
+            self.win.error("Some items couldn't be moved out:\n\n" + "\n".join(errors[:10]))
 
 
 # ---------------------------------------------------------------- 🗑 Trash: see, restore, delete permanently
@@ -24625,9 +24708,43 @@ TEAM = TeamFolders()
 
 
 
-# ---------------------------------------------------------------- 📄 PDF tools (qpdf, poppler or Ghostscript: whichever is there)
+# ---------------------------------------------------------------- 🛠 Finding helper programs (also where Windows installs them)
+TOOLS_DIR = Path(os.environ.get("LOCALAPPDATA") or GLib.get_user_data_dir()) / "Arckad-D" / "tools"
+
+
+def find_tool(name):
+    """A helper program by name: on the PATH, or (Windows) wherever winget / its installer put it."""
+    hit = shutil.which(name)
+    if hit or not IS_WIN:
+        return hit
+    exe = name if name.lower().endswith(".exe") else name + ".exe"
+    la = os.environ.get("LOCALAPPDATA", "")
+    pf = [os.environ.get(k, "") for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432")]
+    pats = [os.path.join(str(TOOLS_DIR), "**", exe), os.path.join(la, "Microsoft", "WinGet", "Links", exe),
+            os.path.join(la, "Microsoft", "WinGet", "Packages", "*", "**", exe)]
+    for base in [b for b in pf if b]:
+        pats += [os.path.join(base, "qpdf*", "bin", exe), os.path.join(base, "gs", "gs*", "bin", exe),
+                 os.path.join(base, "ffmpeg*", "bin", exe), os.path.join(base, "ffmpeg", "bin", exe)]
+    pats.append(os.path.join("C:\\", "ffmpeg", "bin", exe))
+    import glob
+    for pat in pats:
+        found = sorted(glob.glob(pat, recursive=True), reverse=True)          # the newest version first
+        if found:
+            return found[0]
+    return None
+
+
+def _pypdf():
+    try:
+        import pypdf
+        return pypdf
+    except ImportError:
+        return None
+
+
+# ---------------------------------------------------------------- 📄 PDF tools (qpdf, pypdf, poppler or Ghostscript)
 def _gs():
-    return shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+    return find_tool("gs") or find_tool("gswin64c") or find_tool("gswin32c")
 
 
 def parse_pages(text, count=None):
@@ -24671,10 +24788,18 @@ def _run(args, timeout=600):
 
 
 def pdf_merge(paths, out):
-    if shutil.which("qpdf"):
-        return _run(["qpdf", "--empty", "--pages"] + list(paths) + ["--", out])
-    if shutil.which("pdfunite"):
-        return _run(["pdfunite"] + list(paths) + [out])
+    if find_tool("qpdf"):
+        return _run([find_tool("qpdf"), "--empty", "--pages"] + list(paths) + ["--", out])
+    pp = _pypdf()
+    if pp:
+        w = pp.PdfWriter()
+        for p_ in paths:
+            w.append(p_)
+        with open(out, "wb") as fh:
+            w.write(fh)
+        return
+    if find_tool("pdfunite"):
+        return _run([find_tool("pdfunite")] + list(paths) + [out])
     if _gs():
         return _run([_gs(), "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", f"-sOutputFile={out}"] + list(paths))
     raise FileNotFoundError("qpdf")
@@ -24682,17 +24807,27 @@ def pdf_merge(paths, out):
 
 def pdf_extract(path, pages, out):
     spec = ",".join(str(n) for n in pages)
-    if shutil.which("qpdf"):
-        return _run(["qpdf", path, "--pages", path, spec, "--", out])
-    if shutil.which("pdfseparate") and shutil.which("pdfunite"):
+    if find_tool("qpdf"):
+        return _run([find_tool("qpdf"), path, "--pages", path, spec, "--", out])
+    pp = _pypdf()
+    if pp:
+        r = pp.PdfReader(path)
+        w = pp.PdfWriter()
+        for n in pages:
+            if n <= len(r.pages):
+                w.add_page(r.pages[n - 1])
+        with open(out, "wb") as fh:
+            w.write(fh)
+        return
+    if find_tool("pdfseparate") and find_tool("pdfunite"):
         tmpd = tempfile.mkdtemp(prefix="arckad-pdf-")
         try:
             parts = []
             for n in pages:
                 part = os.path.join(tmpd, f"p{n}.pdf")
-                _run(["pdfseparate", "-f", str(n), "-l", str(n), path, part])
+                _run([find_tool("pdfseparate"), "-f", str(n), "-l", str(n), path, part])
                 parts.append(part)
-            return _run(["pdfunite"] + parts + [out])
+            return _run([find_tool("pdfunite")] + parts + [out])
         finally:
             shutil.rmtree(tmpd, ignore_errors=True)
     raise FileNotFoundError("qpdf")
@@ -24701,28 +24836,89 @@ def pdf_extract(path, pages, out):
 def pdf_split(path, folder):
     stem = os.path.splitext(os.path.basename(path))[0]
     pattern = os.path.join(folder, f"{stem} - page %d.pdf")
-    if shutil.which("qpdf"):
+    if find_tool("qpdf"):
         tmpl = os.path.join(folder, f"{stem} - page.pdf")
-        _run(["qpdf", "--split-pages", path, tmpl])       # qpdf names them "… - page-01.pdf"
+        _run([find_tool("qpdf"), "--split-pages", path, tmpl])       # qpdf names them "… - page-01.pdf"
         return
-    if shutil.which("pdfseparate"):
-        return _run(["pdfseparate", path, pattern])
+    pp = _pypdf()
+    if pp:
+        r = pp.PdfReader(path)
+        digits = len(str(len(r.pages)))
+        for i, page in enumerate(r.pages, 1):
+            w = pp.PdfWriter()
+            w.add_page(page)
+            with open(os.path.join(folder, f"{stem} - page-{i:0{digits}d}.pdf"), "wb") as fh:
+                w.write(fh)
+        return
+    if find_tool("pdfseparate"):
+        return _run([find_tool("pdfseparate"), path, pattern])
     raise FileNotFoundError("qpdf")
 
 
 def pdf_rotate(path, angle, pages, out):
-    if not shutil.which("qpdf"):
+    if find_tool("qpdf"):
+        spec = f"+{angle}" + (":" + ",".join(str(n) for n in pages) if pages else "")
+        return _run([find_tool("qpdf"), path, out, f"--rotate={spec}"])
+    pp = _pypdf()
+    if not pp:
         raise FileNotFoundError("qpdf")
-    spec = f"+{angle}" + (":" + ",".join(str(n) for n in pages) if pages else "")
-    return _run(["qpdf", path, out, f"--rotate={spec}"])
+    r = pp.PdfReader(path)
+    w = pp.PdfWriter()
+    want = set(pages or range(1, len(r.pages) + 1))
+    for i, page in enumerate(r.pages, 1):
+        if i in want:
+            page.rotate(int(angle))
+        w.add_page(page)
+    with open(out, "wb") as fh:
+        w.write(fh)
 
 
 def pdf_compress(path, level, out):
     if _gs():
         return _run([_gs(), "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.5",
                      f"-dPDFSETTINGS=/{level}", "-dDetectDuplicateImages=true", f"-sOutputFile={out}", path])
-    if shutil.which("qpdf"):                               # lossless: smaller only by repacking
-        return _run(["qpdf", "--object-streams=generate", "--compress-streams=y", "--recompress-flate", path, out])
+    if find_tool("qpdf"):                                  # lossless: smaller only by repacking
+        return _run([find_tool("qpdf"), "--object-streams=generate", "--compress-streams=y", "--recompress-flate",
+                     path, out])
+    pp = _pypdf()
+    if pp:                                                 # built in: repack (and shrink photos if Pillow is there)
+        q = {"screen": 45, "ebook": 65, "printer": 85}.get(level, 65)
+        best, best_size = None, os.path.getsize(path)
+        for photos in (True, False):                       # try both; keep whichever is smallest
+            w = pp.PdfWriter(clone_from=path)
+            for page in w.pages:
+                if photos:
+                    try:
+                        for img in page.images:
+                            im = img.image
+                            if im.mode not in ("RGB", "L"):
+                                im = im.convert("RGB")
+                            img.replace(im, quality=q)
+                    except Exception:
+                        pass
+                try:
+                    page.compress_content_streams()
+                except Exception:
+                    pass
+            try:
+                w.compress_identical_objects(remove_identicals=True, remove_orphans=True)
+            except Exception:
+                pass
+            tmp = out + (".a" if photos else ".b")
+            with open(tmp, "wb") as fh:
+                w.write(fh)
+            size = os.path.getsize(tmp)
+            if size < best_size:
+                if best:
+                    os.remove(best)
+                best, best_size = tmp, size
+            else:
+                os.remove(tmp)
+        if best:
+            os.replace(best, out)
+        else:
+            shutil.copy2(path, out)                         # never bigger than it was
+        return
     raise FileNotFoundError("ghostscript")
 
 
@@ -24743,7 +24939,7 @@ MEDIA_ACTIONS = [
 
 def media_info(path):
     """Duration, size, video and audio details from ffprobe ({} when it isn't there)."""
-    probe = shutil.which("ffprobe")
+    probe = find_tool("ffprobe")
     if not probe:
         return {}
     try:
@@ -25368,15 +25564,18 @@ GUIDE = [
          "a GIF.", "Right-click a video or song → Media tools", "", None),
         ("🖥", "Terminal here", "A terminal (or Command Prompt on Windows) already in this folder.", "☰ → Open terminal",
          "F4", lambda w: w.open_terminal(_here(w))),
-        ("🧩", "Optional features", "One click installs the free extras: PDF thumbnails and tools, video thumbnails and "
-         "conversion, 7-Zip, QR codes.", "Tools → Install optional features (Ubuntu)", "",
-         lambda w: w.features_dialog() if not IS_WIN else w.info("On Windows the extras come with the installer.")),
+        ("🧩", "Optional features", "One click installs the free extras: smaller PDFs (Ghostscript), media conversion "
+         "(FFmpeg), PDF thumbnails, 7-Zip, QR codes. On Windows they come through Windows' own installer.",
+         "Tools → Install optional features", "",
+         lambda w: w.windows_features_dialog() if IS_WIN else w.features_dialog()),
     ]),
     ("safety", "🛡", "Safety", "Nothing is lost by accident, and private things stay private.", [
         ("🕘", "Version history", "Keeps earlier versions of files in the folders you protect, and brings back deleted "
          "ones.", "Right-click → Version history · Tools → Version history", "", lambda w: w.version_settings()),
         ("🔐", "Private vault", "A password-protected, encrypted folder for salary slips, IDs and contracts. It locks "
-         "itself when you leave the PC.", "Sidebar → Private vault", "", lambda w: w.vault_ui.open()),
+         "itself when you leave the PC. To take files out again: open the vault, select them, right-click → Move out "
+         "of the vault (back where they came from, or any folder).",
+         "Right-click → Move into the private vault · Sidebar → Private vault", "", lambda w: w.vault_ui.open()),
         ("🔏", "Secure delete", "Overwrites a file before deleting it, so recovery tools can't bring it back.",
          "Right-click → Secure delete", "", None),
         ("🛡", "Ransomware guard", "If many files suddenly get scrambled or renamed to strange extensions, it pauses "
@@ -26781,7 +26980,7 @@ class MainWindow(Gtk.ApplicationWindow):
             None,
             ("Update search index now", INDEX.rebuild),
             ("🎵 Music player (on / off)", self.music_toggle),
-        ] + ([("Install optional features…", self.features_dialog)] if not IS_WIN else []) + [
+        ] + [("Install optional features…", self.windows_features_dialog if IS_WIN else self.features_dialog)] + [
             ("🕘 Version history…", self.version_settings),
             ("⚙ Folder rules…", lambda: (lambda d: (d.run(), d.destroy()))(RulesDialog(self))),
             ("📊 Disk usage map…", lambda: DiskUsageWindow(self, self.active.location if is_folder_loc(self.active.location)
@@ -31970,12 +32169,12 @@ class MainWindow(Gtk.ApplicationWindow):
 
     # ---------- 📄 PDF tools
     def _need_tool(self, what):
-        msg = {"qpdf": "This needs qpdf (free). On Ubuntu: Tools → Install optional features, or  sudo apt install qpdf",
-               "ghostscript": "This needs Ghostscript (free). On Ubuntu: Tools → Install optional features, or  "
-                              "sudo apt install ghostscript"}.get(what, f"This needs {what}.")
-        if IS_WIN:
-            msg = msg.split(".")[0] + ". Install it from its website, then try again."
-        self.error(msg)
+        names = {"qpdf": "qpdf (PDF tools)", "ghostscript": "Ghostscript (smaller PDFs)", "ffmpeg": "FFmpeg (media tools)"}
+        if self.confirm(f"This needs {names.get(what, what)}, a free extra.\n\nInstall it now?"):
+            if IS_WIN:
+                self.windows_features_dialog()
+            else:
+                self.features_dialog()
 
     def pdf_tools(self, paths):
         pane = self.active
@@ -32088,10 +32287,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     # ---------- 🎞 media tools
     def media_tools(self, path):
-        if not shutil.which("ffmpeg"):
-            return self.error("Media tools need ffmpeg (free). On Ubuntu: Tools → Install optional features, or  "
-                              "sudo apt install ffmpeg" if not IS_WIN else "Media tools need ffmpeg: install it from "
-                              "ffmpeg.org, then try again.")
+        if not find_tool("ffmpeg"):
+            return self._need_tool("ffmpeg")
         info = media_info(path)
         is_video = "video" in info or category_of(path) == "Videos"
         d = Gtk.Dialog(title=f"🎞 {os.path.basename(path)}", transient_for=self, modal=True)
@@ -32135,7 +32332,7 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.flash(f"🎞 {label.split(' ', 1)[1]}…")
 
         def work():
-            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", path] + args + ["-progress", "pipe:1", "-nostats",
+            cmd = [find_tool("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-i", path] + args + ["-progress", "pipe:1", "-nostats",
                                                                                       out + ".arckad-tmp" + ext]
             err = None
             try:
@@ -32246,6 +32443,77 @@ class MainWindow(Gtk.ApplicationWindow):
         box.add(btns)
         d.show_all()
         d.present()
+
+    # ---------- 🧩 optional features on Windows: installed with Windows' own installer (winget)
+    WIN_FEATURES = [("ffmpeg", "Gyan.FFmpeg", "FFmpeg", "Media tools: video to MP3, convert and shrink videos, GIFs",
+                     "https://www.gyan.dev/ffmpeg/builds/"),
+                    ("gswin64c", "ArtifexSoftware.GhostScript", "Ghostscript", "PDF tools: make PDFs much smaller",
+                     "https://ghostscript.com/releases/gsdnld.html"),
+                    ("qpdf", "QPDF.QPDF", "qpdf", "PDF tools: faster merge, split, rotate (they already work without it)",
+                     "https://github.com/qpdf/qpdf/releases")]
+
+    def windows_features_dialog(self):
+        d = Gtk.Dialog(title="Install optional features", transient_for=self, modal=False)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(620, 360)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        winget = shutil.which("winget")
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        intro.set_markup("Free extras for Arckad-D. "
+                         + ("They're installed with Windows' own installer (winget); Windows may ask for permission."
+                            if winget else "Windows' installer (winget) isn't on this PC, so each button opens the "
+                                           "download page instead.")
+                         + "\n<small>PDF merge, split, extract and rotate already work without any of these.</small>")
+        box.add(intro)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        box.pack_start(lst, True, True, 0)
+        log = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        log.get_style_context().add_class("dim-label")
+        box.add(log)
+
+        def fill():
+            for c in lst.get_children():
+                lst.remove(c)
+            for exe, wid, name, what, url in self.WIN_FEATURES:
+                have = find_tool(exe)
+                row = Gtk.Box(spacing=10, margin=8)
+                lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+                lbl.set_markup(f"<b>{esc(name)}</b>  {'✓ installed' if have else ''}\n<small>{esc(what)}</small>")
+                row.pack_start(lbl, True, True, 0)
+                if not have:
+                    b = Gtk.Button(label="Install" if winget else "Download page")
+                    b.get_style_context().add_class("suggested-action")
+                    b.connect("clicked", lambda btn, wid=wid, name=name, url=url: install(btn, wid, name, url))
+                    row.add(b)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            lst.show_all()
+
+        def install(btn, wid, name, url):
+            if not winget:
+                return Gtk.show_uri_on_window(self, url, Gdk.CURRENT_TIME)
+            btn.set_sensitive(False)
+            btn.set_label("Installing…")
+            log.set_text(f"Installing {name}… (this can take a minute)")
+
+            def work():
+                try:
+                    r = subprocess.run([winget, "install", "--id", wid, "-e", "--silent", "--accept-package-agreements",
+                                        "--accept-source-agreements"], capture_output=True, text=True, timeout=900,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    ok = r.returncode == 0 or "already installed" in (r.stdout or "").lower()
+                    msg = f"✓ {name} installed" if ok else f"✗ {name}: " + ((r.stdout or r.stderr or "").strip()
+                                                                         .splitlines() or ["failed"])[-1][:200]
+                except (OSError, subprocess.SubprocessError) as ex:
+                    msg = f"✗ {name}: {ex}"
+                GLib.idle_add(lambda: (log.set_text(msg), fill()) and False)
+            threading.Thread(target=work, daemon=True).start()
+        fill()
+        d.connect("response", lambda dlg, _r: dlg.destroy())
+        d.show_all()
 
     def _signal(self, pid, sig, name):
         try:
