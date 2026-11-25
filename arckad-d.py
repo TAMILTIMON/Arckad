@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.60.0"
+APP_VERSION = "3.61.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -4282,6 +4282,10 @@ class FilePane(Gtk.Box):
             menu.append(tag_item)
             if all(category_of(x) == "Images" for x in paths):
                 add("🖼 Image tools (resize, rotate, convert, compress)…", lambda: win.image_tools(paths))
+            if all(ext_of(x) == "pdf" for x in paths):
+                add("📄 PDF tools (merge, split, rotate, compress, extract)…", lambda: win.pdf_tools(paths))
+            if len(paths) == 1 and category_of(paths[0]) in ("Videos", "Audio"):
+                add("🎞 Media tools (details, convert, MP3)…", lambda: win.media_tools(paths[0]))
             add("Compare these two…", lambda: win.compare(paths[0], paths[1]), len(paths) == 2)
             add("Send to nearby Arckad-D…", lambda: win.open_share(paths, "nearby"))
             add("Share as link / QR code…", lambda: win.open_share(paths, "link"))
@@ -11906,6 +11910,10 @@ class LinkedDevices:
                 c._schedule_rewrite(gid)
                 c.ui("on_chat_changed", None)
             return reply({"ok": True})
+        if path == "/t/phone/upload":                 # 📷 a scan or 📸 a camera photo from the phone
+            if not self.is_local(h.client_address[0]):
+                return reply({"ok": False, "reason": "only on the same network"})
+            return reply(PHONE_INBOX.receive(req, c))
         if path == "/t/phone/notify":                 # the phone pushes a new notification (or a removal)
             if self.is_local(h.client_address[0]):
                 c.ui("on_phone_event", req)
@@ -16067,6 +16075,9 @@ OPTIONAL_FEATURES = [  # (packages, any one of them is enough), what it adds, gr
     (["poppler-utils"], "Previews and thumbnails for PDFs", "files"),
     (["7zip", "p7zip-full"], "Open and create 7z archives", "files"),
     (["qrencode"], "QR codes for share links", "files"),
+    (["qpdf"], "PDF tools: merge, split, rotate and extract pages", "files"),
+    (["ghostscript"], "PDF tools: make PDFs smaller", "files"),
+    (["ffmpeg"], "Media tools: convert videos and audio, extract MP3", "media"),
     (["pulseaudio-utils", "pipewire-bin"], "Intercom calls and voice messages", "chat"),
     (["gir1.2-ayatanaappindicator3-0.1"], "Icon in the top bar (keep running in the tray)", "chat"),
 ]
@@ -23225,6 +23236,21 @@ def settings_entries(win):
           ("appearance", "Hear the sounds", "Plays a few of them, one after another.", "button", "▶ Play",
            lambda: [GLib.timeout_add(i * 650, lambda n=n: sfx(win, n) or False)
                     for i, n in enumerate(("crumple", "thud", "zip", "clunk", "ding"))]),
+          ("safety", "Ransomware guard", "Watches Documents, Desktop, Pictures, Downloads and team folders. If many "
+           "files suddenly get scrambled or renamed to strange extensions, it pauses syncing and backups and alerts you.",
+           "switch", lambda: win.cfg.get("ransom_guard", True),
+           lambda v: (win.cfg.__setitem__("ransom_guard", v), write_json(CONFIG_FILE, win.cfg), GUARD.rewatch())),
+          ("safety", "Test the ransomware alarm", "Shows what the alert looks like (nothing is wrong).", "button",
+           "Show", lambda: win.ransom_alert(["/example/report.docx.x7k2pq"] * 3, ["/example/report.docx.x7k2pq"], [],
+                                            time.time() - 5)),
+          ("safety", "Backups", "Copy your folders to another drive or network folder on a schedule, keeping older "
+           "versions.", "button", "Open…", win.backups_dialog),
+          ("files", "Find similar photos", "Groups photos that look alike (bursts, edited copies) and keeps the best.",
+           "button", "Find…", lambda: win.similar_photos()),
+          ("chat", "Phone scans go to", "Where documents you scan with the phone are saved.", "button", "Choose…",
+           lambda: win.choose_phone_folder("scan_folder", "Phone scans go to")),
+          ("chat", "Phone photos go to", "Where photos imported from the phone are saved (in year / month folders).",
+           "button", "Choose…", lambda: win.choose_phone_folder("phone_photos_folder", "Phone photos go to")),
           ("chat", "Team folders", "Folders that stay the same on everyone's PC in a chat group, encrypted, no "
            "cloud.", "button", "Open…", win.team_folders),
           ("files", "Tags", "Make your own tags, rename or remove them.", "button", "Manage…", win.manage_tags),
@@ -23894,6 +23920,12 @@ class CommandPalette(Gtk.Window):
              ("🏷", "New tag", "", lambda: w.new_tag(sel() or None)),
              ("🏷", "Manage tags", "", lambda: w.manage_tags()),
              ("🖼", "Image tools for the selected pictures", "", lambda: sel() and w.image_tools(sel())),
+             ("📄", "PDF tools for the selected PDFs", "", lambda: sel() and w.pdf_tools([x for x in sel() if ext_of(x) == "pdf"])),
+             ("🎞", "Media tools for the selected video or song", "", lambda: sel() and w.media_tools(sel()[0])),
+             ("🖼", "Find similar photos here", "", lambda: w.similar_photos()),
+             ("💾", "Backups", "", lambda: w.backups_dialog()),
+             ("🛡", "Ransomware guard: test the alarm", "", lambda: w.ransom_alert(
+                 ["/example/report.docx.x7k2pq"] * 3, ["/example/report.docx.x7k2pq"], [], time.time() - 5)),
              ("📢", "Send an announcement to everyone", "", lambda: w.announce_dialog()),
              ("⚙", "Settings", "Ctrl+,", lambda: w.open_settings()),
              ("⌨", "Keyboard shortcuts", "", lambda: show_shortcuts(w)),
@@ -24449,7 +24481,7 @@ class TeamFolders:
             pass
 
     def sync(self, fid):
-        if fid in self.busy or not self.win:
+        if fid in self.busy or not self.win or GUARD.paused:
             return
         self.busy.add(fid)
         changed = []
@@ -24556,6 +24588,661 @@ class TeamFolders:
 
 
 TEAM = TeamFolders()
+
+
+
+# ---------------------------------------------------------------- 📄 PDF tools (qpdf, poppler or Ghostscript: whichever is there)
+def _gs():
+    return shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+
+
+def parse_pages(text, count=None):
+    """'1-3, 5, 8-' → [1, 2, 3, 5, 8, …] (1-based). Raises ValueError for nonsense."""
+    out = []
+    for part in text.replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a = int(a) if a else 1
+            b = int(b) if b else (count or a)
+            if a < 1 or b < a:
+                raise ValueError(part)
+            out += list(range(a, b + 1))
+        else:
+            n = int(part)
+            if n < 1:
+                raise ValueError(part)
+            out.append(n)
+    if count:
+        out = [n for n in out if n <= count]
+    if not out:
+        raise ValueError(text)
+    return out
+
+
+def pdf_count(path):
+    n = pdf_pages(path) if "pdf_pages" in globals() else None
+    try:
+        return int(n) if n else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _run(args, timeout=600):
+    r = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode not in (0, 3):                         # qpdf: 3 = done with warnings
+        raise OSError((r.stderr or r.stdout or "failed").strip().splitlines()[-1][:300])
+
+
+def pdf_merge(paths, out):
+    if shutil.which("qpdf"):
+        return _run(["qpdf", "--empty", "--pages"] + list(paths) + ["--", out])
+    if shutil.which("pdfunite"):
+        return _run(["pdfunite"] + list(paths) + [out])
+    if _gs():
+        return _run([_gs(), "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", f"-sOutputFile={out}"] + list(paths))
+    raise FileNotFoundError("qpdf")
+
+
+def pdf_extract(path, pages, out):
+    spec = ",".join(str(n) for n in pages)
+    if shutil.which("qpdf"):
+        return _run(["qpdf", path, "--pages", path, spec, "--", out])
+    if shutil.which("pdfseparate") and shutil.which("pdfunite"):
+        tmpd = tempfile.mkdtemp(prefix="arckad-pdf-")
+        try:
+            parts = []
+            for n in pages:
+                part = os.path.join(tmpd, f"p{n}.pdf")
+                _run(["pdfseparate", "-f", str(n), "-l", str(n), path, part])
+                parts.append(part)
+            return _run(["pdfunite"] + parts + [out])
+        finally:
+            shutil.rmtree(tmpd, ignore_errors=True)
+    raise FileNotFoundError("qpdf")
+
+
+def pdf_split(path, folder):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    pattern = os.path.join(folder, f"{stem} - page %d.pdf")
+    if shutil.which("qpdf"):
+        tmpl = os.path.join(folder, f"{stem} - page.pdf")
+        _run(["qpdf", "--split-pages", path, tmpl])       # qpdf names them "… - page-01.pdf"
+        return
+    if shutil.which("pdfseparate"):
+        return _run(["pdfseparate", path, pattern])
+    raise FileNotFoundError("qpdf")
+
+
+def pdf_rotate(path, angle, pages, out):
+    if not shutil.which("qpdf"):
+        raise FileNotFoundError("qpdf")
+    spec = f"+{angle}" + (":" + ",".join(str(n) for n in pages) if pages else "")
+    return _run(["qpdf", path, out, f"--rotate={spec}"])
+
+
+def pdf_compress(path, level, out):
+    if _gs():
+        return _run([_gs(), "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.5",
+                     f"-dPDFSETTINGS=/{level}", "-dDetectDuplicateImages=true", f"-sOutputFile={out}", path])
+    if shutil.which("qpdf"):                               # lossless: smaller only by repacking
+        return _run(["qpdf", "--object-streams=generate", "--compress-streams=y", "--recompress-flate", path, out])
+    raise FileNotFoundError("ghostscript")
+
+
+# ---------------------------------------------------------------- 🎞 Media tools (ffmpeg)
+MEDIA_ACTIONS = [
+    ("mp3", "🎵 Extract the sound as MP3", ".mp3", ["-vn", "-c:a", "libmp3lame", "-q:a", "2"]),
+    ("mp4", "🎬 Convert to MP4 (plays everywhere)", ".mp4",
+     ["-c:v", "libx264", "-preset", "medium", "-crf", "22", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]),
+    ("small", "📉 Make the video smaller (720p)", ".mp4",
+     ["-vf", "scale=-2:'min(720,ih)'", "-c:v", "libx264", "-preset", "medium", "-crf", "27", "-c:a", "aac", "-b:a",
+      "128k", "-movflags", "+faststart"]),
+    ("m4a", "🎧 Convert the sound to M4A (AAC)", ".m4a", ["-vn", "-c:a", "aac", "-b:a", "192k"]),
+    ("wav", "🎼 Convert the sound to WAV", ".wav", ["-vn", "-c:a", "pcm_s16le"]),
+    ("gif", "🎞 Make a GIF (first 8 seconds)", ".gif",
+     ["-t", "8", "-vf", "fps=12,scale=480:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse"]),
+]
+
+
+def media_info(path):
+    """Duration, size, video and audio details from ffprobe ({} when it isn't there)."""
+    probe = shutil.which("ffprobe")
+    if not probe:
+        return {}
+    try:
+        r = subprocess.run([probe, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", path],
+                           capture_output=True, text=True, timeout=30,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        d = json.loads(r.stdout or "{}")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    info = {}
+    fmt = d.get("format") or {}
+    try:
+        info["duration"] = float(fmt.get("duration") or 0)
+    except ValueError:
+        info["duration"] = 0
+    try:
+        info["bitrate"] = int(fmt.get("bit_rate") or 0)
+    except ValueError:
+        pass
+    for s in d.get("streams") or []:
+        if s.get("codec_type") == "video" and "video" not in info:
+            fps = s.get("avg_frame_rate") or "0/1"
+            try:
+                a, b = fps.split("/")
+                fps = round(int(a) / int(b), 2) if int(b) else 0
+            except ValueError:
+                fps = 0
+            info["video"] = f"{s.get('width')}×{s.get('height')} · {s.get('codec_name', '?')} · {fps} fps"
+        elif s.get("codec_type") == "audio" and "audio" not in info:
+            info["audio"] = (f"{s.get('codec_name', '?')} · {s.get('sample_rate', '?')} Hz · "
+                             f"{s.get('channels', '?')} channel{'s' if s.get('channels') != 1 else ''}")
+    return info
+
+
+def fmt_duration(sec):
+    sec = int(sec or 0)
+    return f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}" if sec >= 3600 else f"{sec // 60}:{sec % 60:02d}"
+
+
+# ---------------------------------------------------------------- 🖼 Similar photos (perceptual hash)
+def photo_dhash(path):
+    """A 64-bit fingerprint of how a picture looks (survives resizing, small edits and re-saving)."""
+    pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 256, 256, True)
+    pb = pb.apply_embedded_orientation() or pb
+    small = pb.scale_simple(9, 8, GdkPixbuf.InterpType.BILINEAR)
+    px, rs, n = small.get_pixels(), small.get_rowstride(), small.get_n_channels()
+    bits = 0
+    for y in range(8):
+        row = [px[y * rs + x * n] * 0.299 + px[y * rs + x * n + 1] * 0.587 + px[y * rs + x * n + 2] * 0.114
+               for x in range(9)]
+        for x in range(8):
+            bits = (bits << 1) | (1 if row[x] > row[x + 1] else 0)
+    return bits, pb.get_width() * pb.get_height()
+
+
+def group_similar(items, limit=8):
+    """items: [(path, hash)] → groups of paths that look alike (union–find on Hamming distance)."""
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    hashes = [h for _p, h in items]
+    for i in range(len(items)):
+        hi = hashes[i]
+        for j in range(i + 1, len(items)):
+            if bin(hi ^ hashes[j]).count("1") <= limit:
+                a, b = find(i), find(j)
+                if a != b:
+                    parent[b] = a
+    groups = {}
+    for i, (path, _h) in enumerate(items):
+        groups.setdefault(find(i), []).append(path)
+    return [g for g in groups.values() if len(g) > 1]
+
+
+class SimilarPhotosWindow(Gtk.Window):
+    def __init__(self, win, folder):
+        super().__init__(title=f"🖼 Similar photos · {short(folder)}", transient_for=win)
+        self.win, self.folder = win, folder
+        self.set_default_size(1000, 680)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        self.add(box)
+        top = Gtk.Box(spacing=8)
+        self.title = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        top.pack_start(self.title, True, True, 0)
+        self.strict = Gtk.ComboBoxText()
+        for k, lbl in (("4", "Almost identical"), ("8", "Very similar"), ("12", "Similar")):
+            self.strict.append(k, lbl)
+        self.strict.set_active_id("8")
+        self.strict.connect("changed", lambda *_: self.regroup())
+        top.add(self.strict)
+        box.add(top)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(self.body)
+        box.pack_start(sw, True, True, 0)
+        bar = Gtk.Box(spacing=8)
+        self.summary = Gtk.Label(xalign=0, hexpand=True)
+        bar.pack_start(self.summary, True, True, 0)
+        go = Gtk.Button(label="🗑 Move ticked to the Trash")
+        go.get_style_context().add_class("destructive-action")
+        go.connect("clicked", lambda *_: self.trash_ticked())
+        bar.add(go)
+        box.add(bar)
+        self.items, self.info, self.checks = [], {}, {}
+        self.show_all()
+        self.title.set_markup("<b>Looking at your photos…</b>")
+        threading.Thread(target=self._scan, daemon=True).start()
+
+    def _scan(self):
+        items, info = [], {}
+        n = 0
+        for fp, st, is_dir in walk_entries(self.folder, hidden=False):
+            fp = str(fp)
+            if is_dir or category_of(fp) != "Images" or ext_of(fp) in ("svg", "ico", "gif"):
+                continue
+            try:
+                h, pixels = photo_dhash(fp)
+            except (GLib.Error, OSError):
+                continue
+            items.append((fp, h))
+            info[fp] = (pixels, st.st_size, st.st_mtime)
+            n += 1
+            if n % 50 == 0:
+                GLib.idle_add(lambda k=n: self.title.set_markup(f"<b>Looking at your photos…</b> {k}") and False)
+            if n >= 4000:
+                break
+        self.items, self.info = items, info
+        GLib.idle_add(self.regroup)
+
+    def regroup(self):
+        groups = group_similar(self.items, int(self.strict.get_active_id() or 8))
+        for c in self.body.get_children():
+            self.body.remove(c)
+        self.checks = {}
+        spare = 0
+        for g in sorted(groups, key=len, reverse=True)[:300]:
+            best = max(g, key=lambda p: (self.info[p][0], self.info[p][1]))      # most pixels, then biggest file
+            frame = Gtk.Frame()
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=8, column_spacing=6,
+                               row_spacing=6, margin=6)
+            for path in sorted(g, key=lambda p: p != best):
+                v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+                img = Gtk.Image()
+                try:
+                    img.set_from_pixbuf(load_scaled(path, 150, 120) or thumbnail_for(path, 120))
+                except Exception:
+                    pass
+                v.add(img)
+                pixels, size, _m = self.info[path]
+                cb = Gtk.CheckButton()
+                lbl = Gtk.Label(xalign=0)
+                lbl.set_markup(("<b>⭐ keep</b>\n" if path == best else "") +
+                               f"<small>{esc(os.path.basename(path))[:24]}\n{human_size(size)}</small>")
+                cb.add(lbl)
+                cb.set_active(path != best)
+                if path != best:
+                    spare += size
+                self.checks[path] = cb
+                v.add(cb)
+                flow.add(v)
+            frame.add(flow)
+            self.body.add(frame)
+        self.body.show_all()
+        self.title.set_markup(f"<b>{len(groups)} group{'s' if len(groups) != 1 else ''} of similar photos</b> "
+                              f"<small>({len(self.items)} photos looked at)</small>" if groups else
+                              f"<b>No similar photos</b> <small>({len(self.items)} photos looked at)</small>")
+        self.summary.set_text(f"The best of each group is kept (most pixels). Ticked: the rest, "
+                              f"{human_size(spare)} to free." if groups else "")
+        return False
+
+    def trash_ticked(self):
+        paths = [p for p, cb in self.checks.items() if cb.get_active() and os.path.exists(p)]
+        if not paths:
+            return
+        if not self.win.confirm(f"Move {len(paths)} photo{'s' if len(paths) != 1 else ''} to the Trash?"):
+            return
+        self.win.trash(self.win.active, paths)
+        self.items = [(p, h) for p, h in self.items if p not in set(paths)]
+        self.regroup()
+
+
+# ---------------------------------------------------------------- 🛡 Ransomware guard
+RANSOM_EXTS = {"encrypted", "enc", "locked", "crypt", "crypted", "crypto", "locky", "cerber", "zepto", "wcry", "wncry",
+               "wnry", "ryk", "conti", "lockbit", "djvu", "odin", "thor", "aesir", "zzzzz", "micro", "vvv", "ccc",
+               "exx", "ezz", "ecc", "xyz", "kraken", "darkness", "nochance", "breaking_bad", "cry", "crinf", "r5a",
+               "xrtn", "rdm", "rrk", "lol!", "pzdc", "good", "LeChiffre", "keybtc@inbox_com", "0x0", "bleep", "1999",
+               "vault", "ha3", "toxcrypt", "magic", "SUPERCRYPT", "CTBL", "CTB2", "locked-ransomware"}
+PLAIN_EXTS = {"txt", "csv", "md", "html", "htm", "xml", "json", "svg", "bmp", "py", "js", "css", "ini", "log", "tex",
+              "rtf", "sql", "yaml", "yml"}
+
+
+def entropy(data):
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for b in data:
+        counts[b] += 1
+    n = len(data)
+    return -sum(c / n * math.log2(c / n) for c in counts if c)
+
+
+class RansomGuard:
+    """Watches your main folders. Many files suddenly renamed to strange extensions, or ordinary text files turning
+    into scrambled bytes all at once, is how ransomware looks: Arckad-D stops syncing and backups and alerts you."""
+    WINDOW = 30
+
+    def __init__(self):
+        self.win = None
+        self.mons = []
+        self.events = []                                      # (time, path, kind)
+        self.alert_until = 0
+        self.snooze_until = 0
+        self.paused = False
+
+    def folders(self):
+        cfg = self.win.cfg
+        if cfg.get("guard_folders"):
+            return [f for f in cfg["guard_folders"] if os.path.isdir(f)]
+        out = []
+        for k in (GLib.UserDirectory.DIRECTORY_DOCUMENTS, GLib.UserDirectory.DIRECTORY_DESKTOP,
+                  GLib.UserDirectory.DIRECTORY_PICTURES, GLib.UserDirectory.DIRECTORY_DOWNLOAD):
+            d = GLib.get_user_special_dir(k)
+            if d and os.path.isdir(d) and d not in out:
+                out.append(d)
+        for _fid, f in TEAM.folders():
+            if os.path.isdir(f["path"]) and f["path"] not in out:
+                out.append(f["path"])
+        return out
+
+    def start(self, win):
+        self.win = win
+        self.rewatch()
+
+    def rewatch(self):
+        for m in self.mons:
+            m.cancel()
+        self.mons = []
+        if not self.win or not self.win.cfg.get("ransom_guard", True):
+            return
+        budget = 400                                          # a sensible number of folder watches
+
+        def watch(folder, depth):
+            nonlocal budget
+            if budget <= 0:
+                return
+            try:
+                m = Gio.File.new_for_path(folder).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+            except GLib.Error:
+                return
+            m.connect("changed", self._changed)
+            self.mons.append(m)
+            budget -= 1
+            if depth >= 3:
+                return
+            try:
+                with os.scandir(folder) as it:
+                    for e in it:
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith("."):
+                            watch(e.path, depth + 1)
+            except OSError:
+                pass
+        for f in self.folders():
+            watch(f, 0)
+
+    def _changed(self, _m, f, other, ev):
+        E = Gio.FileMonitorEvent
+        if ev not in (E.CHANGES_DONE_HINT, E.CREATED, E.RENAMED, E.MOVED_IN):
+            return
+        path = (other or f).get_path() if ev == E.RENAMED and other else f.get_path()
+        if not path or os.path.basename(path).startswith("."):
+            return
+        now = time.time()
+        self.events.append((now, path, "renamed" if ev == E.RENAMED else "changed"))
+        self.events = [e for e in self.events if now - e[0] < self.WINDOW]
+        if len(self.events) >= 8 and now > self.alert_until and now > self.snooze_until:
+            self.check()
+
+    @staticmethod
+    def suspicious_name(path):
+        name = os.path.basename(path)
+        parts = name.split(".")
+        if len(parts) < 2:
+            return False
+        last = parts[-1]
+        if last.lower() in RANSOM_EXTS or last in RANSOM_EXTS:
+            return True
+        # "report.docx.x7k2pq": a known extension followed by an unknown random-looking one
+        return len(parts) >= 3 and parts[-2].lower() in ALL_KNOWN_EXTS and last.lower() not in ALL_KNOWN_EXTS \
+            and 4 <= len(last) <= 10 and any(c.isdigit() for c in last)
+
+    def check(self):
+        evs = list(self.events)
+        paths = {p for _t, p, _k in evs}
+        bad_names = [p for p in paths if self.suspicious_name(p)]
+        scrambled = []
+        if len(paths) >= 40:
+            for p in [p for p in paths if ext_of(p) in PLAIN_EXTS][:12]:
+                try:
+                    with open(p, "rb") as fh:
+                        if entropy(fh.read(65536)) > 7.5:
+                            scrambled.append(p)
+                except OSError:
+                    continue
+        if len(bad_names) >= 8 or len(scrambled) >= 5:
+            self.alert(sorted(paths), bad_names, scrambled, min(t for t, _p, _k in evs))
+
+    def alert(self, paths, bad_names, scrambled, since):
+        self.alert_until = time.time() + 600
+        self.paused = True                                    # team folders and backups wait
+        GLib.idle_add(lambda: self.win.ransom_alert(paths, bad_names, scrambled, since) or False)
+
+    def resume(self):
+        self.paused = False
+
+    @staticmethod
+    def top_writers():
+        """Linux: the programs writing the most to disk right now (your own programs only)."""
+        if IS_WIN:
+            return []
+
+        def snap():
+            out = {}
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/io") as fh:
+                        wb = int(next(l for l in fh if l.startswith("write_bytes")).split()[1])
+                    out[int(pid)] = wb
+                except (OSError, StopIteration, ValueError):
+                    continue
+            return out
+        a = snap()
+        time.sleep(1.5)
+        b = snap()
+        me = os.getpid()
+        rows = []
+        for pid, wb in b.items():
+            d = wb - a.get(pid, wb)
+            if d > 0 and pid != me:
+                try:
+                    with open(f"/proc/{pid}/comm") as fh:
+                        name = fh.read().strip()
+                    with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                        cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()[:120]
+                except OSError:
+                    continue
+                rows.append((d, pid, name, cmd))
+        return sorted(rows, reverse=True)[:6]
+
+
+GUARD = RansomGuard()
+
+
+# ---------------------------------------------------------------- 💾 Scheduled backup
+BACKUP_EVERY = [("hourly", "Every hour", 3600), ("daily", "Every day", 86400), ("weekly", "Every week", 7 * 86400)]
+
+
+class Backups:
+    """Copies chosen folders to a drive or a network folder on a schedule. Changed and deleted files keep their old
+    versions in “versions/<date>”, up to the number you choose."""
+
+    def __init__(self):
+        self.win = None
+        self.running = set()
+        self.status = {}                                      # id → text
+
+    def jobs(self):
+        return self.win.cfg.setdefault("backups", [])
+
+    def start(self, win):
+        self.win = win
+        GLib.timeout_add_seconds(60, lambda: self.tick() and False)
+        GLib.timeout_add_seconds(600, self.tick)
+
+    def save(self):
+        write_json(CONFIG_FILE, self.win.cfg)
+
+    def tick(self):
+        now = time.time()
+        for job in self.jobs():
+            every = next((s for k, _l, s in BACKUP_EVERY if k == job.get("every", "daily")), 86400)
+            if now - job.get("last", 0) >= every and job["id"] not in self.running:
+                self.run(job)
+        return True
+
+    def root(self, job):
+        safe = re.sub(r'[\\/:*?"<>|]', "_", job.get("name") or "Backup")
+        return os.path.join(job["dest"], "Arckad Backup", safe)
+
+    def run(self, job, manual=False):
+        if job["id"] in self.running:
+            return
+        if GUARD.paused:
+            self.status[job["id"]] = "⏸ waiting: the ransomware guard is on alert"
+            return
+        if not os.path.isdir(job.get("dest", "")):
+            self.status[job["id"]] = "⏳ waiting for the backup drive or folder to be connected"
+            if manual:
+                self.win.error(f"The backup destination isn't available:\n{job.get('dest')}\n\nConnect the drive (or "
+                               "network folder) and try again.")
+            return
+        self.running.add(job["id"])
+        self.status[job["id"]] = "running…"
+        threading.Thread(target=self._work, args=(job,), daemon=True).start()
+
+    def _work(self, job):
+        copied = archived = 0
+        errors = []
+        stamp = time.strftime("%Y-%m-%d %H.%M.%S")
+        root = self.root(job)
+        cur = os.path.join(root, "current")
+        vers = os.path.join(root, "versions", stamp)
+
+        def archive(dst, rel_path):
+            nonlocal archived
+            target = os.path.join(vers, rel_path)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            shutil.move(dst, target)
+            archived += 1
+        try:
+            for src_root in job.get("sources", []):
+                if not os.path.isdir(src_root):
+                    continue
+                base = os.path.basename(src_root.rstrip("/\\")) or "drive"
+                seen = set()
+                for fp, st, is_dir in walk_entries(src_root, hidden=False):
+                    if GUARD.paused:
+                        raise OSError("stopped: the ransomware guard is on alert")
+                    if is_dir:
+                        continue
+                    rel = os.path.join(base, os.path.relpath(fp, src_root))
+                    seen.add(rel)
+                    dst = os.path.join(cur, rel)
+                    try:
+                        dst_st = os.stat(dst)
+                        if dst_st.st_size == st.st_size and abs(dst_st.st_mtime - st.st_mtime) < 2.01:   # FAT drives: 2 s
+                            continue
+                        archive(dst, rel)                                       # the old version is kept
+                    except FileNotFoundError:
+                        pass
+                    try:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        shutil.copy2(fp, dst)
+                        copied += 1
+                    except OSError as ex:
+                        errors.append(f"{rel}: {ex.strerror or ex}")
+                gone_root = os.path.join(cur, base)                             # deleted at the source: archived
+                for fp, _st, is_dir in list(walk_entries(gone_root, hidden=True)) if os.path.isdir(gone_root) else []:
+                    rel = os.path.relpath(fp, cur)
+                    if not is_dir and rel not in seen:
+                        try:
+                            archive(fp, rel)
+                        except OSError:
+                            pass
+            keep = int(job.get("keep", 10))                                    # only the newest N version sets
+            vroot = os.path.join(root, "versions")
+            if os.path.isdir(vroot):
+                for old in sorted(os.listdir(vroot))[:-keep] if keep > 0 else []:
+                    shutil.rmtree(os.path.join(vroot, old), ignore_errors=True)
+            msg = f"✓ {time.strftime('%d %b %H:%M')}: {copied} copied, {archived} older versions kept"
+        except OSError as ex:
+            msg = f"✗ {ex}"
+        job["last"] = time.time()
+        job["result"] = msg + (f" · {len(errors)} problems" if errors else "")
+        self.status[job["id"]] = job["result"]
+        self.running.discard(job["id"])
+        GLib.idle_add(lambda: (self.save(), self.win.flash_all(f"💾 Backup “{job.get('name')}”: {msg}")) and False)
+
+
+BACKUPS = Backups()
+
+
+# ---------------------------------------------------------------- 📷📸 Files from the phone (scans, camera photos)
+class PhoneInbox:
+    def __init__(self):
+        self.lock = threading.Lock()
+
+    def folder(self, cfg, kind):
+        if kind == "scan":
+            d = cfg.get("scan_folder") or os.path.join(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+                                                       or str(HOME), "Scans")
+            return d
+        base = cfg.get("phone_photos_folder") or os.path.join(
+            GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or str(HOME), "Phone")
+        return base
+
+    def receive(self, req, chat):
+        kind = "scan" if req.get("kind") == "scan" else "photo"
+        fid = re.sub(r"[^A-Za-z0-9_-]", "", str(req.get("id") or ""))[:40]
+        name = os.path.basename(str(req.get("name") or "file").replace("\\", "/")).strip() or "file"
+        name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name)[:150]
+        try:
+            off, total = int(req.get("off") or 0), int(req.get("total") or 0)
+            data = base64.b64decode(req.get("data") or "")
+        except (ValueError, TypeError):
+            return {"ok": False, "reason": "bad data"}
+        if not fid or total <= 0 or total > 4 * 1024 ** 3 or off < 0 or off + len(data) > total:
+            return {"ok": False, "reason": "bad data"}
+        tmpdir = CACHE_DIR / "phone-in"
+        tmpdir.mkdir(parents=True, exist_ok=True)
+        part = tmpdir / (fid + ".part")
+        with self.lock:
+            if off == 0:
+                part.write_bytes(b"")
+            elif not part.exists() or part.stat().st_size != off:
+                return {"ok": False, "reason": "restart", "have": part.stat().st_size if part.exists() else 0}
+            with open(part, "ab") as fh:
+                fh.write(data)
+        if off + len(data) < total:
+            return {"ok": True, "more": True}
+        cfg = chat.win.cfg if getattr(chat, "win", None) else read_json(CONFIG_FILE, {})
+        folder = self.folder(cfg, kind)
+        taken = float(req.get("taken") or 0) / 1000 or time.time()
+        if kind == "photo":                                    # Pictures/Phone/2026/11 November
+            folder = os.path.join(folder, time.strftime("%Y", time.localtime(taken)),
+                                  time.strftime("%m %B", time.localtime(taken)))
+        os.makedirs(folder, exist_ok=True)
+        dest = str(unique_target(Path(folder) / name))
+        shutil.move(str(part), dest)
+        try:
+            os.utime(dest, (taken, taken))
+        except OSError:
+            pass
+        chat.ui("on_phone_file", kind, dest)
+        return {"ok": True, "saved": os.path.basename(dest)}
+
+
+PHONE_INBOX = PhoneInbox()
 
 
 class TabWindow(Gtk.Window):
@@ -24696,6 +25383,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self.watch_drives()
         self.setup_clip_sync()
         TEAM.start(self)
+        GUARD.start(self)
+        BACKUPS.start(self)
         self.apply_text_size()
         GLib.timeout_add(1500, lambda: self.label_for_readers() and False)
         self.connect("key-press-event", self.on_key)
@@ -25014,6 +25703,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("🏢 Organisation…", self.org_dialog),
             ("👥 People directory…", self.people_directory),
             ("📁 Team folders…", self.team_folders),
+            ("💾 Backups…", self.backups_dialog),
             ("📢 Send an announcement…", self.announce_dialog),
             ("🧭 Command palette (Ctrl+K)", lambda: CommandPalette(self)),
             ("🔐 Change the vault password…", self.vault_password),
@@ -25039,6 +25729,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
             ("Compare selected files…", self.compare_selected),
             ("🔀 Compare two folders…", self.compare_folders_dialog),
+            ("🖼 Find similar photos…", lambda: self.similar_photos()),
+            ("💾 Backups…", self.backups_dialog),
             ("Auto-sort Downloads…", self.autosort_dialog),
             ("Update search index now", INDEX.rebuild),
             ("Search index settings…", self.index_settings),
@@ -25053,6 +25745,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
             ("Compare selected files…", self.compare_selected),
             ("🔀 Compare two folders…", self.compare_folders_dialog),
+            ("🖼 Find similar photos…", lambda: self.similar_photos()),
+            ("💾 Backups…", self.backups_dialog),
             ("Auto-sort Downloads…", self.autosort_dialog),
             ("Send files…", lambda: self.open_share(self.active.selected_paths() or None, "nearby")),
             ("Receive files…", lambda: self.open_share(None, "receive")),
@@ -30234,6 +30928,464 @@ class MainWindow(Gtk.ApplicationWindow):
         self.play("plane", src=self.pt_center(0.6), dst=self.pt_widget(self.chat_btn) or self.pt_center(0.2), lift=80)
         self.flash_all(f"📢 Announcement sent to {sent} {'person' if sent == 1 else 'people'}"
                        + (f" ({missing} without a chat yet)" if missing else ""))
+
+
+    # ---------- 📄 PDF tools
+    def _need_tool(self, what):
+        msg = {"qpdf": "This needs qpdf (free). On Ubuntu: Tools → Install optional features, or  sudo apt install qpdf",
+               "ghostscript": "This needs Ghostscript (free). On Ubuntu: Tools → Install optional features, or  "
+                              "sudo apt install ghostscript"}.get(what, f"This needs {what}.")
+        if IS_WIN:
+            msg = msg.split(".")[0] + ". Install it from its website, then try again."
+        self.error(msg)
+
+    def pdf_tools(self, paths):
+        pane = self.active
+        d = Gtk.Dialog(title=f"📄 PDF tools · {len(paths)} PDF{'s' if len(paths) != 1 else ''}", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Do it", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        group = None
+        radios = {}
+        acts = [("merge", "Merge them into one PDF (in this order)", len(paths) > 1),
+                ("split", "Split into one PDF per page", True), ("extract", "Keep only some pages", len(paths) == 1),
+                ("rotate", "Rotate pages", True), ("compress", "Make smaller (compress pictures)", True)]
+        for key, label, ok in acts:
+            r = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            group = group or r
+            r.set_sensitive(ok)
+            radios[key] = r
+            box.add(r)
+        (radios["merge"] if len(paths) > 1 else radios["split"]).set_active(True)
+        grid = Gtk.Grid(column_spacing=10, row_spacing=8, margin_top=6)
+        pages = Gtk.Entry(placeholder_text="e.g. 1-3, 5, 8-   (empty = all)")
+        angle = Gtk.ComboBoxText()
+        for a, lbl in (("90", "↻ 90° right"), ("270", "↺ 90° left"), ("180", "180°")):
+            angle.append(a, lbl)
+        angle.set_active(0)
+        level = Gtk.ComboBoxText()
+        for k, lbl in (("ebook", "Balanced (good for email)"), ("screen", "Smallest (screen quality)"),
+                       ("printer", "High quality (printing)")):
+            level.append(k, lbl)
+        level.set_active(0)
+        for i, (lbl, w) in enumerate((("Pages:", pages), ("Rotate:", angle), ("Compress:", level))):
+            grid.attach(Gtk.Label(label=lbl, xalign=1), 0, i, 1, 1)
+            grid.attach(w, 1, i, 1, 1)
+        box.add(grid)
+        n1 = pdf_count(paths[0]) if len(paths) == 1 else None
+        if n1:
+            box.add(Gtk.Label(label=f"{os.path.basename(paths[0])} has {n1} page{'s' if n1 != 1 else ''}.", xalign=0))
+        d.show_all()
+        if d.run() != Gtk.ResponseType.OK:
+            d.destroy()
+            return
+        act = next(k for k, r in radios.items() if r.get_active())
+        spec, ang, lev = pages.get_text().strip(), angle.get_active_id(), level.get_active_id()
+        d.destroy()
+        try:
+            page_list = parse_pages(spec, n1) if spec else None
+        except ValueError:
+            return self.error(f"“{spec}” isn't a page list. Use numbers like  1-3, 5, 8-")
+        if act == "extract" and not page_list:
+            return self.error("Type the pages to keep, for example  1-3, 5")
+        folder = os.path.dirname(paths[0])
+        stem = os.path.splitext(os.path.basename(paths[0]))[0]
+        self.spinner.start()
+        pane.flash("📄 Working on the PDF…")
+
+        def work():
+            made, err = [], None
+            try:
+                if act == "merge":
+                    out = str(unique_target(Path(folder) / "Merged.pdf"))
+                    pdf_merge(paths, out)
+                    made.append(out)
+                elif act == "split":
+                    for p_ in paths:
+                        sub = str(unique_target(Path(os.path.dirname(p_)) / (os.path.splitext(os.path.basename(p_))[0] + " - pages")))
+                        os.makedirs(sub)
+                        pdf_split(p_, sub)
+                        made.append(sub)
+                elif act == "extract":
+                    out = str(unique_target(Path(folder) / f"{stem} (pages {spec.replace(' ', '')}).pdf"))
+                    pdf_extract(paths[0], page_list, out)
+                    made.append(out)
+                elif act == "rotate":
+                    for p_ in paths:
+                        out = str(unique_target(Path(os.path.dirname(p_)) / (os.path.splitext(os.path.basename(p_))[0] + " (rotated).pdf")))
+                        pdf_rotate(p_, ang, page_list, out)
+                        made.append(out)
+                else:
+                    for p_ in paths:
+                        out = str(unique_target(Path(os.path.dirname(p_)) / (os.path.splitext(os.path.basename(p_))[0] + " (smaller).pdf")))
+                        pdf_compress(p_, lev, out)
+                        made.append(out)
+            except FileNotFoundError as ex:
+                err = ("tool", str(ex))
+            except (OSError, subprocess.SubprocessError) as ex:
+                err = ("fail", str(ex))
+            GLib.idle_add(done, made, err)
+
+        def done(made, err):
+            self.update_spinner()
+            if err and err[0] == "tool":
+                return self._need_tool(err[1]) or False
+            if err:
+                self.error(f"The PDF tool stopped: {err[1]}")
+            if made:
+                pane.pending_select = [m for m in made if os.path.dirname(m) == pane.location]
+                pane.refresh()
+                if act == "compress":
+                    before, after = sum(os.path.getsize(x) for x in paths), sum(os.path.getsize(x) for x in made)
+                    pane.flash(f"📄 {human_size(before)} → {human_size(after)}"
+                               + (f" ({int((1 - after / before) * 100)}% smaller)" if before and after < before else
+                                  " (it was already small)"))
+                else:
+                    pane.flash(f"📄 Done: {', '.join(os.path.basename(m) for m in made[:3])}")
+                self.play("zip", at=self.pt_pane(pane, 0.4))
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 🎞 media tools
+    def media_tools(self, path):
+        if not shutil.which("ffmpeg"):
+            return self.error("Media tools need ffmpeg (free). On Ubuntu: Tools → Install optional features, or  "
+                              "sudo apt install ffmpeg" if not IS_WIN else "Media tools need ffmpeg: install it from "
+                              "ffmpeg.org, then try again.")
+        info = media_info(path)
+        is_video = "video" in info or category_of(path) == "Videos"
+        d = Gtk.Dialog(title=f"🎞 {os.path.basename(path)}", transient_for=self, modal=True)
+        d.add_buttons("Close", Gtk.ResponseType.CANCEL, "Convert", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        lines = [f"<b>{esc(os.path.basename(path))}</b>", f"Size: {human_size(os.path.getsize(path))}"]
+        if info.get("duration"):
+            lines.append(f"Length: {fmt_duration(info['duration'])}")
+        if info.get("video"):
+            lines.append(f"Video: {esc(info['video'])}")
+        if info.get("audio"):
+            lines.append(f"Sound: {esc(info['audio'])}")
+        if info.get("bitrate"):
+            lines.append(f"Bitrate: {info['bitrate'] // 1000} kbit/s")
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("\n".join(lines))
+        box.add(lbl)
+        box.add(Gtk.Separator())
+        group, radios = None, {}
+        for key, label, _ext, _args in MEDIA_ACTIONS:
+            if not is_video and key in ("mp4", "small", "gif"):
+                continue
+            r = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            group = group or r
+            radios[key] = r
+            box.add(r)
+        d.show_all()
+        if d.run() != Gtk.ResponseType.OK:
+            d.destroy()
+            return
+        key = next(k for k, r in radios.items() if r.get_active())
+        d.destroy()
+        _k, label, ext, args = next(a for a in MEDIA_ACTIONS if a[0] == key)
+        out = str(unique_target(Path(os.path.splitext(path)[0] + (" (smaller)" if key == "small" else "") + ext)))
+        pane = self.active
+        dur = info.get("duration") or 0
+        self.spinner.start()
+        pane.flash(f"🎞 {label.split(' ', 1)[1]}…")
+
+        def work():
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-i", path] + args + ["-progress", "pipe:1", "-nostats",
+                                                                                      out + ".arckad-tmp" + ext]
+            err = None
+            try:
+                pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                last = 0
+                for line in pr.stdout:
+                    if line.startswith("out_time_ms=") and dur and time.time() - last > 0.5:
+                        last = time.time()
+                        try:
+                            pct = min(99, int(int(line.split("=")[1]) / 1e6 / dur * 100))
+                        except ValueError:
+                            continue
+                        GLib.idle_add(lambda v=pct: pane.flash(f"🎞 Converting… {v}%") and False)
+                tail = pr.stderr.read()[-400:]
+                if pr.wait() != 0:
+                    err = (tail.strip().splitlines() or ["ffmpeg failed"])[-1]
+                else:
+                    os.replace(out + ".arckad-tmp" + ext, out)
+            except OSError as ex:
+                err = str(ex)
+            GLib.idle_add(done, err)
+
+        def done(err):
+            self.update_spinner()
+            try:
+                os.remove(out + ".arckad-tmp" + ext)
+            except OSError:
+                pass
+            if err:
+                return self.error(f"Converting stopped: {err}") or False
+            pane.pending_select = [out]
+            pane.refresh()
+            pane.flash(f"🎞 Made {os.path.basename(out)} ({human_size(os.path.getsize(out))})")
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- 🖼 similar photos
+    def similar_photos(self, folder=None):
+        folder = folder or (self.active.location if is_folder_loc(self.active.location) else
+                            GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or str(HOME))
+        return SimilarPhotosWindow(self, folder)
+
+    # ---------- 🛡 ransomware guard
+    def ransom_alert(self, paths, bad_names, scrambled, since):
+        self.notify_desktop("⚠ Arckad-D: files are being scrambled", f"{len(paths)} files changed in a few seconds. "
+                            "Syncing and backups are paused. Open Arckad-D now.", None, lambda: self.show_from_tray())
+        sfx(self, "clunk")
+        d = Gtk.Dialog(title="⚠ Possible ransomware", transient_for=self, modal=False)
+        d.set_keep_above(True)
+        d.set_urgency_hint(True)
+        d.set_default_size(640, 520)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        head = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        head.set_markup(f"<span size='x-large'><b>⚠ Something is changing many files at once</b></span>\n\n"
+                        f"<b>{len(paths)}</b> files changed in the last {int(time.time() - since) or 1} seconds"
+                        + (f", <b>{len(bad_names)}</b> renamed to strange extensions" if bad_names else "")
+                        + (f", <b>{len(scrambled)}</b> plain-text files now look scrambled" if scrambled else "")
+                        + ".\n\nThat's how ransomware looks. <b>Team folders and backups are paused</b> so the damage "
+                          "can't spread. If you didn't start this yourself, pause the program doing it now.")
+        box.add(head)
+        ex = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        ex.set_markup("<small>" + "\n".join(esc(short(x)) for x in (bad_names or scrambled or paths)[:6]) + "</small>")
+        box.add(ex)
+        procs = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.add(procs)
+        if IS_WIN:
+            procs.add(Gtk.Label(label="Open Task Manager (Ctrl+Shift+Esc) → Disk column, and end the program writing the "
+                                      "most.", xalign=0, wrap=True))
+        else:
+            procs.add(Gtk.Label(label="Finding the programs writing the most…", xalign=0))
+
+            def find():
+                rows = RansomGuard.top_writers()
+                GLib.idle_add(show, rows)
+
+            def show(rows):
+                for c in procs.get_children():
+                    procs.remove(c)
+                procs.add(Gtk.Label(label="Programs writing to disk right now:" if rows else
+                                    "Nothing is writing much right now (it may have stopped).", xalign=0))
+                for wb, pid, name, cmd in rows:
+                    r = Gtk.Box(spacing=8)
+                    l = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END)
+                    l.set_markup(f"<b>{esc(name)}</b> <small>(pid {pid}) · {human_size(wb)}/s · {esc(cmd)}</small>")
+                    r.pack_start(l, True, True, 0)
+                    for lbl, sig in (("⏸ Pause it", signal.SIGSTOP), ("✖ End it", signal.SIGKILL)):
+                        b = Gtk.Button(label=lbl)
+                        b.connect("clicked", lambda _b, pid=pid, sig=sig, nm=name: self._signal(pid, sig, nm))
+                        r.add(b)
+                    procs.add(r)
+                procs.show_all()
+                return False
+            threading.Thread(target=find, daemon=True).start()
+        btns = Gtk.Box(spacing=8)
+        roll = Gtk.Button(label="↶ Put back earlier versions")
+        roll.set_tooltip_text("Files in folders with version history go back to how they were before this started")
+        roll.connect("clicked", lambda *_: self._rollback(paths, since))
+        me = Gtk.Button(label="It's me: ignore for 30 minutes")
+        me.connect("clicked", lambda *_: (setattr(GUARD, "snooze_until", time.time() + 1800), GUARD.resume(),
+                                          d.destroy(), self.flash_all("🛡 Guard snoozed for 30 minutes")))
+        ok = Gtk.Button(label="I've dealt with it: resume syncing")
+        ok.connect("clicked", lambda *_: (GUARD.resume(), d.destroy()))
+        for b in (roll, me, ok):
+            btns.add(b)
+        box.add(btns)
+        d.show_all()
+        d.present()
+
+    def _signal(self, pid, sig, name):
+        try:
+            os.kill(pid, sig)
+            self.flash_all(f"🛡 {'Paused' if sig == signal.SIGSTOP else 'Ended'} {name}")
+        except OSError as ex:
+            self.error(f"Couldn't stop {name}: {ex.strerror}")
+
+    def _rollback(self, paths, since):
+        back = skipped = 0
+        for p in paths:
+            try:
+                vs = [v for v in VERSIONS.versions(p) if v[1] < since - 1]
+            except Exception:
+                vs = []
+            if not vs:
+                skipped += 1
+                continue
+            try:
+                VERSIONS.restore(p, max(vs, key=lambda v: v[1])[0])
+                back += 1
+            except OSError:
+                skipped += 1
+        self.refresh_all()
+        self.info(f"↶ Put back {back} file{'s' if back != 1 else ''}." + (
+            f"\n\n{skipped} had no earlier version (turn on version history for your important folders: Tools → "
+            "Version history)." if skipped else ""))
+
+    # ---------- 💾 backups
+    def backups_dialog(self):
+        d = Gtk.Dialog(title="💾 Backups", transient_for=self, modal=False)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(640, 480)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(14)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        intro.set_markup("Copies your folders to <b>another drive</b> or a <b>network folder</b> on a schedule. Only "
+                         "changes are copied; files that change or get deleted keep their <b>older versions</b>.")
+        box.add(intro)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        box.pack_start(sw, True, True, 0)
+        add = Gtk.Button(label="＋ New backup…")
+        add.get_style_context().add_class("suggested-action")
+        box.add(add)
+
+        def fill():
+            for c in lst.get_children():
+                lst.remove(c)
+            jobs = BACKUPS.jobs()
+            if not jobs:
+                lst.add(Gtk.Label(label="No backups yet.", margin=20))
+            for job in jobs:
+                row = Gtk.Box(spacing=8, margin=8)
+                every = next((l for k, l, _s in BACKUP_EVERY if k == job.get("every")), "")
+                status = BACKUPS.status.get(job["id"]) or job.get("result") or "not run yet"
+                lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+                lbl.set_markup(f"<b>💾 {esc(job['name'])}</b>  <small>{esc(every)} · keeps {job.get('keep', 10)} "
+                               f"versions</small>\n<small>{esc(', '.join(short(s) for s in job['sources']))} → "
+                               f"{esc(short(job['dest']))}\n{esc(status)}</small>")
+                row.pack_start(lbl, True, True, 0)
+                for label, cb in (("Run now", lambda j=job: (BACKUPS.run(j, manual=True), fill())),
+                                  ("Open", lambda j=job: (self.show_files(), self.active.go(BACKUPS.root(j)) if
+                                                          os.path.isdir(BACKUPS.root(j)) else self.info("Not run yet."))),
+                                  ("Remove", lambda j=job: self.confirm(f"Remove the backup “{j['name']}”?\n\nThe copies "
+                                                                        "already made stay on the drive.") and
+                                   (BACKUPS.jobs().remove(j), BACKUPS.save(), fill()))):
+                    b = Gtk.Button(label=label)
+                    b.connect("clicked", lambda _b, cb=cb: cb())
+                    row.add(b)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            lst.show_all()
+
+        def new(*_):
+            dd = Gtk.Dialog(title="New backup", transient_for=d, modal=True)
+            dd.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Save", Gtk.ResponseType.OK)
+            grid = Gtk.Grid(column_spacing=10, row_spacing=10, border_width=14)
+            dd.get_content_area().add(grid)
+            name = Gtk.Entry(text="My files")
+            srcs = []
+            src_lbl = Gtk.Label(xalign=0, wrap=True, max_width_chars=40)
+            docs = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOCUMENTS)
+            if docs and os.path.isdir(docs):
+                srcs.append(docs)
+            src_lbl.set_text("\n".join(short(s) for s in srcs) or "(none yet)")
+            add_src = Gtk.Button(label="＋ Add a folder…")
+
+            def pick(*_):
+                ch = Gtk.FileChooserDialog(title="Folder to back up", transient_for=dd,
+                                           action=Gtk.FileChooserAction.SELECT_FOLDER)
+                ch.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Add", Gtk.ResponseType.OK)
+                if ch.run() == Gtk.ResponseType.OK and ch.get_filename() not in srcs:
+                    srcs.append(ch.get_filename())
+                    src_lbl.set_text("\n".join(short(s) for s in srcs))
+                ch.destroy()
+            add_src.connect("clicked", pick)
+            dest = Gtk.FileChooserButton(title="Back up to", action=Gtk.FileChooserAction.SELECT_FOLDER)
+            every = Gtk.ComboBoxText()
+            for k, l, _s in BACKUP_EVERY:
+                every.append(k, l)
+            every.set_active_id("daily")
+            keep = Gtk.ComboBoxText()
+            for k in ("5", "10", "30", "100"):
+                keep.append(k, f"{k} older versions")
+            keep.set_active_id("10")
+            srcbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            srcbox.add(src_lbl)
+            srcbox.add(add_src)
+            for i, (lab, w) in enumerate((("Name:", name), ("Folders:", srcbox), ("Back up to:", dest),
+                                          ("How often:", every), ("Keep:", keep))):
+                grid.attach(Gtk.Label(label=lab, xalign=1, yalign=0), 0, i, 1, 1)
+                grid.attach(w, 1, i, 1, 1)
+            hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=46)
+            hint.set_markup("<small>Pick an external drive or a network folder; not the same disk as your files "
+                            "(a broken disk would take both).</small>")
+            hint.get_style_context().add_class("dim-label")
+            grid.attach(hint, 0, 5, 2, 1)
+            dd.show_all()
+            if dd.run() == Gtk.ResponseType.OK and srcs and dest.get_filename():
+                job = {"id": secrets.token_hex(4), "name": name.get_text().strip() or "Backup", "sources": srcs,
+                       "dest": dest.get_filename(), "every": every.get_active_id(), "keep": int(keep.get_active_id()),
+                       "last": 0}
+                if any(os.path.realpath(job["dest"]).startswith(os.path.realpath(s) + os.sep) or
+                       os.path.realpath(job["dest"]) == os.path.realpath(s) for s in srcs):
+                    self.error("The backup can't go inside a folder it's backing up.")
+                else:
+                    BACKUPS.jobs().append(job)
+                    BACKUPS.save()
+                    BACKUPS.run(job)
+            dd.destroy()
+            fill()
+        add.connect("clicked", new)
+        fill()
+        tick = GLib.timeout_add_seconds(3, lambda: d.get_visible() and (fill() or True))
+        d.connect("response", lambda dlg, _r: (GLib.source_remove(tick), dlg.destroy()))
+        d.show_all()
+        return d
+
+    # ---------- 📷📸 from the phone
+    def on_phone_file(self, kind, path):
+        if kind == "scan":
+            self.play("plane", receive=True, src=(self.overlay.get_allocated_width() + 40, 40),
+                      dst=self.pt_center(0.4), lift=40)
+            self.show_toast("📷 Scan from your phone", f"{os.path.basename(path)} · saved in {short(os.path.dirname(path))}",
+                            None, lambda: self.show_from_tray(folder=os.path.dirname(path), select=path))
+            self.flash_all(f"📷 Scan arrived: {os.path.basename(path)}")
+            return False
+        self._phone_photos = getattr(self, "_phone_photos", []) + [path]
+        if getattr(self, "_phone_photo_timer", None):
+            GLib.source_remove(self._phone_photo_timer)
+
+        def tell():
+            self._phone_photo_timer = None
+            got, self._phone_photos = self._phone_photos, []
+            folder = os.path.dirname(got[-1])
+            self.play("download", at=self.pt_center(0.4))
+            self.show_toast(f"📸 {len(got)} new photo{'s' if len(got) != 1 else ''} from your phone",
+                            f"Saved in {short(folder)}", None,
+                            lambda: self.show_from_tray(folder=folder, select=got[-1]))
+            return False
+        self._phone_photo_timer = GLib.timeout_add_seconds(3, tell)
+        return False
+
+    def choose_phone_folder(self, key, title):
+        d = Gtk.FileChooserDialog(title=title, transient_for=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Use this folder", Gtk.ResponseType.OK)
+        cur = PHONE_INBOX.folder(self.cfg, "scan" if key == "scan_folder" else "photo")
+        if os.path.isdir(cur):
+            d.set_current_folder(cur)
+        if d.run() == Gtk.ResponseType.OK and d.get_filename():
+            self.cfg[key] = d.get_filename()
+            write_json(CONFIG_FILE, self.cfg)
+            self.flash_all(f"Phone {('scans' if key == 'scan_folder' else 'photos')} will go to {short(d.get_filename())}")
+        d.destroy()
 
     # ---------- 📁 team folders
     def team_folders(self):

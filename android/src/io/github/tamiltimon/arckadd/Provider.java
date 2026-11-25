@@ -62,6 +62,19 @@ public class Provider extends ContentProvider {
 
     @Override
     public ParcelFileDescriptor openFile(Uri uri, String mode) throws FileNotFoundException {
+        if (mode != null && mode.contains("w")) {                   // 📷 only the camera, only into our scan folder
+            if (uri.getPathSegments().size() < 2) throw new FileNotFoundException(String.valueOf(uri));
+            File f = new File(uri.getPathSegments().get(1));
+            File scan = new File(getContext().getCacheDir(), "scan");
+            try {
+                if (!f.getCanonicalPath().startsWith(scan.getCanonicalPath() + File.separator))
+                    throw new FileNotFoundException("not writable");
+            } catch (java.io.IOException e) {
+                throw new FileNotFoundException("not writable");
+            }
+            return ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_WRITE_ONLY | ParcelFileDescriptor.MODE_CREATE
+                    | ParcelFileDescriptor.MODE_TRUNCATE);
+        }
         return ParcelFileDescriptor.open(fileOf(uri), ParcelFileDescriptor.MODE_READ_ONLY);
     }
 

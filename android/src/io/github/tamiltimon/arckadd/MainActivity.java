@@ -339,6 +339,10 @@ public class MainActivity extends Activity implements Net.NearbyUi {
     @Override
     protected void onActivityResult(int req, int result, Intent data) {
         super.onActivityResult(req, result, data);
+        if (req == Scanner.REQ) {
+            Scanner.onResult(this, result);
+            return;
+        }
         if (result == RESULT_OK && chat != null && (req == ChatScreen.REQ_ATTACH || req == ChatScreen.REQ_PHOTO || req == ChatScreen.REQ_WALL
                 || req == ChatScreen.REQ_BACKUP || req == ChatScreen.REQ_RESTORE))
             chat.onResult(req, data);

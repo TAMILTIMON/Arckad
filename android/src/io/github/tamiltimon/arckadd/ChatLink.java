@@ -669,6 +669,8 @@ final class ChatLink {
         if (System.currentTimeMillis() - lastSync < 30_000 || key() == null) return;
         lastSync = System.currentTimeMillis();
         for (String inst : list(twins().keys())) if (twinOnline(inst)) bg(() -> sync(inst));
+        if (e.phone instanceof PhoneLink && e.phone.enabled())      // 📸 new camera photos to the PC
+            bg(() -> PhotoImport.check(((PhoneLink) e.phone).ctx(), this));
     }
 
     boolean unlink(String inst) {

@@ -2045,6 +2045,28 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
         clip.setChecked(ClipSync.on(a));
         clip.setOnCheckedChangeListener((v, c) -> ClipSync.set(a, c));
         box.addView(clip, Ui.matchWrap(a, 10));
+        Switch photos = new Switch(a);
+        photos.setText("📸 Send new camera photos to the PC by themselves (same Wi-Fi)");
+        photos.setTextColor(Ui.TEXT);
+        photos.setChecked(PhotoImport.on(a));
+        photos.setOnCheckedChangeListener((v, yes) -> {
+            if (!yes) {
+                PhotoImport.set(a, false, 0);
+                return;
+            }
+            Ui.dialog(a).setTitle("📸 Photos to the PC").setMessage("Send photos taken from now on, or also the last 7 days?")
+                    .setPositiveButton("From now on", (d, w) -> PhotoImport.set(a, true, System.currentTimeMillis()))
+                    .setNeutralButton("Last 7 days too", (d, w) -> PhotoImport.set(a, true, System.currentTimeMillis() - 7L * 86400_000))
+                    .setNegativeButton("Cancel", (d, w) -> v.setChecked(false)).show();
+        });
+        box.addView(photos, Ui.matchWrap(a, 10));
+        Switch vids = new Switch(a);
+        vids.setText("🎬 …and videos too");
+        vids.setTextColor(Ui.TEXT);
+        vids.setChecked(PhotoImport.videos(a));
+        vids.setOnCheckedChangeListener((v, yes) -> PhotoImport.setVideos(a, yes));
+        box.addView(vids, Ui.matchWrap(a, 4));
+        box.addView(Ui.button(a, "📷 Scan a document to the PC", true, v -> Scanner.start(a)), Ui.matchWrap(a, 10));
         box.addView(Ui.button(a, (PhoneControl.instance != null ? "✓ " : "") + "Turn on Arckad-D in Accessibility (needed for control)",
                 PhoneControl.instance == null, v -> a.startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))),
                 Ui.matchWrap(a, 6));

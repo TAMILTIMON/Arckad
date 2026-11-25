@@ -42,6 +42,10 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         return mirrorFrame(since);
     }
 
+    Context ctx() {
+        return c;
+    }
+
     @Override
     public boolean enabled() {
         return Ui.prefs(c).getBoolean("phone_link", false);
