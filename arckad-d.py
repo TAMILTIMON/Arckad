@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.59.0"
+APP_VERSION = "3.60.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -156,6 +156,66 @@ TEXT_EXTS = {"txt", "md", "csv", "tsv", "log", "ini", "cfg", "conf", "toml", "en
 PARTIAL_EXTS = {"crdownload", "part", "partial", "tmp", "download", "opdownload", "!ut"}
 TAGS = OrderedDict([("Important", "#e01b24"), ("To do", "#ff7800"), ("Work", "#3584e4"),
                     ("Personal", "#2ec27e"), ("Later", "#9141ac"), ("Done", "#77767b")])
+BUILTIN_TAGS = set(TAGS)
+# 🏷 Smart tags: suggested from a file's name, type, folder and size (applied only when you say so)
+SMART_TAGS = OrderedDict([("Screenshot", "#0aa1a1"), ("Invoice", "#c64600"), ("Camera photo", "#26a269"),
+                          ("Scanned document", "#865e3c"), ("Code", "#613583"), ("Installer", "#a51d2d"),
+                          ("Archive", "#986a44"), ("Video", "#1a5fb4"), ("Music", "#c061cb"),
+                          ("Large file", "#5e5c64")])
+
+
+def smart_tags_for(path, size=None):
+    """The smart tags that fit this file (an empty list for folders)."""
+    import re as _re
+    name = os.path.basename(path)
+    low = name.lower()
+    if os.path.isdir(path):
+        return []
+    kind = category_of(name)
+    ext = ext_of(name)
+    out = []
+    parent = os.path.basename(os.path.dirname(path)).lower()
+    if kind == "Images" and (_re.match(r"^(screenshot|screen ?shot|scrnli|snip|capture)", low) or "screenshot" in low
+                             or parent in ("screenshots", "screen shots")):
+        out.append("Screenshot")
+    if _re.search(r"(invoice|receipt|\bbill\b|payslip|pay slip|salary slip|tax ?invoice|gst)", low) and \
+            (ext == "pdf" or kind in ("Documents", "Spreadsheets", "Images")):
+        out.append("Invoice")
+    if kind == "Images" and "Screenshot" not in out and (
+            _re.match(r"^(img|dsc|dscn|dcim|pxl|photo|wp|mvimg)[_-]?\d", low) or ext in ("heic", "heif", "cr2", "nef", "arw")
+            or _re.match(r"^(19|20)\d{6}[_-]\d{4,6}", low)):
+        out.append("Camera photo")
+    if "scan" in low and (ext == "pdf" or kind == "Images"):
+        out.append("Scanned document")
+    for k, tag in (("Code", "Code"), ("Installers", "Installer"), ("Archives", "Archive"), ("Videos", "Video"),
+                   ("Audio", "Music")):
+        if kind == k:
+            out.append(tag)
+    try:
+        size = os.path.getsize(path) if size is None else size
+        if size > 500 * 1024 * 1024:
+            out.append("Large file")
+    except OSError:
+        pass
+    return out
+
+
+def load_custom_tags(cfg):
+    """Your own tags (and the smart tags you've used) join the built-in ones everywhere."""
+    for name, colour in cfg.get("custom_tags", []):
+        if name and name not in TAGS:
+            TAGS[name] = colour
+
+
+def add_custom_tag(cfg, name, colour):
+    name = name.strip()[:32]
+    if not name:
+        return None
+    if name not in TAGS:
+        TAGS[name] = colour
+        cfg.setdefault("custom_tags", []).append([name, colour])
+        write_json(CONFIG_FILE, cfg)
+    return name
 KINDS = ["All types", "Folder"] + list(CATEGORIES) + ["Others"]
 DATE_CHOICES = [("Any time", None), ("Today", "today"), ("Last 7 days", 7),
                 ("Last 30 days", 30), ("Last year", 365), ("Custom range…", "custom")]
@@ -4213,9 +4273,15 @@ class FilePane(Gtk.Box):
                 ci.connect("toggled", lambda w, t=tag: win.toggle_tag(paths, t, w.get_active()))
                 sub.append(ci)
             sub.append(Gtk.SeparatorMenuItem())
+            add("＋ New tag…", lambda: win.new_tag(paths), parent=sub)
+            add("✨ Smart tags…", lambda: win.smart_tag_dialog(paths), parent=sub)
+            add("🏷 Manage tags…", lambda: win.manage_tags(), parent=sub)
+            sub.append(Gtk.SeparatorMenuItem())
             add("Write a note…", lambda: win.edit_note(first), len(paths) == 1, parent=sub)
             tag_item.set_submenu(sub)
             menu.append(tag_item)
+            if all(category_of(x) == "Images" for x in paths):
+                add("🖼 Image tools (resize, rotate, convert, compress)…", lambda: win.image_tools(paths))
             add("Compare these two…", lambda: win.compare(paths[0], paths[1]), len(paths) == 2)
             add("Send to nearby Arckad-D…", lambda: win.open_share(paths, "nearby"))
             add("Share as link / QR code…", lambda: win.open_share(paths, "link"))
@@ -4472,17 +4538,12 @@ class PreviewPanel(Gtk.ScrolledWindow):
         tags = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=3,
                            column_spacing=4, row_spacing=4, homogeneous=True)
         self.tag_btns = {}
-        for tag, color in TAGS.items():
-            b = Gtk.ToggleButton()
-            lbl = Gtk.Label()
-            lbl.set_markup(f'<span foreground="{color}">●</span> {esc(tag)}')
-            b.add(lbl)
-            b.connect("toggled", self.on_tag_toggled, tag)
-            self.tag_btns[tag] = b
-            tags.add(b)
-        for child in tags.get_children():
-            child.set_can_focus(False)
+        self.tags_flow = tags
+        self.fill_tag_buttons()
         box.add(tags)
+        self.suggest = Gtk.Box(spacing=4)                     # ✨ smart-tag suggestions for this file
+        self.suggest.set_no_show_all(True)
+        box.add(self.suggest)
 
         box.add(self._heading("Note"))
         self.note = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, left_margin=6, right_margin=6,
@@ -4719,11 +4780,54 @@ class PreviewPanel(Gtk.ScrolledWindow):
         self.info.show_all()
 
     # ---------- tags & note
+    def fill_tag_buttons(self):
+        """The tag buttons (again after you make or remove a tag)."""
+        for c in self.tags_flow.get_children():
+            self.tags_flow.remove(c)
+        self.tag_btns = {}
+        for tag, color in TAGS.items():
+            b = Gtk.ToggleButton()
+            lbl = Gtk.Label(ellipsize=Pango.EllipsizeMode.END)
+            lbl.set_markup(f'<span foreground="{color}">●</span> {esc(tag)}')
+            b.add(lbl)
+            b.connect("toggled", self.on_tag_toggled, tag)
+            self.tag_btns[tag] = b
+            self.tags_flow.add(b)
+        for child in self.tags_flow.get_children():
+            child.set_can_focus(False)
+        self.tags_flow.show_all()
+
+    def show_suggestions(self):
+        for c in self.suggest.get_children():
+            self.suggest.remove(c)
+        have = set(TAG_STORE.tags(self.path)) if self.path else set()
+        tips = [t for t in smart_tags_for(self.path) if t not in have] if self.path else []
+        if not tips:
+            self.suggest.hide()
+            return
+        lbl = Gtk.Label()
+        lbl.set_markup("<small>✨ Suggested:</small>")
+        lbl.get_style_context().add_class("dim-label")
+        self.suggest.add(lbl)
+        for t in tips[:3]:
+            b = Gtk.Button(relief=Gtk.ReliefStyle.NONE)
+            bl = Gtk.Label()
+            bl.set_markup(f'<small><span foreground="{SMART_TAGS.get(t, "#888")}">●</span> {esc(t)} ＋</small>')
+            b.add(bl)
+            b.set_tooltip_text(f"Tag this file “{t}”")
+            b.connect("clicked", lambda _b, t=t: self.win.apply_smart_tag([self.path], t))
+            self.suggest.add(b)
+        self.suggest.set_no_show_all(False)
+        self.suggest.show_all()
+
     def load_tags_and_note(self):
         self.updating = True
         current = TAG_STORE.tags(self.path)
+        if set(self.tag_btns) != set(TAGS):
+            self.fill_tag_buttons()
         for tag, b in self.tag_btns.items():
             b.set_active(tag in current)
+        self.show_suggestions()
         self.note.get_buffer().set_text(TAG_STORE.note(self.path))
         self.updating = False
 
@@ -10456,6 +10560,8 @@ class Chat:
 
         def reply(obj, code=200):
             h._raw(code, seal(key, json.dumps(obj).encode()))
+        if path.startswith("/c/tf/") and not pair:              # 📁 shared team folders
+            return reply(TEAM.handle(gid, did, path, req))
         if path == "/c/msg" and not pair:
             m = self._clean(req.get("msg"), gid)
             if not m or m["from"] != did:
@@ -23119,6 +23225,13 @@ def settings_entries(win):
           ("appearance", "Hear the sounds", "Plays a few of them, one after another.", "button", "▶ Play",
            lambda: [GLib.timeout_add(i * 650, lambda n=n: sfx(win, n) or False)
                     for i, n in enumerate(("crumple", "thud", "zip", "clunk", "ding"))]),
+          ("chat", "Team folders", "Folders that stay the same on everyone's PC in a chat group, encrypted, no "
+           "cloud.", "button", "Open…", win.team_folders),
+          ("files", "Tags", "Make your own tags, rename or remove them.", "button", "Manage…", win.manage_tags),
+          ("files", "Smart tags", "Suggests tags (Screenshot, Invoice, Camera photo…) for the files in this folder.",
+           "button", "Suggest…", lambda: win.smart_tag_dialog()),
+          ("files", "Compare two folders", "Side by side: what's missing, newer or different, then copy or sync.",
+           "button", "Compare…", lambda: win.compare_folders_dialog()),
           ("org", "People directory", "Everyone's work card: designation, department, extension, email.", "button",
            "Open…", win.people_directory),
           ("org", "Announcement", "Send one notice to all your contacts (or everyone in your organisation).", "button",
@@ -23773,6 +23886,14 @@ class CommandPalette(Gtk.Window):
              ("🗑", "Open the Trash", "", lambda: w.sidebar_activate(w.trash_row)),
              ("💬", "Team chat", "", lambda: w.chat_btn.set_active(True)),
              ("👥", "People directory", "", lambda: w.people_directory()),
+             ("📁", "Team folders: share a folder with a group", "", lambda: w.team_folders()),
+             ("📅", "Timeline: files by day, week or month", "", lambda: w.sidebar_activate(
+                 next(r for r in w.sidebar.get_children() if getattr(r, "key", "") == "timeline:"))),
+             ("🔀", "Compare two folders", "", lambda: w.compare_folders_dialog()),
+             ("✨", "Smart tags for this folder", "", lambda: w.smart_tag_dialog()),
+             ("🏷", "New tag", "", lambda: w.new_tag(sel() or None)),
+             ("🏷", "Manage tags", "", lambda: w.manage_tags()),
+             ("🖼", "Image tools for the selected pictures", "", lambda: sel() and w.image_tools(sel())),
              ("📢", "Send an announcement to everyone", "", lambda: w.announce_dialog()),
              ("⚙", "Settings", "Ctrl+,", lambda: w.open_settings()),
              ("⌨", "Keyboard shortcuts", "", lambda: show_shortcuts(w)),
@@ -23856,6 +23977,585 @@ class CommandPalette(Gtk.Window):
         self.destroy()
         if cb:
             GLib.idle_add(lambda: (cb(), False)[1])
+
+
+
+# ---------------------------------------------------------------- 📅 Timeline: your files by day, week or month
+class TimelineView(Gtk.Box):
+    PERIODS = [(7, "Last 7 days"), (30, "Last 30 days"), (90, "Last 3 months"), (365, "Last year")]
+
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.win = win
+        self.set_border_width(10)
+        self.gen = 0
+        top = Gtk.Box(spacing=8)
+        self.title = Gtk.Label(xalign=0, hexpand=True)
+        top.pack_start(self.title, True, True, 0)
+        self.period = Gtk.ComboBoxText()
+        for d, label in self.PERIODS:
+            self.period.append(str(d), label)
+        self.period.set_active_id(str(win.cfg.get("timeline_days", 30)))
+        if self.period.get_active() < 0:
+            self.period.set_active(1)
+        self.group = Gtk.ComboBoxText()
+        for k, label in (("day", "By day"), ("week", "By week"), ("month", "By month")):
+            self.group.append(k, label)
+        self.group.set_active_id(win.cfg.get("timeline_group", "day"))
+        self.kind = Gtk.ComboBoxText()
+        for k in ["All types"] + [k for k in KINDS if k != "All types"]:
+            self.kind.append_text(k)
+        self.kind.set_active(0)
+        for w in (self.kind, self.period, self.group):
+            top.add(w)
+            w.connect("changed", lambda *_: self.refresh(save=True))
+        self.add(top)
+        self.hint = Gtk.Label(xalign=0)
+        self.hint.get_style_context().add_class("dim-label")
+        self.add(self.hint)
+        self.body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(self.body)
+        self.pack_start(sw, True, True, 0)
+
+    @staticmethod
+    def _skip(path):
+        parts = path.split(os.sep)
+        return any(p.startswith(".") for p in parts) or str(CACHE_DIR) in path or "/snap/" in path or \
+            "\\AppData\\" in path or "node_modules" in parts or "__pycache__" in parts
+
+    def refresh(self, save=False):
+        days = int(self.period.get_active_id() or 30)
+        group = self.group.get_active_id() or "day"
+        if save:
+            self.win.cfg["timeline_days"], self.win.cfg["timeline_group"] = days, group
+            write_json(CONFIG_FILE, self.win.cfg)
+        kind = self.kind.get_active_text()
+        self.gen += 1
+        gen = self.gen
+        self.title.set_markup("<span size='x-large'><b>📅 Timeline</b></span>  <small>loading…</small>")
+
+        def work():
+            cutoff = time.time() - days * 86400
+            rows = INDEX.recent(cutoff, 4000) if INDEX.available() else None
+            if rows is None:
+                rows = [(str(p), ts) for ts, p in recent_activity(days=days, limit=1500)]
+            items = []
+            for path, mtime in rows:
+                if self._skip(path) or not os.path.isfile(path):
+                    continue
+                if kind != "All types" and category_of(path) != kind:
+                    continue
+                items.append((path, mtime))
+                if len(items) >= 1200:
+                    break
+            GLib.idle_add(lambda: gen == self.gen and self._show(items, group) or False)
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _bucket(ts, group):
+        d = date.fromtimestamp(ts)
+        today = date.today()
+        if group == "day":
+            if d == today:
+                return "Today", d.toordinal()
+            if (today - d).days == 1:
+                return "Yesterday", d.toordinal()
+            return d.strftime("%A, %d %B %Y"), d.toordinal()
+        if group == "week":
+            start = d.fromordinal(d.toordinal() - d.weekday())
+            if start == today.fromordinal(today.toordinal() - today.weekday()):
+                return "This week", start.toordinal()
+            return f"Week of {start.strftime('%d %B %Y')}", start.toordinal()
+        if (d.year, d.month) == (today.year, today.month):
+            return "This month", d.year * 12 + d.month
+        return d.strftime("%B %Y"), d.year * 12 + d.month
+
+    def _show(self, items, group):
+        for c in self.body.get_children():
+            self.body.remove(c)
+        n = len(items)
+        self.title.set_markup(f"<span size='x-large'><b>📅 Timeline</b></span>  <small>{n} file{'s' if n != 1 else ''}"
+                              "</small>")
+        self.hint.set_text("Double-click to open · right-click for more · newest first" if items else
+                           "Nothing changed in this period (or the search index is still being built).")
+        sections, order = {}, []
+        for path, ts in items:
+            label, key = self._bucket(ts, group)
+            if label not in sections:
+                sections[label] = []
+                order.append(label)
+            sections[label].append((path, ts))
+        self.tiles = []
+        for label in order:
+            files = sections[label]
+            h = Gtk.Label(xalign=0, margin_top=10, margin_start=4)
+            h.set_markup(f"<b>{esc(label)}</b>  <small>{len(files)}</small>")
+            self.body.add(h)
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, max_children_per_line=30,
+                               column_spacing=4, row_spacing=4, valign=Gtk.Align.START)
+            for path, ts in files:
+                tile = Gtk.EventBox()
+                vb = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3, margin=4)
+                img = Gtk.Image()
+                img.set_from_gicon(icon_for(os.path.basename(path), False), Gtk.IconSize.DIALOG)
+                img.set_pixel_size(64)
+                img.set_size_request(100, 84)
+                vb.add(img)
+                name = Gtk.Label(label=os.path.basename(path), ellipsize=Pango.EllipsizeMode.MIDDLE, max_width_chars=14)
+                vb.add(name)
+                tile.add(vb)
+                tile.set_tooltip_text(f"{short(path)}\n{fmt_full(ts)}")
+                tile.connect("button-press-event", self._click, path)
+                flow.add(tile)
+                if category_of(path) in THUMB_KINDS:
+                    self.tiles.append((img, path))
+            self.body.add(flow)
+        self.body.show_all()
+        self._thumbs(self.gen)
+        return False
+
+    def _thumbs(self, gen):
+        todo = list(self.tiles[:300])
+
+        def work():
+            for img, path in todo:
+                if gen != self.gen:
+                    return
+                try:
+                    pb = thumbnail_for(path, 84)
+                except Exception:
+                    pb = None
+                if pb:
+                    GLib.idle_add(lambda i=img, b=pb: (gen == self.gen and i.set_from_pixbuf(b)) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _click(self, _w, ev, path):
+        if ev.type == Gdk.EventType._2BUTTON_PRESS and ev.button == 1:
+            self.win.open_path(path)
+            return True
+        if ev.button == 3:
+            m = Gtk.Menu()
+            for label, cb in (("Open", lambda: self.win.open_path(path)),
+                              ("Show in folder", lambda: (self.win.show_files(), self.win.active.show_in_folder(path))),
+                              ("Copy location", lambda: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(path, -1))):
+                it = Gtk.MenuItem(label=label)
+                it.connect("activate", lambda _i, cb=cb: cb())
+                m.append(it)
+            m.show_all()
+            m.attach_to_widget(self, None)
+            m.popup_at_pointer(ev)
+            return True
+        return False
+
+
+# ---------------------------------------------------------------- 🔀 Compare two folders, then copy or sync
+def compare_folders(a, b, hidden=False):
+    """[(rel, status, info_a, info_b)] status: only_a, only_b, a_newer, b_newer, differ, same."""
+    def scan(root):
+        out = {}
+        for fp, st, is_dir in walk_entries(root, hidden=hidden):
+            if not is_dir:
+                out[os.path.relpath(fp, root)] = (st.st_size, st.st_mtime)
+        return out
+    A, B = scan(a), scan(b)
+    rows = []
+    for rel in sorted(set(A) | set(B), key=str.lower):
+        ia, ib = A.get(rel), B.get(rel)
+        if ia and not ib:
+            st = "only_a"
+        elif ib and not ia:
+            st = "only_b"
+        elif ia[0] == ib[0] and abs(ia[1] - ib[1]) < 2.5:
+            st = "same"
+        elif abs(ia[1] - ib[1]) < 2.5:
+            st = "differ"
+        else:
+            st = "a_newer" if ia[1] > ib[1] else "b_newer"
+        rows.append((rel, st, ia, ib))
+    return rows
+
+
+class CompareFoldersWindow(Gtk.Window):
+    LABELS = {"only_a": "◀ only in left", "only_b": "only in right ▶", "a_newer": "◀ newer on left",
+              "b_newer": "newer on right ▶", "differ": "≠ different", "same": "= same"}
+
+    def __init__(self, win, a, b):
+        super().__init__(title="🔀 Compare folders", transient_for=win)
+        self.win, self.a, self.b = win, a, b
+        self.set_default_size(980, 620)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+        self.add(box)
+        head = Gtk.Label(xalign=0, wrap=True)
+        head.set_markup(f"<b>Left:</b> {esc(short(a))}\n<b>Right:</b> {esc(short(b))}")
+        box.add(head)
+        bar = Gtk.Box(spacing=8)
+        self.hide_same = Gtk.CheckButton(label="Hide files that are the same", active=True)
+        self.hide_same.connect("toggled", lambda *_: self.fill())
+        bar.add(self.hide_same)
+        self.summary = Gtk.Label(xalign=0, hexpand=True)
+        bar.pack_start(self.summary, True, True, 0)
+        box.add(bar)
+        self.store = Gtk.ListStore(bool, str, str, str, str, str)     # tick, status, path, left, right, status key
+        tv = Gtk.TreeView(model=self.store)
+        tick = Gtk.CellRendererToggle()
+        tick.connect("toggled", lambda _r, path: self.store.set_value(self.store.get_iter(path), 0,
+                                                                       not self.store[path][0]))
+        tv.append_column(Gtk.TreeViewColumn("", tick, active=0))
+        for i, t in ((1, "Status"), (2, "File"), (3, "Left"), (4, "Right")):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.MIDDLE if i == 2 else Pango.EllipsizeMode.NONE)
+            c = Gtk.TreeViewColumn(t, r, text=i)
+            c.set_resizable(True)
+            c.set_expand(i == 2)
+            tv.append_column(c)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(tv)
+        box.pack_start(sw, True, True, 0)
+        btns = Gtk.Box(spacing=8)
+        for label, cb, tip in (("Copy ticked → right", lambda: self.copy("right"), "Left's version goes to the right"),
+                               ("← Copy ticked to left", lambda: self.copy("left"), "Right's version goes to the left"),
+                               ("⇄ Sync both ways (newer wins)", lambda: self.copy("sync"),
+                                "Missing files are copied both ways; where both have it, the newer one wins")):
+            b = Gtk.Button(label=label)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            btns.add(b)
+        refresh = Gtk.Button(label="↻ Compare again")
+        refresh.connect("clicked", lambda *_: self.run())
+        btns.pack_end(refresh, False, False, 0)
+        box.add(btns)
+        self.rows = []
+        self.show_all()
+        self.run()
+
+    @staticmethod
+    def _info(i):
+        return f"{human_size(i[0])} · {time.strftime('%d %b %Y %H:%M', time.localtime(i[1]))}" if i else "—"
+
+    def run(self):
+        self.summary.set_text("Comparing…")
+
+        def work():
+            rows = compare_folders(self.a, self.b, hidden=self.win.cfg.get("show_hidden", False))
+            GLib.idle_add(lambda: (setattr(self, "rows", rows), self.fill()) and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def fill(self):
+        self.store.clear()
+        counts = {}
+        for rel, st, ia, ib in self.rows:
+            counts[st] = counts.get(st, 0) + 1
+            if st == "same" and self.hide_same.get_active():
+                continue
+            self.store.append([st != "same", self.LABELS[st], rel, self._info(ia), self._info(ib), st])
+        diff = sum(v for k, v in counts.items() if k != "same")
+        self.summary.set_markup(f"<b>{diff}</b> different · {counts.get('same', 0)} the same · "
+                                f"{counts.get('only_a', 0)} only left · {counts.get('only_b', 0)} only right")
+
+    def copy(self, how):
+        todo = [(r[2], r[5]) for r in self.store if r[0]]
+        jobs = []
+        for rel, st in todo:
+            la, lb = os.path.join(self.a, rel), os.path.join(self.b, rel)
+            if how == "right" and st in ("only_a", "a_newer", "b_newer", "differ"):
+                jobs.append((la, lb))
+            elif how == "left" and st in ("only_b", "a_newer", "b_newer", "differ"):
+                jobs.append((lb, la))
+            elif how == "sync":
+                if st in ("only_a", "a_newer"):
+                    jobs.append((la, lb))
+                elif st in ("only_b", "b_newer"):
+                    jobs.append((lb, la))
+        jobs = [(s, d) for s, d in jobs if os.path.isfile(s)]
+        if not jobs:
+            return self.win.info("Nothing to copy: tick the files first.")
+        overwrite = sum(1 for _s, d in jobs if os.path.exists(d))
+        if overwrite and not self.win.confirm(f"Copy {len(jobs)} file{'s' if len(jobs) != 1 else ''}?\n\n"
+                                              f"{overwrite} of them will replace an existing file."):
+            return
+        errors = []
+        for s, d in jobs:
+            try:
+                os.makedirs(os.path.dirname(d), exist_ok=True)
+                shutil.copy2(s, d)
+            except OSError as ex:
+                errors.append(f"{os.path.basename(s)}: {ex.strerror or ex}")
+        self.win.refresh_all()
+        self.win.flash_all(f"🔀 Copied {len(jobs) - len(errors)} file{'s' if len(jobs) != 1 else ''}")
+        if errors:
+            self.win.error("Some files couldn't be copied:\n\n" + "\n".join(errors[:10]))
+        self.run()
+
+
+
+# ---------------------------------------------------------------- 📁 Shared team folders
+# A folder that stays the same on every member's PC of a chat group: over the office network, encrypted with the
+# group's key (the same as its chat), no cloud. Each PC pulls what's new from the others; deletes travel too; if two
+# people changed the same file, both versions are kept.
+TEAM_FILE = CONFIG_DIR / "team_folders.json"
+TEAM_CHUNK = 2 * 1024 * 1024
+TEAM_SKIP = (".arckad-team", ".~lock", "~$", ".DS_Store", "Thumbs.db", "desktop.ini")
+
+
+class TeamFolders:
+    def __init__(self):
+        self.data = read_json(TEAM_FILE, {})        # fid → {gid, name, path, files: {rel: {s, m, h, d}}, synced: {rel: h}}
+        self.lock = threading.RLock()
+        self.busy = set()
+        self.win = None
+        self.state = {}                             # fid → (last sync time, online peers, last message)
+
+    def save(self):
+        with self.lock:
+            write_json(TEAM_FILE, self.data)
+
+    def start(self, win):
+        self.win = win
+        GLib.timeout_add_seconds(8, lambda: self.tick() and False)
+        GLib.timeout_add_seconds(20, self.tick)
+
+    def folders(self):
+        return [(fid, f) for fid, f in self.data.items() if f.get("path")]
+
+    # ---------- making, joining, leaving
+    def create(self, gid, name, path):
+        fid = secrets.token_hex(8)
+        with self.lock:
+            self.data[fid] = {"gid": gid, "name": name.strip()[:60] or os.path.basename(path), "path": path,
+                              "files": {}, "synced": {}, "owner": True, "since": time.time()}
+        self.scan(fid)
+        self.save()
+        try:
+            self.win.chat.send_text(gid, f"📁 I shared the team folder “{self.data[fid]['name']}”. To get it on your PC: "
+                                         "☰ → Team folders → Look for team folders → Join.")
+        except Exception:
+            pass
+        return fid
+
+    def join(self, gid, fid, name, path):
+        os.makedirs(path, exist_ok=True)
+        with self.lock:
+            self.data[fid] = {"gid": gid, "name": name, "path": path, "files": {}, "synced": {}, "since": time.time()}
+        self.scan(fid)
+        self.save()
+        threading.Thread(target=self.sync, args=(fid,), daemon=True).start()
+
+    def leave(self, fid):
+        with self.lock:
+            self.data.pop(fid, None)
+        self.save()
+
+    # ---------- what's here
+    @staticmethod
+    def _skip(rel):
+        parts = rel.replace("\\", "/").split("/")
+        return any(x.startswith(TEAM_SKIP) or x.endswith((".arckad-part", ".arckad-tmp")) for x in parts)
+
+    @staticmethod
+    def _sha(path):
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _safe(self, root, rel):
+        rel = os.path.normpath(str(rel)).replace("\\", "/")
+        if not rel or rel.startswith("../") or rel == ".." or os.path.isabs(rel) or ":" in rel.split("/")[0]:
+            return None
+        full = os.path.realpath(os.path.join(root, rel))
+        return full if (full + os.sep).startswith(os.path.realpath(root) + os.sep) else None
+
+    def scan(self, fid):
+        """Updates the folder's list of files (hashing only what changed); notices deletions."""
+        f = self.data.get(fid)
+        if not f or not os.path.isdir(f["path"]):
+            return
+        root = f["path"]
+        files = dict(f.get("files", {}))
+        present = set()
+        for fp, st, is_dir in walk_entries(root, hidden=True):
+            if is_dir:
+                continue
+            rel = os.path.relpath(fp, root).replace("\\", "/")
+            if self._skip(rel):
+                continue
+            present.add(rel)
+            old = files.get(rel)
+            if old and not old.get("d") and old["s"] == st.st_size and abs(old["m"] - st.st_mtime) < 0.01:
+                continue
+            try:
+                files[rel] = {"s": st.st_size, "m": st.st_mtime, "h": self._sha(fp), "d": 0}
+            except OSError:
+                continue
+        now = time.time()
+        for rel, e in list(files.items()):
+            if rel not in present and not e.get("d"):
+                files[rel] = dict(e, d=now)                        # deleted here: others delete it too
+            elif e.get("d") and now - e["d"] > 30 * 86400:
+                files.pop(rel)                                     # old tombstones are forgotten after a month
+        with self.lock:
+            if fid in self.data:
+                self.data[fid]["files"] = files
+
+    # ---------- answering other members (called by the chat server; already decrypted and checked)
+    def handle(self, gid, did, path, req):
+        fid = str(req.get("fid") or "")
+        f = self.data.get(fid)
+        if path == "/c/tf/list":
+            return {"ok": True, "folders": [{"fid": k, "name": v["name"]} for k, v in self.folders() if v["gid"] == gid]}
+        if not f or f.get("gid") != gid:
+            return {"ok": False, "reason": "no such team folder here"}
+        if path == "/c/tf/manifest":
+            return {"ok": True, "files": f.get("files", {}), "name": f["name"]}
+        if path == "/c/tf/get":
+            full = self._safe(f["path"], req.get("rel", ""))
+            if not full or not os.path.isfile(full):
+                return {"ok": False, "reason": "not here"}
+            off = max(0, int(req.get("off") or 0))
+            with open(full, "rb") as fh:
+                fh.seek(off)
+                data = fh.read(TEAM_CHUNK)
+            size = os.path.getsize(full)
+            return {"ok": True, "data": base64.b64encode(data).decode(), "size": size, "done": off + len(data) >= size}
+        return {"ok": False, "reason": "unknown"}
+
+    # ---------- syncing: pull what's new from each member who is online
+    def tick(self):
+        for fid, _f in self.folders():
+            if fid not in self.busy:
+                threading.Thread(target=self.sync, args=(fid,), daemon=True).start()
+        return True
+
+    def _fetch(self, gid, did, fid, rel, dest, mtime):
+        chat = self.win.chat
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        tmp = dest + ".arckad-part"
+        off = 0
+        with open(tmp, "wb") as out:
+            while True:
+                r = chat._request(gid, did, "POST", "/c/tf/get", {"fid": fid, "rel": rel, "off": off}, timeout=60)
+                if not r.get("ok"):
+                    raise OSError(r.get("reason") or "refused")
+                chunk = base64.b64decode(r.get("data") or "")
+                out.write(chunk)
+                off += len(chunk)
+                if r.get("done") or not chunk:
+                    break
+        os.replace(tmp, dest)
+        try:
+            os.utime(dest, (mtime, mtime))                         # same time on every PC
+        except OSError:
+            pass
+
+    def sync(self, fid):
+        if fid in self.busy or not self.win:
+            return
+        self.busy.add(fid)
+        changed = []
+        try:
+            f = self.data.get(fid)
+            if not f or not os.path.isdir(f["path"]):
+                return
+            chat = self.win.chat
+            gid = f["gid"]
+            if gid not in chat.groups:
+                return
+            self.scan(fid)
+            peers = chat.online_members(gid)
+            got_any = 0
+            for did in peers:
+                try:
+                    r = chat._request(gid, did, "POST", "/c/tf/manifest", {"fid": fid}, timeout=20)
+                except Exception:
+                    continue
+                if not r.get("ok"):
+                    continue
+                got_any += 1
+                who = ((chat.groups.get(gid) or {}).get("members", {}).get(did) or {}).get("name", "someone")
+                changed += self._apply(fid, gid, did, who, r.get("files") or {})
+            self.state[fid] = (time.time(), got_any, "")
+        except Exception as ex:
+            self.state[fid] = (time.time(), 0, str(ex))
+        finally:
+            self.busy.discard(fid)
+            self.save()
+            if changed and self.win:
+                GLib.idle_add(lambda: (self.win.refresh_all(), self.win.flash_all(
+                    f"📁 Team folder: {len(changed)} change{'s' if len(changed) != 1 else ''} from your team")) and False)
+
+    def _apply(self, fid, gid, did, who, remote):
+        f = self.data[fid]
+        root = f["path"]
+        local, synced = f["files"], f.setdefault("synced", {})
+        changed = []
+        for rel, r in remote.items():
+            if self._skip(rel) or not isinstance(r, dict):
+                continue
+            dest = self._safe(root, rel)
+            if not dest:
+                continue
+            l = local.get(rel)
+            if r.get("d"):                                         # they deleted it
+                if l and not l.get("d") and l.get("h") == synced.get(rel) and r["d"] > l.get("m", 0):
+                    try:
+                        Gio.File.new_for_path(dest).trash(None)
+                    except GLib.Error:
+                        try:
+                            os.remove(dest)
+                        except OSError:
+                            continue
+                    local[rel] = dict(l, d=r["d"])
+                    synced.pop(rel, None)
+                    changed.append(rel)
+                continue
+            if l and not l.get("d") and l.get("h") == r.get("h"):
+                synced[rel] = r["h"]                               # already the same
+                continue
+            if l is None or (l.get("d") and r.get("m", 0) > l["d"]):
+                action = "take"
+            elif l.get("d"):
+                continue                                           # we deleted it after their change
+            elif l.get("h") == synced.get(rel):
+                action = "take"                                    # only they changed it
+            elif r.get("h") == synced.get(rel):
+                continue                                           # only we changed it: they'll take ours
+            else:
+                action = "conflict"                                # both changed it: keep both
+            try:
+                if action == "take":
+                    self._fetch(gid, did, fid, rel, dest, r.get("m", time.time()))
+                    local[rel] = {"s": r.get("s", 0), "m": r.get("m", 0), "h": r["h"], "d": 0}
+                    synced[rel] = r["h"]
+                else:
+                    stem, ext = os.path.splitext(dest)
+                    side = f"{stem} (conflict from {who} {time.strftime('%d %b %H.%M')}){ext}"
+                    self._fetch(gid, did, fid, rel, side, r.get("m", time.time()))
+                    synced[rel] = l.get("h")
+                changed.append(rel)
+            except Exception:
+                continue
+        return changed
+
+    # ---------- finding team folders in your groups
+    def discover(self):
+        chat = self.win.chat
+        found = {}
+        for gid, g in chat.groups.items():
+            if g.get("kind") == "direct" or g.get("removed"):
+                continue
+            for did in chat.online_members(gid):
+                try:
+                    r = chat._request(gid, did, "POST", "/c/tf/list", {}, timeout=10)
+                except Exception:
+                    continue
+                for item in r.get("folders") or []:
+                    if item.get("fid") not in self.data:
+                        found[item["fid"]] = (gid, g.get("name", "Group"), item.get("name", "Team folder"))
+        return found
+
+
+TEAM = TeamFolders()
 
 
 class TabWindow(Gtk.Window):
@@ -23943,6 +24643,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def __init__(self, app, start=None):
         super().__init__(application=app, title=APP_NAME)
         self.cfg = read_json(CONFIG_FILE, {})
+        load_custom_tags(self.cfg)
         for key, default in (("pinned", []), ("show_hidden", False), ("view", "list"), ("dual", False),
                              ("preview", True), ("autosort", False), ("autosort_background", False),
                              ("autosort_delay", 5)):
@@ -23994,6 +24695,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._build_ui()
         self.watch_drives()
         self.setup_clip_sync()
+        TEAM.start(self)
         self.apply_text_size()
         GLib.timeout_add(1500, lambda: self.label_for_readers() and False)
         self.connect("key-press-event", self.on_key)
@@ -24311,6 +25013,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Default file manager…", self.default_fm_dialog),
             ("🏢 Organisation…", self.org_dialog),
             ("👥 People directory…", self.people_directory),
+            ("📁 Team folders…", self.team_folders),
             ("📢 Send an announcement…", self.announce_dialog),
             ("🧭 Command palette (Ctrl+K)", lambda: CommandPalette(self)),
             ("🔐 Change the vault password…", self.vault_password),
@@ -24335,6 +25038,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Find duplicate files…", lambda: self.duplicates(
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
             ("Compare selected files…", self.compare_selected),
+            ("🔀 Compare two folders…", self.compare_folders_dialog),
             ("Auto-sort Downloads…", self.autosort_dialog),
             ("Update search index now", INDEX.rebuild),
             ("Search index settings…", self.index_settings),
@@ -24348,6 +25052,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Find duplicate files…", lambda: self.duplicates(
                 self.active.location if is_folder_loc(self.active.location) else str(HOME))),
             ("Compare selected files…", self.compare_selected),
+            ("🔀 Compare two folders…", self.compare_folders_dialog),
             ("Auto-sort Downloads…", self.autosort_dialog),
             ("Send files…", lambda: self.open_share(self.active.selected_paths() or None, "nearby")),
             ("Receive files…", lambda: self.open_share(None, "receive")),
@@ -24529,7 +25234,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.library = LibraryView(self)
         self.lib_stack.add_named(self.library, "library")
         self.trash_view = TrashView(self)
+        self.timeline = TimelineView(self)
         self.lib_stack.add_named(self.trash_view, "trash")
+        self.lib_stack.add_named(self.timeline, "timeline")
         self.content_paned.pack1(self.lib_stack, True, True)     # both sides may get narrow: the window never
         self.content_paned.pack2(self.right_box, False, True)     # grows past the screen when a panel opens
         content.pack_start(self.content_paned, True, True, 0)
@@ -25133,6 +25840,7 @@ class MainWindow(Gtk.ApplicationWindow):
             self.sidebar.remove(row)
         self._side_header("Quick access")
         self._side_row("Recent files", "document-open-recent-symbolic", "recent")
+        self._side_row("Timeline", "x-office-calendar-symbolic", "timeline:")
         self._side_row("Home", "user-home-symbolic", str(HOME))
         specials = [(GLib.UserDirectory.DIRECTORY_DESKTOP, "user-desktop-symbolic"),
                     (GLib.UserDirectory.DIRECTORY_DOCUMENTS, "folder-documents-symbolic"),
@@ -25159,6 +25867,11 @@ class MainWindow(Gtk.ApplicationWindow):
             self._side_row(tag, None, "tag:" + tag, dot=color)
         self._side_row("Files with notes", "accessories-text-editor-symbolic", "notes")
         pinned = [p for p in self.cfg["pinned"] if os.path.isdir(p)]
+        teams = TEAM.folders()
+        if teams:
+            self._side_header("Team folders")
+            for _fid, f in teams:
+                self._side_row(f["name"], "folder-remote-symbolic", f["path"])
         saved = self.cfg.get("saved_searches", [])
         if saved:
             self._side_header("Saved searches")
@@ -25480,6 +26193,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if key == "trash:":
             self.lib_stack.set_visible_child_name("trash")
             self.trash_view.refresh()
+            return
+        if key == "timeline:":
+            self.lib_stack.set_visible_child_name("timeline")
+            self.timeline.refresh()
             return
         if key.startswith("search:"):
             self.show_files()
@@ -26022,6 +26739,281 @@ class MainWindow(Gtk.ApplicationWindow):
                 ctx.add_class("suggested-action")
 
     # ---------- tags & notes
+    # ---------- 🏷 your own tags and ✨ smart tags
+    def tags_updated(self):
+        self.build_sidebar()
+        self.preview.fill_tag_buttons()
+        if self.preview.path:
+            self.preview.load_tags_and_note()
+
+    def new_tag(self, paths=None):
+        d = Gtk.Dialog(title="New tag", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Create", Gtk.ResponseType.OK)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        row = Gtk.Box(spacing=8)
+        name = Gtk.Entry(placeholder_text="Tag name, e.g. Client A, Tax 2026", activates_default=True, hexpand=True)
+        colour = Gtk.ColorButton()
+        rgba = Gdk.RGBA()
+        palette = ["#e5a50a", "#1c71d8", "#c01c28", "#2ec27e", "#813d9c", "#f66151", "#00a3a3", "#986a44"]
+        rgba.parse(palette[len(self.cfg.get("custom_tags", [])) % len(palette)])
+        colour.set_rgba(rgba)
+        colour.set_tooltip_text("The tag's colour")
+        row.pack_start(name, True, True, 0)
+        row.add(colour)
+        box.add(row)
+        if paths:
+            box.add(Gtk.Label(label=f"It will be added to the {len(paths)} selected item{'s' if len(paths) != 1 else ''}.",
+                              xalign=0))
+        d.show_all()
+        made = None
+        if d.run() == Gtk.ResponseType.OK and name.get_text().strip():
+            c = colour.get_rgba()
+            hexc = "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
+            made = add_custom_tag(self.cfg, name.get_text(), hexc)
+        d.destroy()
+        if made:
+            self.tags_updated()
+            if paths:
+                self.toggle_tag(paths, made, True)
+            self.flash_all(f"🏷 New tag “{made}”")
+        return made
+
+    def manage_tags(self):
+        d = Gtk.Dialog(title="Manage tags", transient_for=self, modal=True)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(420, 420)
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(14)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        box.pack_start(sw, True, True, 0)
+        addb = Gtk.Button(label="＋ New tag…")
+        box.add(addb)
+
+        def fill():
+            for c in lst.get_children():
+                lst.remove(c)
+            for tag, colour in TAGS.items():
+                row = Gtk.Box(spacing=8, margin=6)
+                lbl = Gtk.Label(xalign=0, hexpand=True)
+                lbl.set_markup(f'<span foreground="{colour}" size="large">●</span>  {esc(tag)}'
+                               + ("  <small>(built in)</small>" if tag in BUILTIN_TAGS else ""))
+                row.pack_start(lbl, True, True, 0)
+                if tag not in BUILTIN_TAGS:
+                    rn = Gtk.Button(label="Rename")
+                    rn.connect("clicked", lambda _b, t=tag: (self.rename_tag(t), fill()))
+                    row.add(rn)
+                    rm = Gtk.Button(label="Remove")
+                    rm.connect("clicked", lambda _b, t=tag: (self.remove_tag(t), fill()))
+                    row.add(rm)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            lst.show_all()
+        addb.connect("clicked", lambda *_: (self.new_tag(), fill()))
+        fill()
+        d.show_all()
+        d.run()
+        d.destroy()
+
+    def rename_tag(self, old):
+        new = self.ask_text("Rename tag", "New name:", old)
+        if not new or new.strip() == old or new.strip() in TAGS:
+            return
+        new = new.strip()[:32]
+        colour = TAGS.pop(old)
+        TAGS[new] = colour
+        self.cfg["custom_tags"] = [[new if n == old else n, c] for n, c in self.cfg.get("custom_tags", [])]
+        with TAG_STORE.lock:                                  # files keep their tag under the new name
+            for entry in TAG_STORE.data.values():
+                if old in entry.get("tags", []):
+                    entry["tags"] = [new if t == old else t for t in entry["tags"]]
+            write_json(TAGS_FILE, TAG_STORE.data)
+        write_json(CONFIG_FILE, self.cfg)
+        self.tags_updated()
+
+    def remove_tag(self, tag):
+        if not self.confirm(f"Remove the tag “{tag}”?\n\nFiles keep everything else; only this tag goes."):
+            return
+        TAGS.pop(tag, None)
+        self.cfg["custom_tags"] = [[n, c] for n, c in self.cfg.get("custom_tags", []) if n != tag]
+        with TAG_STORE.lock:
+            for key in list(TAG_STORE.data):
+                entry = TAG_STORE.data[key]
+                if tag in entry.get("tags", []):
+                    entry["tags"] = [t for t in entry["tags"] if t != tag]
+                    if not entry["tags"]:
+                        entry.pop("tags")
+                    if not entry:
+                        TAG_STORE.data.pop(key)
+            write_json(TAGS_FILE, TAG_STORE.data)
+        write_json(CONFIG_FILE, self.cfg)
+        self.tags_updated()
+
+    def apply_smart_tag(self, paths, tag):
+        if tag not in TAGS:
+            add_custom_tag(self.cfg, tag, SMART_TAGS.get(tag, "#888888"))
+            self.tags_updated()
+        self.toggle_tag(paths, tag, True)
+
+    def smart_tag_dialog(self, paths=None):
+        """✨ Look at files and suggest tags; you tick which ones to apply."""
+        pane = self.active
+        if not paths:
+            folder = pane.location if is_folder_loc(pane.location) else str(HOME)
+            try:
+                paths = [os.path.join(folder, n) for n in os.listdir(folder) if not n.startswith(".")]
+            except OSError:
+                paths = []
+        found = OrderedDict()
+        for fp in paths[:20000]:
+            for t in smart_tags_for(fp):
+                if t not in TAG_STORE.tags(fp):
+                    found.setdefault(t, []).append(fp)
+        if not found:
+            return self.info("✨ No smart tags fit these files (or they already have them).")
+        d = Gtk.Dialog(title="✨ Smart tags", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Apply", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        box = d.get_content_area()
+        box.set_spacing(8)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=56)
+        intro.set_markup("Arckad-D looked at the names, types, folders and sizes. <b>Tick the tags to add:</b>")
+        box.add(intro)
+        checks = {}
+        for t, fps in found.items():
+            cb = Gtk.CheckButton()
+            lbl = Gtk.Label(xalign=0)
+            names = ", ".join(os.path.basename(x) for x in fps[:3]) + ("…" if len(fps) > 3 else "")
+            lbl.set_markup(f'<span foreground="{SMART_TAGS.get(t, "#888")}">●</span> <b>{esc(t)}</b>  '
+                           f'{len(fps)} file{"s" if len(fps) != 1 else ""}\n<small>{esc(names)}</small>')
+            cb.add(lbl)
+            cb.set_active(True)
+            checks[t] = cb
+            box.add(cb)
+        d.show_all()
+        if d.run() == Gtk.ResponseType.OK:
+            n = 0
+            for t, cb in checks.items():
+                if cb.get_active():
+                    self.apply_smart_tag(found[t], t)
+                    n += len(found[t])
+            self.flash_all(f"✨ Tagged {n} file{'s' if n != 1 else ''}")
+        d.destroy()
+
+    # ---------- 🖼 image tools
+    def image_tools(self, paths):
+        writable = {f.get_name() for f in GdkPixbuf.Pixbuf.get_formats() if f.is_writable()}
+        formats = [(k, lbl) for k, lbl in (("keep", "Keep the format"), ("jpeg", "JPG"), ("png", "PNG"),
+                                          ("webp", "WebP")) if k == "keep" or k in writable]
+        d = Gtk.Dialog(title=f"🖼 Image tools · {len(paths)} picture{'s' if len(paths) != 1 else ''}",
+                       transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Apply", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, border_width=16)
+        d.get_content_area().add(grid)
+
+        def combo(items, active=0):
+            c = Gtk.ComboBoxText()
+            for k, label in items:
+                c.append(k, label)
+            c.set_active(active)
+            return c
+        size = combo([("keep", "Keep the size"), ("3840", "Large (3840 px)"), ("1920", "Full HD (1920 px)"),
+                      ("1280", "Medium (1280 px)"), ("800", "Small (800 px)"), ("50%", "Half (50%)"),
+                      ("25%", "Quarter (25%)")])
+        rot = combo([("0", "Don't rotate"), ("90", "↻ 90° right"), ("270", "↺ 90° left"), ("180", "180°")])
+        fmt = combo(formats)
+        quality = combo([("92", "Best (92)"), ("85", "High (85)"), ("75", "Smaller file (75)"),
+                         ("60", "Smallest (60)")], 1)
+        out = combo([("copy", "Save as new copies (keeps the originals)"), ("replace", "Replace the originals")])
+        for i, (label, w) in enumerate((("Size (longest side):", size), ("Rotate:", rot), ("Format:", fmt),
+                                        ("JPG / WebP quality:", quality), ("Save:", out))):
+            grid.attach(Gtk.Label(label=label, xalign=1), 0, i, 1, 1)
+            grid.attach(w, 1, i, 1, 1)
+        note = Gtk.Label(xalign=0, wrap=True)
+        note.set_markup("<small>Photos are turned the right way up first (from the camera's orientation).</small>")
+        note.get_style_context().add_class("dim-label")
+        grid.attach(note, 0, 5, 2, 1)
+        d.show_all()
+        if d.run() != Gtk.ResponseType.OK:
+            d.destroy()
+            return
+        opts = dict(size=size.get_active_id(), rot=int(rot.get_active_id()), fmt=fmt.get_active_id(),
+                    q=quality.get_active_id(), replace=out.get_active_id() == "replace")
+        d.destroy()
+        if opts["replace"] and not self.confirm(f"Replace {len(paths)} original picture{'s' if len(paths) != 1 else ''}?"
+                                                "\n\nThe old versions stay in version history only if that folder "
+                                                "is protected."):
+            return
+        self.spinner.start()
+        pane = self.active
+
+        def one(src):
+            pb = GdkPixbuf.Pixbuf.new_from_file(src)
+            pb = pb.apply_embedded_orientation() or pb
+            w, h = pb.get_width(), pb.get_height()
+            s = opts["size"]
+            if s != "keep":
+                k = int(s[:-1]) / 100 if s.endswith("%") else min(1.0, int(s) / max(w, h))
+                if k < 1.0:
+                    pb = pb.scale_simple(max(1, round(w * k)), max(1, round(h * k)), GdkPixbuf.InterpType.HYPER)
+            if opts["rot"]:
+                pb = pb.rotate_simple({90: GdkPixbuf.PixbufRotation.CLOCKWISE,
+                                       270: GdkPixbuf.PixbufRotation.COUNTERCLOCKWISE,
+                                       180: GdkPixbuf.PixbufRotation.UPSIDEDOWN}[opts["rot"]])
+            ext = ext_of(src)
+            fmt_ = opts["fmt"]
+            if fmt_ == "keep":
+                fmt_ = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}.get(ext, "jpeg")
+                if fmt_ not in writable:
+                    fmt_ = "jpeg"
+            new_ext = {"jpeg": "jpg"}.get(fmt_, fmt_)
+            base = os.path.splitext(src)[0]
+            if opts["replace"]:
+                dst = base + "." + new_ext
+            else:
+                dst = str(unique_target(Path(base + " (edited)." + new_ext)))
+            keys, vals = ([], [])
+            if fmt_ in ("jpeg", "webp"):
+                keys, vals = ["quality"], [opts["q"]]
+            if fmt_ == "jpeg" and pb.get_has_alpha():                # JPG has no transparency: put it on white
+                flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, pb.get_width(), pb.get_height())
+                flat.fill(0xffffffff)
+                pb.composite(flat, 0, 0, pb.get_width(), pb.get_height(), 0, 0, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+                pb = flat
+            tmp = dst + ".arckad-tmp"
+            pb.savev(tmp, fmt_, keys, vals)
+            os.replace(tmp, dst)
+            if opts["replace"] and os.path.abspath(dst) != os.path.abspath(src):
+                os.remove(src)                                     # converted: the old-format file goes
+            return dst
+
+        def work():
+            made, errors = [], []
+            for src in paths:
+                try:
+                    made.append(one(src))
+                except (GLib.Error, OSError) as ex:
+                    errors.append(f"{os.path.basename(src)}: {getattr(ex, 'message', None) or ex}")
+            GLib.idle_add(done, made, errors)
+
+        def done(made, errors):
+            self.update_spinner()
+            pane.pending_select = made
+            pane.refresh()
+            pane.flash(f"🖼 {len(made)} picture{'s' if len(made) != 1 else ''} done")
+            if errors:
+                self.error("Some pictures couldn't be changed:\n\n" + "\n".join(errors[:10]))
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
     def toggle_tag(self, paths, tag, on):
         if on and paths:
             self.play("tag", at=self.pt_sel(), colour=TAGS.get(tag, "#ff7800"))
@@ -27316,6 +28308,26 @@ class MainWindow(Gtk.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     # ---------- compare & duplicates
+    def compare_folders_dialog(self, a=None, b=None):
+        a = a or (self.active.location if is_folder_loc(self.active.location) else None)
+        other = self.other_pane() if self.cfg.get("dual") else None
+        b = b or (other.location if other is not None and is_folder_loc(other.location) and other.location != a else None)
+        for which in ("a", "b"):
+            if (a if which == "a" else b):
+                continue
+            d = Gtk.FileChooserDialog(title="Choose the " + ("first" if which == "a" else "second") + " folder",
+                                      transient_for=self, action=Gtk.FileChooserAction.SELECT_FOLDER)
+            d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Choose", Gtk.ResponseType.OK)
+            got = d.get_filename() if d.run() == Gtk.ResponseType.OK else None
+            d.destroy()
+            if not got:
+                return None
+            if which == "a":
+                a = got
+            else:
+                b = got
+        return CompareFoldersWindow(self, a, b)
+
     def compare_selected(self):
         sel = self.active.selected_paths()
         other = self.other_pane()
@@ -29222,6 +30234,146 @@ class MainWindow(Gtk.ApplicationWindow):
         self.play("plane", src=self.pt_center(0.6), dst=self.pt_widget(self.chat_btn) or self.pt_center(0.2), lift=80)
         self.flash_all(f"📢 Announcement sent to {sent} {'person' if sent == 1 else 'people'}"
                        + (f" ({missing} without a chat yet)" if missing else ""))
+
+    # ---------- 📁 team folders
+    def team_folders(self):
+        d = Gtk.Dialog(title="📁 Team folders", transient_for=self, modal=False)
+        d.add_button("Close", Gtk.ResponseType.CLOSE)
+        d.set_default_size(640, 520)
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(14)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=70)
+        intro.set_markup("A <b>team folder</b> stays the same on the PCs of everyone in a chat group: over your office "
+                         "network, <b>encrypted</b>, with <b>no cloud</b>. Changes arrive within about 20 seconds while "
+                         "people are online. Deleted files go to their Trash; if two people change the same file, "
+                         "both versions are kept.")
+        box.add(intro)
+        mine = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(mine)
+        box.pack_start(sw, True, True, 0)
+        btns = Gtk.Box(spacing=8)
+        share = Gtk.Button(label="＋ Share a folder with a group…")
+        share.get_style_context().add_class("suggested-action")
+        look = Gtk.Button(label="🔎 Look for team folders")
+        btns.add(share)
+        btns.add(look)
+        box.add(btns)
+        found_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.add(found_box)
+
+        def fill():
+            for c in mine.get_children():
+                mine.remove(c)
+            items = TEAM.folders()
+            if not items:
+                mine.add(Gtk.Label(label="No team folders yet.", margin=20))
+            for fid, f in items:
+                g = self.chat.groups.get(f["gid"]) or {}
+                last, peers, err = TEAM.state.get(fid, (0, 0, ""))
+                n = sum(1 for e in f.get("files", {}).values() if not e.get("d"))
+                status = (f"✓ synced {ago(last)} with {peers} online" if last and peers else
+                          "waiting for someone in the group to be online" if last else "starting…")
+                row = Gtk.Box(spacing=8, margin=8)
+                lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+                lbl.set_markup(f"<b>📁 {esc(f['name'])}</b>  <small>· group {esc(g.get('name', '?'))} · {n} files</small>\n"
+                               f"<small>{esc(short(f['path']))}\n{esc(status)}{(' · ' + esc(err)) if err else ''}</small>")
+                row.pack_start(lbl, True, True, 0)
+                for label, cb in (("Open", lambda p=f["path"]: (self.show_files(), self.active.go(p), d.destroy())),
+                                  ("Sync now", lambda i=fid: threading.Thread(target=TEAM.sync, args=(i,), daemon=True).start()),
+                                  ("Leave", lambda i=fid, nm=f["name"]: self.confirm(
+                                      f"Stop sharing “{nm}” on this PC?\n\nYour files stay where they are.")
+                                   and (TEAM.leave(i), fill(), self.build_sidebar()))):
+                    b = Gtk.Button(label=label)
+                    b.connect("clicked", lambda _b, cb=cb: cb())
+                    row.add(b)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                mine.add(r)
+            mine.show_all()
+
+        def do_share(*_):
+            groups = [(gid, g.get("name", "Group")) for gid, g in self.chat.groups.items()
+                      if g.get("kind") != "direct" and not g.get("removed")]
+            if not groups:
+                return self.info("Make a chat group first (Chat → New group), with the people who should share it.")
+            dd = Gtk.Dialog(title="Share a folder with a group", transient_for=d, modal=True)
+            dd.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Share", Gtk.ResponseType.OK)
+            grid = Gtk.Grid(column_spacing=10, row_spacing=10, border_width=14)
+            dd.get_content_area().add(grid)
+            gc = Gtk.ComboBoxText()
+            for gid, nm in groups:
+                gc.append(gid, nm)
+            gc.set_active(0)
+            fc = Gtk.FileChooserButton(title="Folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
+            if is_folder_loc(self.active.location):
+                fc.set_filename(self.active.location)
+            nm_e = Gtk.Entry(placeholder_text="Name (optional)")
+            for i, (lab, w) in enumerate((("Group:", gc), ("Folder:", fc), ("Name:", nm_e))):
+                grid.attach(Gtk.Label(label=lab, xalign=1), 0, i, 1, 1)
+                grid.attach(w, 1, i, 1, 1)
+            dd.show_all()
+            if dd.run() == Gtk.ResponseType.OK and fc.get_filename():
+                path = fc.get_filename()
+                TEAM.create(gc.get_active_id(), nm_e.get_text().strip() or os.path.basename(path), path)
+                self.build_sidebar()
+                self.flash_all("📁 Team folder shared: the group was told how to join")
+            dd.destroy()
+            fill()
+
+        def do_look(*_):
+            for c in found_box.get_children():
+                found_box.remove(c)
+            found_box.add(Gtk.Label(label="Looking in your groups…", xalign=0))
+            found_box.show_all()
+
+            def work():
+                found = TEAM.discover()
+                GLib.idle_add(show_found, found)
+            threading.Thread(target=work, daemon=True).start()
+
+        def show_found(found):
+            for c in found_box.get_children():
+                found_box.remove(c)
+            if not found:
+                found_box.add(Gtk.Label(label="No new team folders right now (the person sharing one needs to be "
+                                              "online).", xalign=0, wrap=True))
+            for fid, (gid, gname, name) in found.items():
+                row = Gtk.Box(spacing=8)
+                lbl = Gtk.Label(xalign=0, hexpand=True)
+                lbl.set_markup(f"📁 <b>{esc(name)}</b>  <small>from group {esc(gname)}</small>")
+                row.pack_start(lbl, True, True, 0)
+                b = Gtk.Button(label="Join")
+                b.get_style_context().add_class("suggested-action")
+
+                def join(_b, fid=fid, gid=gid, name=name):
+                    base = HOME / "Arckad Team" / re.sub(r'[\\/:*?"<>|]', "_", name)
+                    ch = Gtk.FileChooserDialog(title=f"Where should “{name}” be on this PC?", transient_for=d,
+                                               action=Gtk.FileChooserAction.SELECT_FOLDER)
+                    ch.add_buttons("Cancel", Gtk.ResponseType.CANCEL, f"Use {base.name}", 1, "Use this folder",
+                                   Gtk.ResponseType.OK)
+                    rr = ch.run()
+                    path = str(base) if rr == 1 else (ch.get_filename() if rr == Gtk.ResponseType.OK else None)
+                    ch.destroy()
+                    if path:
+                        TEAM.join(gid, fid, name, path)
+                        self.build_sidebar()
+                        self.flash_all(f"📁 Joined “{name}”: files are arriving")
+                        fill()
+                        do_look()
+                b.connect("clicked", join)
+                row.add(b)
+                found_box.add(row)
+            found_box.show_all()
+            return False
+        share.connect("clicked", do_share)
+        look.connect("clicked", do_look)
+        fill()
+        tick = GLib.timeout_add_seconds(5, lambda: d.get_visible() and (fill() or True))
+        d.connect("response", lambda dlg, _r: (GLib.source_remove(tick), dlg.destroy()))
+        d.show_all()
+        return d
 
     def org_dialog(self):
         """Organisations this PC trusts: their admin (Arckad-D Pro) can add you as a contact without a request."""
