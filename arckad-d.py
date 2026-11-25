@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.58.0"
+APP_VERSION = "3.58.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20664,6 +20664,11 @@ def _win_trash_call(what, item):
     return item["orig"]
 
 
+def pane_key_blocked(key, ctrl):
+    """Keys that act on a folder's files: blocked while the Trash is on screen."""
+    return key in ("Delete", "KP_Delete", "F2", "Return", "KP_Enter", "BackSpace") or (ctrl and key.lower() in ("a", "n"))
+
+
 class TrashView(Gtk.Box):
     """🗑 The Trash of every drive: a list or a grid of thumbnails, with one-click shortcuts per drive."""
     COLS = (str, str, str, str, str, float, GObject.TYPE_INT64, int, GdkPixbuf.Pixbuf, str)
@@ -20720,19 +20725,20 @@ class TrashView(Gtk.Box):
             c.set_sort_column_id(sort)
             self.tv.append_column(c)
         self.tv.connect("row-activated", lambda *_: self.restore())
-        self.icons = Gtk.IconView(pixbuf_column=8, item_width=112, column_spacing=6,
-                                  row_spacing=10, margin=6)
+        self.icons = Gtk.IconView(item_width=110, column_spacing=4, row_spacing=4, margin=8)   # like normal folders
         self.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
-        cell = next((c for c in self.icons.get_cells() if isinstance(c, Gtk.CellRendererText)), None)
-        if cell is None:
-            cell = Gtk.CellRendererText()
-            self.icons.pack_end(cell, False)
+        pix = Gtk.CellRendererPixbuf()
+        pix.set_fixed_size(100, 100)
+        self.icons.pack_start(pix, False)
+        self.icons.add_attribute(pix, "pixbuf", 8)
+        cell = Gtk.CellRendererText(wrap_mode=Pango.WrapMode.WORD_CHAR, wrap_width=100,
+                                    alignment=Pango.Alignment.CENTER, xalign=0.5)
         cell.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE)
-        cell.set_property("wrap-mode", Pango.WrapMode.WORD_CHAR)
-        cell.set_property("alignment", Pango.Alignment.CENTER)
-        cell.set_property("xalign", 0.5)
+        self.icons.pack_start(cell, False)
         self.icons.add_attribute(cell, "text", 1)
         self.icons.connect("item-activated", lambda *_: self.restore())
+        self.tv.connect("button-press-event", self._click)
+        self.icons.connect("button-press-event", self._click)
         self.views = Gtk.Stack()
         for name, w in (("list", self.tv), ("grid", self.icons)):
             sw = Gtk.ScrolledWindow(vexpand=True)
@@ -20742,11 +20748,18 @@ class TrashView(Gtk.Box):
         self.items, self.drive, self.gen = [], None, 0    # drive: None = all drives
         self._icon_cache = {}
         self._new_model()
-        mode = win.cfg.get("trash_view", "list")
+        mode = win.cfg.get("trash_view", "grid")                         # thumbnails unless you chose the list
         (self.grid_btn if mode == "grid" else self.list_btn).set_active(True)
         self.views.set_visible_child_name(mode)
         self.list_btn.connect("toggled", lambda b: b.get_active() and self.set_view("list"))
         self.grid_btn.connect("toggled", lambda b: b.get_active() and self.set_view("grid"))
+        self.connect("map", lambda *_: self._apply_mode())      # a Stack only switches once it's on screen
+
+    def _apply_mode(self):
+        mode = self.win.cfg.get("trash_view", "grid")
+        if self.views.get_visible_child_name() != mode:
+            self.views.set_visible_child_name(mode)
+        (self.grid_btn if mode == "grid" else self.list_btn).set_active(True)
 
     def _new_model(self):
         """A fresh model for every refresh (clearing one under a filter + sort upsets GTK)."""
@@ -20759,7 +20772,6 @@ class TrashView(Gtk.Box):
     def _attach(self):
         self.tv.set_model(self.sorted)
         self.icons.set_model(self.sorted)
-        self.icons.set_pixbuf_column(8)
 
     def set_view(self, mode):
         self.views.set_visible_child_name(mode)
@@ -20821,6 +20833,7 @@ class TrashView(Gtk.Box):
         self._attach()
         self._drive_button()
         self._update_title()
+        self._apply_mode()
 
     def _drive_button(self):
         on_drive = bool(self.drive)                        # a drive's own Trash is selected
@@ -20861,14 +20874,14 @@ class TrashView(Gtk.Box):
         if key not in self._icon_cache:
             pb = None
             try:
-                info = Gtk.IconTheme.get_default().lookup_by_gicon(icon_for(name, is_dir), 64,
+                info = Gtk.IconTheme.get_default().lookup_by_gicon(icon_for(name, is_dir), 80,
                                                                    Gtk.IconLookupFlags.FORCE_SIZE)
                 pb = info.load_icon() if info else None
             except Exception:
                 pb = None
             if pb is None:
                 try:
-                    pb = Gtk.IconTheme.get_default().load_icon("folder" if is_dir else "text-x-generic", 64,
+                    pb = Gtk.IconTheme.get_default().load_icon("folder" if is_dir else "text-x-generic", 80,
                                                                Gtk.IconLookupFlags.FORCE_SIZE)
                 except GLib.Error:
                     pb = None
@@ -20899,6 +20912,7 @@ class TrashView(Gtk.Box):
         self._build_chips(shown)
         self.filter.refilter()
         self._attach()
+        self._apply_mode()
         self._update_title()
         self.win.update_trash_count(len(shown))
         self._load_thumbs()
@@ -20950,6 +20964,178 @@ class TrashView(Gtk.Box):
         else:
             _m, paths = self.tv.get_selection().get_selected_rows()
         return [self.items[self.sorted[p][7]] for p in paths]
+
+    # ---------- right-click menu and keys (like a normal folder)
+    def _view(self):
+        return self.icons if self.views.get_visible_child_name() == "grid" else self.tv
+
+    def _click(self, view, ev):
+        if ev.button != 3:
+            return False
+        if view is self.icons:
+            path = view.get_path_at_pos(int(ev.x), int(ev.y))
+            if path is not None and not view.path_is_selected(path):
+                view.unselect_all()
+                view.select_path(path)
+        else:
+            hit = view.get_path_at_pos(int(ev.x), int(ev.y))
+            sel = view.get_selection()
+            if hit and not sel.path_is_selected(hit[0]):
+                sel.unselect_all()
+                sel.select_path(hit[0])
+        self.menu(ev)
+        return True
+
+    def menu(self, ev=None):
+        sel = self._selected()
+        m = Gtk.Menu()
+
+        def add(label, cb, ok=True, accel=None):
+            it = Gtk.MenuItem()
+            box = Gtk.Box(spacing=24)
+            box.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
+            if accel:
+                a = Gtk.Label(label=accel)
+                a.get_style_context().add_class("dim-label")
+                box.pack_end(a, False, False, 0)
+            it.add(box)
+            it.set_sensitive(ok)
+            it.connect("activate", lambda *_: cb())
+            m.append(it)
+        n = len(sel)
+        one = n == 1
+        add(f"↩ Restore{f' {n} items' if n > 1 else ''}", self.restore, n > 0, "Enter")
+        add("📂 Restore to…", self.restore_to, n > 0)
+        add("📁 Open the folder it was in", self.open_origin, one)
+        add("👁 Open", self.open_item, one and not sel[0]["is_dir"] if one else False)
+        m.append(Gtk.SeparatorMenuItem())
+        add("📋 Copy", self.copy, n > 0 and not IS_WIN, "Ctrl+C")
+        add("🔗 Copy original location", self.copy_location, one)
+        m.append(Gtk.SeparatorMenuItem())
+        add("🗑 Delete permanently", self.delete, n > 0, "Delete")
+        add("Select all", self.select_all, bool(self.items), "Ctrl+A")
+        add("↻ Refresh", self.refresh, True, "F5")
+        m.append(Gtk.SeparatorMenuItem())
+        add("ℹ Properties", self.show_props, n > 0, "Alt+Enter")
+        add("Empty Trash", self.empty, bool(self.items))
+        m.show_all()
+        m.attach_to_widget(self, None)
+        if ev is not None:
+            m.popup_at_pointer(ev)
+        else:
+            m.popup_at_widget(self._view(), Gdk.Gravity.CENTER, Gdk.Gravity.NORTH_WEST, None)
+
+    def handle_key(self, key, low, ctrl, shift, alt, typing):
+        """The Trash's own shortcuts. True = handled. (Delete never reaches the files hidden behind the Trash.)"""
+        if typing:
+            return False
+        if key in ("Return", "KP_Enter") and alt:
+            self.show_props()
+        elif key in ("Return", "KP_Enter"):
+            self.restore()
+        elif key in ("Delete", "KP_Delete"):
+            self.delete()
+        elif ctrl and low == "a":
+            self.select_all()
+        elif ctrl and low == "c":
+            self.copy()
+        elif ctrl and key in ("1", "KP_1"):
+            self.list_btn.set_active(True)
+        elif ctrl and key in ("2", "KP_2"):
+            self.grid_btn.set_active(True)
+        elif key == "F5":
+            self.refresh()
+        elif key in ("Menu", "F10") and (shift or key == "Menu"):
+            self.menu()
+        elif ctrl and low in ("x", "v", "z") or key in ("F2", "BackSpace"):
+            self.win.flash_all("In the Trash: Enter restores, Delete removes for good, right-click for more")
+        else:
+            return False
+        return True
+
+    def select_all(self):
+        if self.views.get_visible_child_name() == "grid":
+            self.icons.select_all()
+        else:
+            self.tv.get_selection().select_all()
+
+    def open_origin(self):
+        sel = self._selected()
+        if not sel:
+            return
+        folder = os.path.dirname(sel[0]["orig"])
+        if not os.path.isdir(folder):
+            return self.win.flash_all(f"That folder isn't there any more: {short(folder)}")
+        self.win.show_files()
+        self.win.active.go(folder)
+
+    def open_item(self):
+        sel = self._selected()
+        if sel and os.path.exists(sel[0]["key"]):
+            self.win.open_path(sel[0]["key"])
+
+    def copy(self):
+        sel = self._selected()
+        if IS_WIN:
+            return self.win.flash_all("Use Restore (or Restore to…) to take things out of the Recycle Bin")
+        if sel:
+            self.win.set_clipboard([it["key"] for it in sel], False)
+
+    def copy_location(self):
+        sel = self._selected()
+        if sel:
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(self._text(sel[0]["orig"]), -1)
+            self.win.flash_all("Copied the original location")
+
+    def restore_to(self):
+        """Take them out of the Trash into a folder you choose (instead of where they were)."""
+        sel = self._selected()
+        if not sel:
+            return
+        d = Gtk.FileChooserDialog(title="Restore to…", transient_for=self.win, action=Gtk.FileChooserAction.SELECT_FOLDER)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Restore here", Gtk.ResponseType.OK)
+        d.set_current_folder(os.path.dirname(sel[0]["orig"]) if os.path.isdir(os.path.dirname(sel[0]["orig"])) else str(HOME))
+        folder = d.get_filename() if d.run() == Gtk.ResponseType.OK else None
+        d.destroy()
+        if not folder:
+            return
+        back = []
+        for it in sel:
+            try:
+                if IS_WIN:
+                    src = trash_restore(it)                      # back to where it was, then on to the chosen folder
+                else:
+                    src = it["key"]
+                dst = str(unique_target(Path(folder) / os.path.basename(it["orig"] or it["name"])))
+                shutil.move(src, dst)
+                if not IS_WIN and it.get("info"):
+                    Path(it["info"]).unlink(missing_ok=True)
+                back.append(dst)
+            except (OSError, shutil.Error, subprocess.SubprocessError) as ex:
+                self.win.error(f"Couldn't restore {self._text(it['name'])}: {getattr(ex, 'strerror', None) or ex}")
+        self.refresh()
+        self.win.refresh_all()
+        if back:
+            self.win.flash_all(f"↩ Restored {len(back)} item{'s' if len(back) != 1 else ''} to {short(folder)}")
+            self.win.after_restore(back)
+
+    def show_props(self):
+        sel = self._selected()
+        if not sel:
+            return
+        if len(sel) == 1:
+            it = sel[0]
+            try:
+                when = time.strftime("%d %b %Y, %H:%M", time.localtime(it["when"]))
+            except (OverflowError, OSError, ValueError):
+                when = "—"
+            kind = "Folder" if it["is_dir"] else (category_of(self._text(it["name"])) or "File")
+            text = (f"{self._text(it['name'])}\n\nType:  {kind}\nSize:  {'—' if it['is_dir'] else human_size(it['size'])}"
+                    f"\nWas in:  {self._text(os.path.dirname(it['orig']))}\nDeleted:  {when}")
+        else:
+            text = (f"{len(sel)} items in the Trash\n\nTotal size:  {human_size(sum(i['size'] for i in sel))}\n"
+                    f"Folders:  {sum(1 for i in sel if i['is_dir'])}")
+        self.win.info(text)
 
     # ---------- actions
     def restore(self):
@@ -27710,6 +27896,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if ctrl and key == "comma":
             self.open_settings()                                # Ctrl+,  all settings in one place
             return True
+        if self.lib_stack.get_visible_child_name() == "trash" and not typing:
+            if self.trash_view.handle_key(key, low, ctrl, shift, alt, typing):
+                return True
+            if key == "space" or (ctrl and low in ("c", "x", "v", "1", "2")) or pane_key_blocked(key, ctrl):
+                return True                                     # never act on files hidden behind the Trash
         pane = self.active
         if ctrl and low == "t":
             self.new_tab()
