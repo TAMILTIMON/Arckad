@@ -116,6 +116,34 @@ def _professional_icons():
         return None
 
 
+def _wait_for_previous():
+    """After “Restart Arckad-D”: wait (up to 15 s) until the old copy has closed, then carry on starting."""
+    pid = os.environ.pop("ARCKAD_WAIT_PID", "")
+    if not pid.isdigit():
+        return
+    pid = int(pid)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x00100000, False, pid)            # SYNCHRONIZE
+            if h:
+                k.WaitForSingleObject(h, 15000)
+                k.CloseHandle(h)
+        except Exception:
+            pass
+        return
+    import time as _t
+    end = _t.time() + 15
+    while _t.time() < end:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        _t.sleep(0.1)
+
+
+_wait_for_previous()
 ICON_FONTS = _professional_icons()
 if sys.platform == "win32":
     os.environ.setdefault("GDK_WIN32_USE_EXPERIMENTAL_OLE2_DND", "1")     # drops from Explorer and other apps
@@ -155,7 +183,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.63.0"
+APP_VERSION = "3.63.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -27495,13 +27523,11 @@ class MainWindow(Gtk.ApplicationWindow):
             cmd = ["arckad-d"]
         else:
             cmd = [sys.executable, os.path.abspath(__file__)]
-        if IS_WIN:                                          # starts a moment after this copy has closed
-            later = ["cmd", "/c", "ping -n 3 127.0.0.1 >nul & start \"\" " + " ".join(f'"{c}"' for c in cmd)]
-        else:
-            later = ["sh", "-c", 'sleep 1.5; exec "$0" "$@"'] + cmd
+        env["ARCKAD_WAIT_PID"] = str(os.getpid())         # the new copy waits until this one has closed
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) \
+            if IS_WIN else 0
         try:
-            subprocess.Popen(later, start_new_session=not IS_WIN, env=env,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            subprocess.Popen(cmd, env=env, close_fds=True, start_new_session=not IS_WIN, creationflags=flags)
         except OSError as ex:
             return self.error(f"Couldn't restart: {ex}. Please close and open {APP_NAME} again.")
         self.quitting = True
