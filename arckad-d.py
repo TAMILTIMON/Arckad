@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.54.1"
+APP_VERSION = "3.54.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20858,7 +20858,7 @@ def settings_entries(win):
         E += [("system", "Optional features", "Extras for music, video thumbnails, PDFs, archives…", "button",
                "Install…", win.features_dialog)]
     E += [("system", "Keyboard shortcuts", "Every shortcut on one page.", "button", "Show",
-           lambda: win.info(SHORTCUTS, mono=True)),
+           lambda: show_shortcuts(win)),
           ("system", "About Arckad-D", "Version, credits and licence.", "button", "About", win.show_about)]
     return E
 
@@ -20979,22 +20979,126 @@ CSS = b"""
 .fm-footer { padding: 6px 10px; }
 """
 
-SHORTCUTS = """Ctrl+T  new tab          Ctrl+W  close tab
-F3  dual pane on/off      F6  jump to other pane
-Space  preview panel      Ctrl+1 / Ctrl+2  list / grid
-Ctrl+F  filter            Ctrl+L  type a path
-Ctrl+C / X / V  copy, cut, paste files
-Ctrl+Shift+N  new folder  Alt+Enter  properties
-F4  open a terminal / Command Prompt in this folder
-F2  rename                Delete  move to Trash
-Shift+Delete  delete permanently   Ctrl+A  select all
-Ctrl+H  hidden files      F5  refresh
-Ctrl+Shift+D  switch theme (system / light / dark)
-Alt+← / Alt+→ / Alt+↑  back, forward, up
-Drag files onto a folder, a tab or the sidebar to move them
-   (hold Ctrl to copy; files dragged in from other apps are copied)
-Middle-click a folder  open it in a new tab
-Send / Receive buttons  share files with nearby Arckad-D, phones and browsers"""
+# The keyboard shortcuts page: sections, each a table of keys and what they do.
+# A key list like ("Ctrl", "C") shows as key caps; a plain string (mouse actions) shows as words.
+SHORTCUTS = [
+    ("📄 Files", [
+        (("Ctrl", "C"), "Copy the selected files"),
+        (("Ctrl", "X"), "Cut (to move them)"),
+        (("Ctrl", "V"), "Paste here: copies, or moves what you cut"),
+        (("F2",), "Rename (several selected: batch rename)"),
+        (("Ctrl", "Shift", "N"), "New folder"),
+        (("Delete",), "Move to the Trash"),
+        (("Shift", "Delete"), "Delete permanently"),
+        (("Ctrl", "A"), "Select all"),
+        (("Alt", "Enter"), "Properties"),
+    ]),
+    ("🖱 Moving with the mouse", [
+        ("Drag", "Drop onto a folder, a tab or the sidebar to move"),
+        ("Ctrl + drag", "Copy instead of move"),
+        ("From other apps", "Files dragged in are copied"),
+    ]),
+    ("🗂 Tabs and windows", [
+        (("Ctrl", "T"), "New tab"),
+        (("Ctrl", "W"), "Close tab"),
+        ("Middle-click", "Open a folder in a new tab"),
+        ("Drag a tab out", "Give it a window of its own"),
+        (("F3",), "Dual pane on / off"),
+        (("F6",), "Jump to the other pane"),
+    ]),
+    ("🧭 Going places", [
+        (("Alt", "←"), "Back"),
+        (("Alt", "→"), "Forward"),
+        (("Alt", "↑"), "Up one folder"),
+        (("Backspace",), "Back"),
+        (("Ctrl", "L"), "Type a path"),
+        (("Ctrl", "F"), "Filter this folder"),
+        ("Start typing", "Filters the list as you type"),
+    ]),
+    ("👁 View", [
+        (("Space",), "Preview panel"),
+        (("Ctrl", "1"), "List view"),
+        (("Ctrl", "2"), "Grid view"),
+        (("Ctrl", "H"), "Show hidden files"),
+        (("F5",), "Refresh"),
+        (("Ctrl", "Shift", "D"), "Next theme"),
+    ]),
+    ("⚙ Other", [
+        (("F4",), "Open a terminal here" if not IS_WIN else "Open a Command Prompt here"),
+        (("Ctrl", ","), "Settings"),
+        ("Send / Receive", "Share files with nearby PCs, phones and browsers"),
+    ]),
+]
+
+SHORTCUT_CSS = b"""
+label.keycap { border: 1px solid alpha(currentColor, 0.35); border-bottom-width: 2px; border-radius: 5px;
+               padding: 1px 7px; background-color: alpha(currentColor, 0.06); font-size: 0.92em; }
+label.keyplus { opacity: 0.55; }
+label.sc-title { font-weight: bold; font-size: 1.08em; }
+"""
+
+
+def show_shortcuts(parent):
+    """The keyboard shortcuts page: one titled table per section, keys as key caps, in two columns."""
+    css = Gtk.CssProvider()
+    css.load_from_data(SHORTCUT_CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 8)
+    w = Gtk.Window(title="Keyboard shortcuts", transient_for=parent, modal=True,
+                   window_position=Gtk.WindowPosition.CENTER_ON_PARENT)
+    w.set_default_size(880, 600)
+    hb = Gtk.HeaderBar(show_close_button=True, title="Keyboard shortcuts")
+    w.set_titlebar(hb)
+
+    def section(title, rows):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        t = Gtk.Label(label=title, xalign=0)
+        t.get_style_context().add_class("sc-title")
+        box.add(t)
+        grid = Gtk.Grid(column_spacing=16, row_spacing=7, margin_start=4)
+        for i, (keys, what) in enumerate(rows):
+            kb = Gtk.Box(spacing=3, halign=Gtk.Align.START, valign=Gtk.Align.CENTER)
+            if isinstance(keys, str):                      # a mouse action, in words
+                lbl = Gtk.Label(xalign=0)
+                lbl.set_markup(f"<i>{esc(keys)}</i>")
+                kb.add(lbl)
+            else:
+                for j, k in enumerate(keys):
+                    if j:
+                        plus = Gtk.Label(label="+")
+                        plus.get_style_context().add_class("keyplus")
+                        kb.add(plus)
+                    cap = Gtk.Label(label=k)
+                    cap.get_style_context().add_class("keycap")
+                    kb.add(cap)
+            kb.set_size_request(150, -1)
+            grid.attach(kb, 0, i, 1, 1)
+            d = Gtk.Label(label=what, xalign=0, wrap=True, max_width_chars=34)
+            grid.attach(d, 1, i, 1, 1)
+        box.add(grid)
+        return box
+
+    cols = Gtk.Box(spacing=36, margin=20, homogeneous=True)
+    left, right = (Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=22) for _ in range(2))
+    half = (len(SHORTCUTS) + 1) // 2
+    for i, (title, rows) in enumerate(SHORTCUTS):
+        (left if i < half else right).add(section(title, rows))
+    cols.add(left)
+    cols.add(right)
+    outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    outer.add(cols)
+    note = Gtk.Label(xalign=0, wrap=True, margin_start=20, margin_end=20, margin_bottom=16)
+    note.set_markup("<small>These work in every Arckad-D window, including tabs dragged out into a window of their "
+                    "own. While you type in a box (a path, a filter, chat), Ctrl+C / X / V copy and paste text "
+                    "instead of files.</small>")
+    note.get_style_context().add_class("dim-label")
+    outer.add(note)
+    sw = Gtk.ScrolledWindow()
+    sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+    sw.add(outer)
+    w.add(sw)
+    w.connect("key-press-event", lambda _w, ev: ev.keyval == Gdk.KEY_Escape and (w.destroy() or True))
+    w.show_all()
+    return w
 
 
 # ---------------------------------------------------------------- Skins: modern, glossy themes
@@ -21672,7 +21776,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Pin this folder to sidebar", lambda: self.pin(self.active.location)),
             None,
         ] + ([] if INSTALLED or IS_WIN else [(f"Add {APP_NAME} to app menu", self.on_install)]) + [
-            ("Keyboard shortcuts", lambda: self.info(SHORTCUTS, mono=True)),
+            ("Keyboard shortcuts", lambda: show_shortcuts(self)),
             ("Default file manager…", self.default_fm_dialog),
             ("🏢 Organisation…", self.org_dialog),
             ("🔐 Change the vault password…", self.vault_password),
@@ -25512,14 +25616,33 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.search.set_position(-1)
         return True
 
+    @staticmethod
+    def _latin_key(event, key):
+        """With a non-Latin keyboard layout active (Tamil, Hindi, Russian…), Ctrl+C sends a non-Latin letter: use
+        the same physical key's letter from a Latin layout, so shortcuts work whatever layout is on."""
+        if len(key) == 1 and key.isascii():
+            return key
+        try:
+            ok, _keys, vals = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_entries_for_keycode(
+                event.hardware_keycode)
+        except Exception:
+            return key
+        for v in (vals or []) if ok else []:
+            name = Gdk.keyval_name(v) or ""
+            if len(name) == 1 and name.isascii() and name.isalnum():
+                return name
+        return key
+
     def on_key(self, _w, event):
         key = Gdk.keyval_name(event.keyval) or ""
-        low = key.lower()
         ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
         alt = bool(event.state & Gdk.ModifierType.MOD1_MASK)
+        if ctrl or alt:
+            key = self._latin_key(event, key)
+        low = key.lower()
         shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
         typing = isinstance((getattr(self, "_key_window", None) or self).get_focus(), (Gtk.Entry, Gtk.TextView))
-        if (event.state & Gdk.ModifierType.CONTROL_MASK) and Gdk.keyval_name(event.keyval) == "comma":
+        if ctrl and key == "comma":
             self.open_settings()                                # Ctrl+,  all settings in one place
             return True
         pane = self.active
