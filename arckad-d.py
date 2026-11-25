@@ -76,11 +76,25 @@ def _professional_icons():
     instead of colourful phone emoji. Linux: a font setup for Arckad-D alone (other apps are untouched)."""
     base = (os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) if sys.platform == "win32" else \
         (os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"))
+    path = os.path.join(base, "arckad-d", "config.json")
     try:
-        with open(os.path.join(base, "arckad-d", "config.json"), encoding="utf-8") as f:
-            style = json.load(f).get("icon_style", "pro")
-    except (OSError, ValueError, AttributeError):
-        style = "pro"
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = None                                         # a fresh install: Professional (the default)
+    style = "pro"
+    if isinstance(cfg, dict):
+        if not cfg.get("icons_pro_default"):               # once, after updating: everyone starts on Professional
+            cfg["icon_style"] = "pro"
+            cfg["icons_pro_default"] = True
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=1)
+                os.replace(tmp, path)
+            except OSError:
+                pass
+        style = cfg.get("icon_style", "pro")               # after that, a deliberate choice is respected
     fonts = _font_dir()
     if style != "pro" or not fonts:
         return None
@@ -215,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.63.2"
+APP_VERSION = "3.63.5"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -630,6 +644,19 @@ def disk_activity(seconds=3.0):
         if pid in a[1]:
             out[group] += max(0, v - a[1][pid][1]) / dt
     return out
+
+
+def sql_id(v):
+    """A file's device / ID number in a form the database can hold. Windows (NTFS) file IDs go up to 2**64 and ReFS
+    ones to 2**128, but SQLite stores at most 2**63: the same number always gives the same result, so matching works."""
+    if v is None:
+        return None
+    v = int(v)
+    if -(1 << 63) <= v < (1 << 63):
+        return v
+    if v >= (1 << 64):                                      # ReFS: fold 128 bits into 64
+        v = (v ^ (v >> 64)) & ((1 << 64) - 1)
+    return v - (1 << 64) if v >= (1 << 63) else v
 
 
 def walk_entries(root, hidden=False):
@@ -1748,7 +1775,8 @@ class FileIndex:
             extra = [x for x in read_json(CONFIG_FILE, {}).get("library_places", []) if os.path.isdir(x)]
             for p, st, is_dir in itertools.chain(walk_entries(HOME), *(walk_entries(x) for x in extra)):
                 batch.append((str(p), p.name.lower(), "" if is_dir else ext_of(p.name),
-                              int(is_dir), 0 if is_dir else st.st_size, st.st_mtime, st.st_dev, st.st_ino))
+                              int(is_dir), 0 if is_dir else st.st_size, st.st_mtime, sql_id(st.st_dev),
+                              sql_id(st.st_ino)))
                 n += 1
                 if n % 300 == 0:
                     time.sleep(0.01)              # give way: the window stays responsive and the disk breathes
@@ -2048,7 +2076,7 @@ class Journey:
     def _stat(path):
         try:
             st = os.lstat(path)
-            return st.st_dev, st.st_ino, int(stat_isdir(st)), (0 if stat_isdir(st) else st.st_size)
+            return sql_id(st.st_dev), sql_id(st.st_ino), int(stat_isdir(st)), (0 if stat_isdir(st) else st.st_size)
         except OSError:
             return None, None, 0, 0
 
@@ -2425,7 +2453,7 @@ def _find_by_ino(root, dev, ino, depth=3):
                 for e in it:
                     seen += 1
                     try:
-                        if e.inode() == ino and e.stat(follow_symlinks=False).st_dev == dev:
+                        if sql_id(e.inode()) == ino and sql_id(e.stat(follow_symlinks=False).st_dev) == dev:
                             return e.path
                         if d < depth and e.is_dir(follow_symlinks=False) and e.name not in SKIP_DIRS:
                             stack.append((e.path, d + 1))
@@ -19253,6 +19281,7 @@ class LibraryView(Gtk.Box):
 
     # ---------- Applications
     def _apps(self, q):
+        pending = []
         apps = installed_apps()
         ql = q.lower()
         if ql:
@@ -19274,6 +19303,8 @@ class LibraryView(Gtk.Box):
                 img = Gtk.Image.new_from_gicon(a["icon"], Gtk.IconSize.DIALOG) if a.get("icon") else \
                     Gtk.Image.new_from_icon_name("application-x-executable", Gtk.IconSize.DIALOG)
                 img.set_pixel_size(48)
+                if a.get("lnk"):
+                    pending.append((img, a["lnk"]))             # Windows: the app's real icon, filled in below
                 box.add(img)
                 box.add(Gtk.Label(label=a["name"], ellipsize=Pango.EllipsizeMode.END, max_width_chars=14))
                 b.add(box)
@@ -19281,6 +19312,17 @@ class LibraryView(Gtk.Box):
                 b.connect("clicked", lambda _b, a=a: self._launch(a))
                 flow.add(b)
             self.body.add(flow)
+        if pending:                                         # Windows icons: read in the background, shown as they come
+            gen = self._icon_gen = getattr(self, "_icon_gen", 0) + 1
+
+            def work():
+                for img, lnk in pending:
+                    if gen != self._icon_gen:
+                        return
+                    pb = app_icon_cached(lnk, 48)
+                    if pb is not None:
+                        GLib.idle_add(lambda i=img, p=pb: (gen == self._icon_gen and i.set_from_pixbuf(p)) and False)
+            threading.Thread(target=work, daemon=True).start()
 
     def _launch(self, a):
         try:
@@ -19323,6 +19365,131 @@ def music_tags(path):
             "album": t.get("album") or ""}
     _MUSIC_TAGS[path] = (mt, info)
     return info
+
+
+def windows_icon_pixbuf(path, size=48):
+    """Windows: the real icon of a file or shortcut (as Explorer shows it), as a picture GTK can draw.
+    None if Windows has none for it."""
+    if not IS_WIN:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    shell32, user32, gdi32 = ctypes.windll.shell32, ctypes.windll.user32, ctypes.windll.gdi32
+
+    class SHFILEINFOW(ctypes.Structure):
+        _fields_ = [("hIcon", wintypes.HANDLE), ("iIcon", ctypes.c_int), ("dwAttributes", wintypes.DWORD),
+                    ("szDisplayName", wintypes.WCHAR * 260), ("szTypeName", wintypes.WCHAR * 80)]
+
+    class ICONINFO(ctypes.Structure):
+        _fields_ = [("fIcon", wintypes.BOOL), ("xHotspot", wintypes.DWORD), ("yHotspot", wintypes.DWORD),
+                    ("hbmMask", wintypes.HBITMAP), ("hbmColor", wintypes.HBITMAP)]
+
+    class BITMAP(ctypes.Structure):
+        _fields_ = [("bmType", wintypes.LONG), ("bmWidth", wintypes.LONG), ("bmHeight", wintypes.LONG),
+                    ("bmWidthBytes", wintypes.LONG), ("bmPlanes", wintypes.WORD), ("bmBitsPixel", wintypes.WORD),
+                    ("bmBits", ctypes.c_void_p)]
+
+    class BIH(ctypes.Structure):
+        _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32), ("biHeight", ctypes.c_int32),
+                    ("biPlanes", ctypes.c_uint16), ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                    ("biSizeImage", ctypes.c_uint32), ("a", ctypes.c_int32), ("b", ctypes.c_int32),
+                    ("c", ctypes.c_uint32), ("d", ctypes.c_uint32)]
+    shell32.SHGetFileInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(SHFILEINFOW), wintypes.UINT,
+                                       wintypes.UINT]
+    shell32.SHGetFileInfoW.restype = ctypes.c_size_t
+    user32.PrivateExtractIconsW.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                            ctypes.POINTER(wintypes.HICON), ctypes.POINTER(wintypes.UINT), wintypes.UINT,
+                                            wintypes.UINT]
+    user32.GetIconInfo.argtypes = [wintypes.HICON, ctypes.POINTER(ICONINFO)]
+    user32.DestroyIcon.argtypes = [wintypes.HICON]
+    gdi32.GetObjectW.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p]
+    gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+                                ctypes.c_void_p, wintypes.UINT]
+    gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+
+    hicon = wintypes.HICON()
+    sfi = SHFILEINFOW()
+    # 1. where the icon lives (a shortcut's own icon, or its program's), then that icon at the size we want
+    if shell32.SHGetFileInfoW(path, 0, ctypes.byref(sfi), ctypes.sizeof(sfi), 0x1000):        # SHGFI_ICONLOCATION
+        src = sfi.szDisplayName or path
+        got = user32.PrivateExtractIconsW(os.path.expandvars(src), sfi.iIcon, size, size, ctypes.byref(hicon), None, 1, 0)
+        if got != 1 or not hicon:
+            hicon = wintypes.HICON()
+    # 2. otherwise Explorer's own large icon for it (32 px)
+    if not hicon:
+        sfi = SHFILEINFOW()
+        if shell32.SHGetFileInfoW(path, 0, ctypes.byref(sfi), ctypes.sizeof(sfi), 0x100 | 0x0) and sfi.hIcon:
+            hicon = wintypes.HICON(sfi.hIcon)                                                   # SHGFI_ICON | LARGE
+    if not hicon:
+        return None
+    ii = ICONINFO()
+    try:
+        if not user32.GetIconInfo(hicon, ctypes.byref(ii)):
+            return None
+        bm = BITMAP()
+        gdi32.GetObjectW(ii.hbmColor or ii.hbmMask, ctypes.sizeof(bm), ctypes.byref(bm))
+        w, h = bm.bmWidth, bm.bmHeight if ii.hbmColor else bm.bmHeight // 2
+        if w <= 0 or h <= 0:
+            return None
+        hdc = user32.GetDC(None)
+
+        def bits(hbm):
+            bih = BIH(ctypes.sizeof(BIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+            buf = (ctypes.c_char * (w * h * 4))()
+            gdi32.GetDIBits(hdc, hbm, 0, h, buf, ctypes.byref(bih), 0)
+            return bytearray(buf.raw)
+        try:
+            px = bits(ii.hbmColor) if ii.hbmColor else bytearray(w * h * 4)
+            if not any(px[3::4]):                          # an old-style icon without alpha: use its mask
+                mask = bits(ii.hbmMask)
+                px[3::4] = bytes(0 if m else 255 for m in mask[0::4])
+        finally:
+            user32.ReleaseDC(None, hdc)
+        px[0::4], px[2::4] = px[2::4], px[0::4]             # BGRA → RGBA
+        pb = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(px)), GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4)
+        if w != size:
+            pb = pb.scale_simple(size, size, GdkPixbuf.InterpType.HYPER)
+        return pb
+    except Exception:
+        return None
+    finally:
+        for hbm in (ii.hbmColor, ii.hbmMask):
+            if hbm:
+                gdi32.DeleteObject(hbm)
+        user32.DestroyIcon(hicon)
+
+
+_APP_ICONS = {}
+
+
+def app_icon_cached(lnk, size=48):
+    """A Start Menu shortcut's icon, remembered in memory and on disk (so the Applications view is quick)."""
+    key = (lnk, size)
+    if key in _APP_ICONS:
+        return _APP_ICONS[key]
+    try:
+        stamp = int(os.path.getmtime(lnk))
+    except OSError:
+        stamp = 0
+    cache = CACHE_DIR / "app-icons" / (hashlib.sha1(f"{lnk}|{stamp}|{size}".encode()).hexdigest() + ".png")
+    pb = None
+    if cache.exists():
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file(str(cache))
+        except GLib.Error:
+            pb = None
+    if pb is None:
+        pb = windows_icon_pixbuf(lnk, size)
+        if pb is not None:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                pb.savev(str(cache), "png", [], [])
+            except (GLib.Error, OSError):
+                pass
+    _APP_ICONS[key] = pb
+    return pb
 
 
 def installed_apps():
