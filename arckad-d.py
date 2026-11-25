@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.63.5"
+APP_VERSION = "3.64.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -23590,7 +23590,11 @@ def settings_entries(win):
     button (label, action) · info."""
     E = []
     themes = [(k, f"{i}  {label}") for k, i, label in win.THEMES]
-    E += [("appearance", "Theme", "Colours of the whole app (Ctrl+Shift+D switches).", "choice", themes,
+    E += [("appearance", "Reset appearance to default", "Puts everything on this page back to how Arckad-D looks when "
+           "it's first installed: theme, title bar, sidebar, icons, animations, sounds, glass, accent colour, wallpaper, "
+           "lock screen and logo. Your files, tags and other settings aren't touched.", "button", "↺ Reset…",
+           win.reset_appearance),
+          ("appearance", "Theme", "Colours of the whole app (Ctrl+Shift+D switches).", "choice", themes,
            lambda: win.cfg.get("theme", "midnight"), lambda k: win.theme_items[k].set_active(True)),
           ("appearance", "Title bar", "How many buttons the title bar shows.", "choice",
            [("full", "Full"), ("compact", "Compact"), ("minimal", "Minimal (like Files)"),
@@ -23663,6 +23667,10 @@ def settings_entries(win):
            "Open…", win.people_directory),
           ("org", "Announcement", "Send one notice to all your contacts (or everyone in your organisation).", "button",
            "Send…", win.announce_dialog),
+          ("appearance", "Glass see-through", "How much of your desktop shows through the Glass theme. More "
+           "see-through looks lighter; less is easier to read over busy wallpapers.", "choice",
+           [(k, label) for k, label, _f in GLASS_LEVELS], lambda: win.cfg.get("glass_level", "normal"),
+           lambda k: win.set_glass_level(k)),
           ("appearance", "Icons", "Professional: clean single-colour line icons that match the theme. Colourful: the "
            "phone-style emoji. (Takes effect when Arckad-D starts again.)", "choice",
            [("pro", "Professional (line icons)"), ("emoji", "Colourful (emoji)")],
@@ -23670,8 +23678,12 @@ def settings_entries(win):
            lambda k: win.set_icon_style(k)),
           ("appearance", "Your accent colour", "Pick any colour for buttons and highlights (then choose “Your colour” "
            "as the theme).", "button", "Choose…", win.choose_accent),
+          ("appearance", "Default accent colour", "Back to Arckad-D's own teal for the “Your colour” themes.", "button",
+           "↺ Default", win.reset_accent),
           ("appearance", "Wallpaper behind your files", "A picture behind the file list, softened so names stay easy to "
            "read.", "button", "Choose…", win.choose_wallpaper),
+          ("appearance", "Remove the wallpaper", "No picture behind your files (the theme's own background).", "button",
+           "↺ Remove", win.remove_wallpaper),
           ("access", "Text size", "Makes all the text in Arckad-D bigger.", "choice",
            [(k, label) for k, label, _f in TEXT_SIZES], lambda: win.cfg.get("text_size", "100"),
            lambda k: (win.cfg.__setitem__("text_size", k), write_json(CONFIG_FILE, win.cfg), win.apply_text_size())),
@@ -23687,6 +23699,8 @@ def settings_entries(win):
            "Windows). Done automatically; this refreshes them now.", "button", "Refresh", lambda: win.label_for_readers()),
           ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
            "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
+          ("appearance", "Default lock screen", "Back to the standard lock screen picture.", "button", "↺ Default",
+           win.reset_lock_wallpaper),
           ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
           ("appearance", "Default logo", "Go back to Arckad-D's own logo.", "button", "Use the default", win.reset_logo)]
     E += [("files", "Default file manager", "Open folders from other apps (and browsers' “Show in folder”) here.",
@@ -23793,7 +23807,7 @@ class SettingsWindow(Gtk.Window):
         for key, icon, name, desc in SETTINGS_CATS:
             self.stack.add_named(self._page(f"{icon} {name}", desc, [e for e in self.entries if e[0] == key]), key)
         self.results = Gtk.Box()
-        self.stack.add_named(self.results, "search")
+        self.stack.add_named(self.results, "_results")          # not "search": that's a category's page
         paned.pack_start(self.stack, True, True, 0)
         self.connect("key-press-event", lambda _w, ev: (self.search.grab_focus(), False)[1]
                      if Gdk.keyval_to_unicode(ev.keyval) and not self.search.has_focus() and
@@ -23873,13 +23887,13 @@ class SettingsWindow(Gtk.Window):
             return
         words = q.split()
         hits = [e for e in self.entries if all(w in (e[1] + " " + e[2]).lower() for w in words)]
-        old = self.stack.get_child_by_name("search")
+        old = self.stack.get_child_by_name("_results")
         if old:
             self.stack.remove(old)
         page = self._page(f"Search: {self.search.get_text()}", f"{len(hits)} matching setting"
                           f"{'s' if len(hits) != 1 else ''}", hits, show_cat=True)
-        self.stack.add_named(page, "search")
-        self.stack.set_visible_child_name("search")
+        self.stack.add_named(page, "_results")
+        self.stack.set_visible_child_name("_results")
 
 
 # ---------------------------------------------------------------- main window
@@ -24317,12 +24331,30 @@ def skin_color(key):
     return s[key] if s and key in s else _CLASSIC_COLOURS.get(key, "#888888")
 
 
+# 🪟 How see-through the Glass theme is (Settings → Appearance): every white layer is scaled by the same amount,
+# so the panels keep their balance (sidebar lightest, file list most solid) at every level.
+GLASS_LEVELS = [("solid", "Almost solid", 0.35), ("soft", "Soft", 0.7), ("normal", "Normal", 1.0),
+                ("strong", "Strong", 1.35), ("max", "Very see-through", 1.7)]
+GLASS_LEVEL = "normal"
+
+
+def _glass_scaled(css):
+    k = next((f for key, _l, f in GLASS_LEVELS if key == GLASS_LEVEL), 1.0)
+
+    def one(m):
+        a = float(m.group(1))
+        if a >= 0.9:                                        # highlights and edges stay crisp
+            return m.group(0)
+        return f"rgba(255,255,255,{max(0.04, min(0.98, 1 - (1 - a) * k)):.2f})"
+    return re.sub(r"rgba\(255,255,255,([0-9.]+)\)", one, css)
+
+
 def skin_css(name):
     from string import Template
     s = dict(SKINS[name], emoji_font='"Noto Emoji",' if ICON_FONTS else "")
     css = Template(_SKIN_TEMPLATE).safe_substitute(s)
     if s.get("glass"):
-        css += Template(_GLASS_CSS).safe_substitute(s)
+        css += _glass_scaled(Template(_GLASS_CSS).safe_substitute(s))
     return css.encode()
 
 
@@ -26016,7 +26048,11 @@ GUIDE = [
     ]),
     ("look", "🎨", "Look & feel", "Make Arckad-D yours.", [
         ("🪟", "Glass theme", "Pure white and see-through, like frosted glass. On Windows 11 the desktop behind is "
-         "blurred too.", "Theme button → Glass", "", lambda w: w.theme_items["glass"].set_active(True)),
+         "blurred too. Choose how see-through it is, from almost solid to very see-through.",
+         "Theme button → Glass · Settings → Appearance → Glass see-through", "", lambda w: w.theme_items["glass"].set_active(True)),
+        ("↺", "Back to the defaults", "Remove the wallpaper, go back to the default accent colour, lock screen or logo, "
+         "or reset the whole appearance in one go. Your files and other settings aren't touched.",
+         "Settings → Appearance → Reset appearance to default", "", None),
         ("✒", "Professional icons", "Clean single-colour line icons that match the theme, instead of colourful phone "
          "emoji (switch back any time).", "Settings → Appearance → Icons", "", None),
         ("🎨", "Themes", "Dark and light in many colours, glass, mono, high contrast, or follow the system.",
@@ -26051,6 +26087,8 @@ GUIDE = [
 ]
 
 WHATS_NEW = [
+    ("3.64", "Glass see-through levels, Reset appearance to default (and single resets for wallpaper, accent colour and "
+             "lock screen), real app icons on Windows, and fixes for big Windows file IDs and Settings search"),
     ("3.63", "Professional line icons everywhere, the new Glass theme (white, see-through, blurred on Windows 11), "
              "PDF tools built into the Windows app, optional features on Windows, Move out of the vault"),
     ("3.62", "See and control your PC from the phone (full screen, touch), the phone as a remote for slides, music "
@@ -26952,6 +26990,8 @@ class MainWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title=APP_NAME)
         self.cfg = read_json(CONFIG_FILE, {})
         load_custom_tags(self.cfg)
+        global GLASS_LEVEL
+        GLASS_LEVEL = self.cfg.get("glass_level", "normal")
         self._glass_ok = glass_canvas(self)
         for key, default in (("pinned", []), ("show_hidden", False), ("view", "list"), ("dual", False),
                              ("preview", True), ("autosort", False), ("autosort_background", False),
@@ -27728,6 +27768,87 @@ class MainWindow(Gtk.ApplicationWindow):
             open_default(f"https://github.com/{UPDATE_REPO}/releases/latest")
         d.destroy()
         return False
+
+    # ---------- ↺ back to defaults
+    def remove_wallpaper(self, quiet=False):
+        had = self.cfg.pop("wallpaper", None)
+        write_json(CONFIG_FILE, self.cfg)
+        self.apply_wallpaper()
+        if not quiet:
+            self.flash_all("↺ Wallpaper removed" if had else "There's no wallpaper to remove")
+
+    def reset_accent(self, quiet=False):
+        self.cfg.pop("custom_accent", None)
+        write_json(CONFIG_FILE, self.cfg)
+        make_custom_skins("#14b8a6")
+        if self.cfg.get("theme") in ("dark-custom", "light-custom"):
+            self.apply_theme(self.cfg["theme"])
+        if not quiet:
+            self.flash_all("↺ Accent colour back to the default")
+
+    def reset_lock_wallpaper(self, quiet=False):
+        self.cfg["lock_wallpaper"] = "sunset"
+        write_json(CONFIG_FILE, self.cfg)
+        for ls in _LOCK_SCREENS:
+            try:
+                ls.apply()
+            except Exception:
+                pass
+        if not quiet:
+            self.flash_all("↺ Lock screen back to the default picture")
+
+    def reset_appearance(self):
+        """Everything on the Appearance page back to a fresh install's look. Nothing else is touched."""
+        if not self.confirm("Reset the appearance to default?\n\nTheme, title bar, sidebar, icons, animations, sounds, "
+                            "glass, accent colour, wallpaper, lock screen and logo go back to how Arckad-D looks when "
+                            "it's first installed.\n\nYour files, tags, chats and other settings stay as they are."):
+            return
+        self.theme_items["midnight"].set_active(True)
+        self.set_titlebar_style("full")
+        self.set_sidebar_mode("expanded")
+        self.icons_item.set_active(colour_icons_supported())
+        self.hidden_item.set_active(False)
+        for key, value in (("animations", True), ("trash_anim_speed", "normal"), ("trash_anim_size", "medium"),
+                           ("sounds", True), ("sound_volume", "low")):
+            self.cfg[key] = value
+        self.set_glass_level("normal")
+        self.reset_accent(quiet=True)
+        self.remove_wallpaper(quiet=True)
+        self.reset_lock_wallpaper(quiet=True)
+        try:
+            self.reset_logo()
+        except Exception:
+            pass
+        write_json(CONFIG_FILE, self.cfg)
+        sw = getattr(self, "_settings_win", None)                # show the restored values
+        if sw is not None and sw.get_visible():
+            sw.destroy()
+            GLib.idle_add(lambda: (self.open_settings(), self._settings_open_cat("appearance")) and False)
+        self.flash_all("↺ Appearance is back to the default")
+        if self.cfg.get("icon_style", "pro") != "pro":            # the icons need a new start
+            self.set_icon_style("pro")
+
+    def _settings_open_cat(self, cat):
+        sw = getattr(self, "_settings_win", None)
+        if sw is None:
+            return
+        keys = [k for k, *_r in SETTINGS_CATS]
+        if cat in keys:
+            row = sw.cats.get_row_at_index(keys.index(cat))
+            if row is not None:
+                sw.cats.select_row(row)
+
+    def set_glass_level(self, k):
+        global GLASS_LEVEL
+        if k == GLASS_LEVEL:
+            return
+        GLASS_LEVEL = k
+        self.cfg["glass_level"] = k
+        write_json(CONFIG_FILE, self.cfg)
+        if self.cfg.get("theme") == "glass":
+            self.apply_theme("glass")                       # instantly, no restart
+        else:
+            self.flash_all("Applies to the Glass theme (Theme button → Glass)")
 
     def set_icon_style(self, k):
         if k == self.cfg.get("icon_style", "pro"):
