@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.57.1"
+APP_VERSION = "3.58.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -20381,7 +20381,7 @@ class VaultUI:
         self.win.show_files()
         self.win.new_tab(self.win.left_nb, path)
         self.win.flash_all("🔓 Vault open")
-        self.win.play("vault", at=self.win.pt_pane(None, 0.4), lock=False)
+        self.win.play("vault", at=self.win.pt_center(), lock=False)
 
     def lock_now(self, why="Vault locked"):
         if not VAULT.is_open():
@@ -20393,7 +20393,7 @@ class VaultUI:
         VAULT.close()
         self.bar.hide()
         self.win.flash_all(f"🔐 {why}")
-        self.win.play("vault", at=self.win.pt_pane(None, 0.4), lock=True)
+        self.win.play("vault", at=self.win.pt_center(), lock=True)
 
     def create(self):
         d = Gtk.Dialog(title="Create your private vault", transient_for=self.win, modal=True)
@@ -21758,6 +21758,13 @@ class AnimLayer(Gtk.Box):
             return None
         a = dict(data, t0=time.time(), dur=max(0.05, dur * _trash_anim_scale(self.win)), fn=fn,
                  s=_trash_anim_size(self.win))
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        if W > 100 and H > 100:                               # never half off the edge of the window
+            m = min(a["s"] * 0.9, W / 3, H / 3)
+            for key in ("at", "src", "dst"):
+                pt = a.get(key)
+                if pt and not (key == "src" and a.get("receive")):     # a received plane flies in from outside
+                    a[key] = (max(m, min(W - m, pt[0])), max(m, min(H - m, pt[1])))
         self.anims.append(a)
         if getattr(self, "_tick", None) is None:
             self._tick = GLib.timeout_add(16, self._step)
@@ -22215,6 +22222,283 @@ def _an_view_fold(cr, k, a):
         cr.restore()
 
 
+# ---------------------------------------------------------------- 🔊 Sound effects for the animations
+# Made by Arckad-D itself (no sound files to ship): each one is synthesised once into a small WAV in the cache, at the
+# chosen volume, and played with GStreamer (Ubuntu), paplay / pw-play / aplay, or winsound (Windows).
+SFX_VOLUMES = [("low", "Low", 0.35), ("medium", "Medium", 0.6), ("high", "High", 0.9)]
+_SFX_RATE = 22050
+
+
+def _sfx_noise(rnd):
+    return rnd.random() * 2 - 1
+
+
+def _sfx_render(name):
+    """The samples (floats −1…1) for one sound."""
+    import random as _r
+    rnd = _r.Random(hash(name) & 0xffff)
+    R = _SFX_RATE
+    out = []
+
+    def env(t, a, d):                                         # quick attack, exponential decay
+        return min(1.0, t / a) * math.exp(-t / d) if a > 0 else math.exp(-t / d)
+
+    if name == "crumple":                                     # paper: lots of little crackles, louder in bursts
+        n = int(R * 0.9)
+        out = [0.0] * n
+        lp = 0.0
+        for _ in range(260):
+            at = int(rnd.random() ** 0.8 * n * 0.95)
+            ln = int(R * (0.002 + rnd.random() * 0.012))
+            amp = 0.25 + rnd.random() * 0.75
+            for j in range(ln):
+                if at + j < n:
+                    out[at + j] += _sfx_noise(rnd) * amp * math.exp(-j / (ln * 0.3 + 1))
+        for i in range(n):                                    # soften it a little (paper, not static)
+            lp = lp * 0.55 + out[i] * 0.45
+            out[i] = lp * 0.8 * min(1, i / (R * 0.02)) * (1 - max(0, i - n * 0.8) / (n * 0.2))
+    elif name == "shred":                                     # motor buzz + paper tearing
+        n = int(R * 1.1)
+        lp = 0.0
+        for i in range(n):
+            t = i / R
+            saw = ((t * 118) % 1) * 2 - 1
+            lp = lp * 0.7 + _sfx_noise(rnd) * 0.3
+            e = min(1, t / 0.06) * min(1, (1.1 - t) / 0.15)
+            out.append((saw * 0.35 + lp * 0.9 * (0.6 + 0.4 * math.sin(t * 60))) * e * 0.7)
+    elif name == "zip":                                       # a zipper: fast ticks rising in pitch
+        n = int(R * 0.55)
+        out = [0.0] * n
+        t, gap = 0.0, 0.016
+        while t < 0.5:
+            at = int(t * R)
+            for j in range(int(R * 0.004)):
+                if at + j < n:
+                    out[at + j] += _sfx_noise(rnd) * math.exp(-j / 18) * 0.8
+            t += gap
+            gap = max(0.006, gap * 0.95)
+    elif name == "whoosh":                                    # air: noise swelling and fading, its tone rising
+        n = int(R * 0.5)
+        lp = bp = 0.0
+        for i in range(n):
+            t = i / n
+            k = 0.05 + 0.25 * t
+            lp += k * (_sfx_noise(rnd) - lp)
+            bp += k * (lp - bp)
+            out.append((lp - bp) * 3.2 * math.sin(math.pi * t) ** 1.5)
+    elif name == "clunk":                                     # vault: heavy door thud, then the bolt clicks
+        n = int(R * 0.7)
+        for i in range(n):
+            t = i / R
+            thud = math.sin(2 * math.pi * 62 * t) * env(t, 0.004, 0.09) * 0.9
+            click = _sfx_noise(rnd) * env(t - 0.32, 0.0005, 0.012) * 0.6 if t > 0.32 else 0
+            ring = math.sin(2 * math.pi * 2100 * t) * env(t - 0.32, 0.001, 0.05) * 0.18 if t > 0.32 else 0
+            out.append(thud + click + ring)
+    elif name == "dial":                                      # a safe dial: a few ratchet ticks
+        n = int(R * 0.45)
+        out = [0.0] * n
+        for k in range(7):
+            at = int((0.03 + k * 0.06) * R)
+            for j in range(int(R * 0.01)):
+                if at + j < n:
+                    out[at + j] += (_sfx_noise(rnd) * 0.5 + math.sin(j * 0.9) * 0.4) * math.exp(-j / 25)
+    elif name == "pop":                                       # a soft rising pop
+        n = int(R * 0.16)
+        ph = 0.0
+        for i in range(n):
+            t = i / R
+            ph += 2 * math.pi * (300 + 900 * t / 0.16) / R
+            out.append(math.sin(ph) * env(t, 0.003, 0.05) * 0.7)
+    elif name == "ding":                                      # a little bell
+        n = int(R * 0.9)
+        for i in range(n):
+            t = i / R
+            out.append((math.sin(2 * math.pi * 1318 * t) * 0.5 + math.sin(2 * math.pi * 1976 * t) * 0.25 +
+                        math.sin(2 * math.pi * 2637 * t) * 0.12) * env(t, 0.002, 0.25) * 0.7)
+    elif name == "slide":                                     # paper sliding on a desk
+        n = int(R * 0.35)
+        lp = 0.0
+        for i in range(n):
+            t = i / n
+            lp = lp * 0.82 + _sfx_noise(rnd) * 0.18
+            out.append(lp * 2.2 * math.sin(math.pi * t))
+    elif name == "flap":                                      # a split-flap / page turning
+        n = int(R * 0.25)
+        out = [0.0] * n
+        for at_s, amp in ((0.0, 0.8), (0.06, 0.5), (0.11, 0.3)):
+            at = int(at_s * R)
+            for j in range(int(R * 0.03)):
+                if at + j < n:
+                    out[at + j] += _sfx_noise(rnd) * amp * math.exp(-j / 90)
+    elif name == "thud":                                      # landing softly
+        n = int(R * 0.22)
+        for i in range(n):
+            t = i / R
+            out.append((math.sin(2 * math.pi * 95 * t) * 0.8 + _sfx_noise(rnd) * 0.15) * env(t, 0.002, 0.04))
+    elif name == "tick":                                      # a light tap (pin, tag)
+        n = int(R * 0.12)
+        for i in range(n):
+            t = i / R
+            out.append((math.sin(2 * math.pi * 1500 * t) * 0.4 + _sfx_noise(rnd) * 0.3) * env(t, 0.0005, 0.012))
+    elif name == "chime":                                     # sparkly (batch rename, new folder)
+        n = int(R * 0.7)
+        out = [0.0] * n
+        for k, f in enumerate((1568, 2093, 2637, 3136)):
+            at = int(k * 0.07 * R)
+            for j in range(n - at):
+                t = j / R
+                out[at + j] += math.sin(2 * math.pi * f * t) * env(t, 0.002, 0.12) * 0.22
+    elif name == "blip":                                      # a chat message going out
+        n = int(R * 0.12)
+        ph = 0.0
+        for i in range(n):
+            t = i / R
+            ph += 2 * math.pi * (700 + 500 * t / 0.12) / R
+            out.append(math.sin(ph) * env(t, 0.004, 0.035) * 0.6)
+    elif name == "hum":                                       # magnets pulling together
+        n = int(R * 0.6)
+        for i in range(n):
+            t = i / R
+            f = 140 + 160 * t / 0.6
+            out.append(math.sin(2 * math.pi * f * t) * math.sin(math.pi * t / 0.6) * 0.45)
+    elif name == "swipe":                                     # a quick soft sweep (theme, views)
+        n = int(R * 0.3)
+        lp = 0.0
+        for i in range(n):
+            t = i / n
+            k = 0.08 + 0.4 * t
+            lp += k * (_sfx_noise(rnd) - lp)
+            out.append(lp * 1.4 * math.sin(math.pi * t) ** 2)
+    peak = max((abs(v) for v in out), default=0) or 1.0
+    return [v / peak for v in out]
+
+
+def _sfx_file(name, volume):
+    """The cached WAV for this sound at this volume (made the first time)."""
+    import wave
+    import struct
+    folder = CACHE_DIR / "sounds"
+    path = folder / f"{name}-{int(volume * 100)}-v1.wav"
+    if path.exists():
+        return path
+    folder.mkdir(parents=True, exist_ok=True)
+    samples = _sfx_render(name)
+    tmp = path.with_suffix(".tmp")
+    with wave.open(str(tmp), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(_SFX_RATE)
+        w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, v * volume)) * 32000)) for v in samples))
+    os.replace(tmp, path)
+    return path
+
+
+class SoundFX:
+    """Plays the little sounds, never blocking the app and never more than a few at once."""
+
+    def __init__(self):
+        self.gst = None
+        self.busy = 0
+        self.player = None
+        try:
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gst
+            Gst.init(None)
+            if Gst.ElementFactory.find("playbin"):
+                self.gst = Gst
+        except (ImportError, ValueError):
+            self.gst = None
+        if not self.gst and not IS_WIN:
+            self.player = next((p for p in ("paplay", "pw-play", "aplay") if shutil.which(p)), None)
+
+    def available(self):
+        return IS_WIN or bool(self.gst or self.player)
+
+    def play(self, win, name):
+        if not win.cfg.get("sounds", True) or self.busy >= 4:
+            return
+        vol = next((v for k, _l, v in SFX_VOLUMES if k == win.cfg.get("sound_volume", "medium")), 0.6)
+        self.busy += 1
+
+        def work():
+            try:
+                path = _sfx_file(name, vol)
+                if IS_WIN:
+                    import winsound
+                    winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+                    time.sleep(1.0)
+                elif self.gst:
+                    GLib.idle_add(self._gst_play, path)
+                elif self.player:
+                    args = [self.player, "-q", str(path)] if self.player == "aplay" else [self.player, str(path)]
+                    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+            finally:
+                GLib.idle_add(self._done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self):
+        self.busy = max(0, self.busy - 1)
+        return False
+
+    def _gst_play(self, path):
+        Gst = self.gst
+        try:
+            pb = Gst.ElementFactory.make("playbin", None)
+            pb.set_property("uri", Path(path).as_uri())
+            fake = Gst.ElementFactory.make("fakesink", None)
+            if fake:
+                pb.set_property("video-sink", fake)
+            bus = pb.get_bus()
+            bus.add_signal_watch()
+
+            def on_msg(_bus, msg):
+                if msg.type in (Gst.MessageType.EOS, Gst.MessageType.ERROR):
+                    bus.remove_signal_watch()
+                    pb.set_state(Gst.State.NULL)
+            bus.connect("message", on_msg)
+            pb.set_state(Gst.State.PLAYING)
+            GLib.timeout_add(3000, lambda: pb.set_state(Gst.State.NULL) and False)     # never left running
+        except Exception:
+            pass
+        return False
+
+
+SFX = None
+
+
+def sfx(win, name):
+    global SFX
+    if SFX is None:
+        SFX = SoundFX()
+    SFX.play(win, name)
+
+
+# which sounds go with which animation: [(sound, when, as a fraction of the animation)]
+ANIM_SOUNDS = {"copy": [("slide", 0.1), ("thud", 0.82)], "move": [("slide", 0.15), ("thud", 0.8)],
+               "rename": [("flap", 0.0), ("flap", 0.45)], "ripple": [("chime", 0.0)], "new_folder": [("pop", 0.0)],
+               "duplicate": [("pop", 0.3)], "vault": [("whoosh", 0.05), ("clunk", 0.5), ("dial", 0.65)],
+               "empty_trash": [("crumple", 0.15), ("whoosh", 0.3)], "shred": [("shred", 0.15)],
+               "zip": [("slide", 0.0), ("zip", 0.45)], "unzip": [("zip", 0.0), ("pop", 0.38)],
+               "plane": [("whoosh", 0.3)], "clip": [("whoosh", 0.05), ("tick", 0.78)], "bubble": [("blip", 0.0)],
+               "tag": [("tick", 0.3)], "pin": [("tick", 0.33), ("whoosh", 0.55)], "rules": [("slide", 0.05), ("thud", 0.78)],
+               "download": [("whoosh", 0.0), ("thud", 0.55), ("ding", 0.6)], "magnet": [("hum", 0.1)],
+               "search": [("swipe", 0.0)], "reassemble": [("crumple", 0.0), ("chime", 0.7)],
+               "versions": [("flap", 0.05), ("flap", 0.3), ("flap", 0.55)], "wipe": [("swipe", 0.0)],
+               "fold": [("swipe", 0.0)], "vault_open": [("dial", 0.05), ("clunk", 0.32), ("whoosh", 0.6)]}
+
+
+def anim_sounds(win, kind, dur):
+    """Plays the sounds that go with an animation, timed to its moments."""
+    for name, at in ANIM_SOUNDS.get(kind, []):
+        ms = int(at * dur * 1000)
+        if ms <= 0:
+            sfx(win, name)
+        else:
+            GLib.timeout_add(ms, lambda n=name: sfx(win, n) or False)
+
+
 ANIMS = {"copy": (_an_copy, 0.9), "move": (_an_move, 1.0), "rename": (_an_rename, 0.9), "ripple": (_an_ripple, 1.3),
          "new_folder": (_an_new_folder, 0.9), "duplicate": (_an_duplicate, 0.9), "vault": (_an_vault, 1.7),
          "empty_trash": (_an_empty_trash, 1.7), "shred": (_an_shred, 1.6), "zip": (_an_zip, 1.4),
@@ -22241,6 +22525,9 @@ def fly_to_trash(win, start, count):
     img.show()
     t0 = time.time()
     arc = max(30, min(140, min(sy, ty) - size))                     # stays inside the window
+    sfx(win, "crumple")
+    GLib.timeout_add(int((crumple + hold) * 1000), lambda: sfx(win, "whoosh") or False)
+    GLib.timeout_add(int((crumple + hold + fly) * 1000), lambda: sfx(win, "thud") or False)
 
     def frame():
         t = time.time() - t0
@@ -22291,6 +22578,8 @@ def fly_from_trash(win, count, landed=None):
     t0 = time.time()
     arc = max(30, min(140, min(sy, ty) - size))
     state = {"landed": False}
+    sfx(win, "whoosh")
+    GLib.timeout_add(int(fly * 1000), lambda: (sfx(win, "thud"), sfx(win, "crumple")) and False)
 
     def frame():
         t = time.time() - t0
@@ -22393,6 +22682,16 @@ def settings_entries(win):
            [(k, label) for k, label, _px in TRASH_ANIM_SIZES],
            lambda: win.cfg.get("trash_anim_size", "medium"),
            lambda k: (win.cfg.__setitem__("trash_anim_size", k), write_json(CONFIG_FILE, win.cfg))),
+          ("appearance", "Sound effects", "Little sounds with the animations: paper crumpling, the shredder, the "
+           "zipper, a whoosh, the vault door, a ding when a download lands…", "switch",
+           lambda: win.cfg.get("sounds", True),
+           lambda v: (win.cfg.__setitem__("sounds", v), write_json(CONFIG_FILE, win.cfg), v and sfx(win, "pop"))),
+          ("appearance", "Sound volume", "How loud the sound effects are.", "choice",
+           [(k, label) for k, label, _v in SFX_VOLUMES], lambda: win.cfg.get("sound_volume", "medium"),
+           lambda k: (win.cfg.__setitem__("sound_volume", k), write_json(CONFIG_FILE, win.cfg), sfx(win, "ding"))),
+          ("appearance", "Hear the sounds", "Plays a few of them, one after another.", "button", "▶ Play",
+           lambda: [GLib.timeout_add(i * 650, lambda n=n: sfx(win, n) or False)
+                    for i, n in enumerate(("crumple", "whoosh", "shred", "zip", "clunk", "ding"))]),
           ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
            "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
           ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
@@ -24307,22 +24606,31 @@ class MainWindow(Gtk.ApplicationWindow):
             return
         fn, dur = ANIMS[kind]
         try:
-            self.anim_layer.add(dur, fn, **kw)
+            a = self.anim_layer.add(dur, fn, **kw)
         except Exception:
-            pass
+            a = None
+        if a:
+            anim_sounds(self, "vault_open" if kind == "vault" and not kw.get("lock", True) else kind, a["dur"])
+
+    def pt_center(self, fy=0.45):
+        """The middle of the window's content (for things that belong to the whole app, like the vault)."""
+        a = self.overlay.get_allocation()
+        return (a.width // 2, int(a.height * fy)) if a.width > 50 else (400, 300)
 
     def pt_widget(self, w, fx=0.5, fy=0.5):
         try:
             if w is None or not w.get_mapped():
                 return None
             a = w.get_allocation()
+            if a.width < 40 or a.height < 30:                 # not laid out yet (a brand-new tab): don't trust it
+                return None
             return w.translate_coordinates(self.overlay, int(a.width * fx), int(a.height * fy))
         except Exception:
             return None
 
     def pt_pane(self, pane=None, fy=0.45):
         pane = pane or self.active
-        return self.pt_widget(pane, 0.5, fy) or self.pt_widget(self.overlay, 0.5, fy) or (300, 300)
+        return self.pt_widget(pane, 0.5, fy) or self.pt_center(fy)
 
     def pt_sel(self, pane=None):
         pane = pane or self.active
@@ -26146,7 +26454,7 @@ class MainWindow(Gtk.ApplicationWindow):
         CompareWindow(self, a, b)
 
     def duplicates(self, folder):
-        self.play("magnet", at=self.pt_pane(None, 0.4))
+        self.play("magnet", at=self.pt_center())
         return self._duplicates(folder)
 
     def _duplicates(self, folder):
