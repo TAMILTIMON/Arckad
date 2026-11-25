@@ -93,7 +93,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.53.0"
+APP_VERSION = "3.54.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3775,18 +3775,36 @@ class FilePane(Gtk.Box):
         if gen != self.gen or self.store is None:
             return False
         for r in rows:
-            self.iters[r[C_PATH]] = self.store.append(r)
+            self._add_row(r)
+        self._note_odd_names()
         if done:
             self.set_busy(False)
             self.load_thumbs()
         self.update_status(note)
         return False
 
+    def _add_row(self, r):
+        """A name that isn't valid UTF-8 can't go in the list: skip just that one (and count it), never the rest."""
+        try:
+            self.iters[r[C_PATH]] = self.store.append(r)
+        except (UnicodeEncodeError, TypeError, ValueError):
+            self._odd_names = getattr(self, "_odd_names", 0) + 1
+
+    def _note_odd_names(self):
+        n = getattr(self, "_odd_names", 0)
+        if n:
+            self._odd_names = 0
+            self.flash(f"{n} item{'s' if n != 1 else ''} here {'have names' if n != 1 else 'has a name'} with "
+                       "unreadable characters, so {} not shown. Rename {} in Ubuntu's Files app to see {} here."
+                       .format(*(("they're", "them", "them") if n != 1 else ("it's", "it", "it"))))
+
     def set_rows(self, rows):
         self.store = Gtk.ListStore(*COLUMN_TYPES)
         self.iters = {}
+        self._odd_names = 0
         for r in rows:
-            self.iters[r[C_PATH]] = self.store.append(r)
+            self._add_row(r)
+        self._note_odd_names()
         self.filter = self.store.filter_new()
         self.filter.set_visible_func(self.visible)
         self.sorted = Gtk.TreeModelSort(model=self.filter)
@@ -20424,31 +20442,41 @@ def trash_items():
             continue
         top = t.parent if t.name.startswith(".Trash-") else (t.parent.parent if t.parent.name == ".Trash" else None)
         for n in names:
-            f = files_dir / n
-            orig, when = "", 0.0
             try:
-                for line in (info_dir / (n + ".trashinfo")).read_text(encoding="utf-8", errors="replace").splitlines():
-                    if line.startswith("Path="):
-                        orig = urllib.parse.unquote(line[5:])
-                        if top is not None and not orig.startswith("/"):
-                            orig = str(top / orig)         # other drives keep paths relative to the drive
-                    elif line.startswith("DeletionDate="):
-                        try:
-                            when = time.mktime(time.strptime(line[13:].strip()[:19], "%Y-%m-%dT%H:%M:%S"))
-                        except ValueError:
-                            pass
-            except OSError:
-                pass
-            try:
-                st = os.lstat(f)
-                is_dir = statmod.S_ISDIR(st.st_mode)
-                size = 0 if is_dir else st.st_size
-            except OSError:
-                continue
-            items.append({"key": str(f), "name": n, "orig": orig or n, "when": when or st.st_mtime, "size": size,
-                          "is_dir": is_dir, "info": str(info_dir / (n + ".trashinfo"))})
+                it = _trash_entry(files_dir, info_dir, n, top)
+            except Exception:
+                it = None
+            if it:
+                items.append(it)
     items.sort(key=lambda i: -i["when"])
     return items
+
+
+def _trash_entry(files_dir, info_dir, n, top):
+    """One Trash entry, or None if it can't be read."""
+    f = files_dir / n
+    orig, when = "", 0.0
+    try:
+        for line in (info_dir / (n + ".trashinfo")).read_text(encoding="utf-8", errors="surrogateescape").splitlines():
+            if line.startswith("Path="):                   # keep odd (non-UTF-8) names byte for byte
+                orig = urllib.parse.unquote(line[5:], errors="surrogateescape")
+                if top is not None and not orig.startswith("/"):
+                    orig = str(top / orig)         # other drives keep paths relative to the drive
+            elif line.startswith("DeletionDate="):
+                try:
+                    when = time.mktime(time.strptime(line[13:].strip()[:19], "%Y-%m-%dT%H:%M:%S"))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    try:
+        st = os.lstat(f)
+        is_dir = statmod.S_ISDIR(st.st_mode)
+        size = 0 if is_dir else st.st_size
+    except OSError:
+        return None
+    return {"key": str(f), "name": n, "orig": orig or n, "when": when or st.st_mtime, "size": size,
+            "is_dir": is_dir, "info": str(info_dir / (n + ".trashinfo"))}
 
 
 def trash_restore(item):
@@ -20553,24 +20581,49 @@ class TrashView(Gtk.Box):
 
     def refresh(self):
         def work():
-            items = trash_items()
-            GLib.idle_add(lambda: self._show(items) or False)
+            try:
+                items, err = trash_items(), None
+            except Exception as ex:                        # never a blank page: say what went wrong
+                items, err = [], f"{type(ex).__name__}: {ex}"
+            GLib.idle_add(lambda: self._show(items, err) or False)
         threading.Thread(target=work, daemon=True).start()
 
-    def _show(self, items):
-        self.items = items
+    @staticmethod
+    def _text(s):
+        """File names that aren't valid UTF-8 (common from Windows, old drives, some apps) shown with a �, instead of
+        stopping the whole list."""
+        s = str(s)
+        try:
+            s.encode("utf-8")
+            return s
+        except UnicodeEncodeError:
+            return s.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+    def _show(self, items, err=None):
         self.store.clear()
-        total = 0
-        for i, it in enumerate(items):
+        shown, total = [], 0
+        for it in items:
+            try:
+                when = time.strftime("%d %b %Y, %H:%M", time.localtime(it["when"]))
+            except (OverflowError, OSError, ValueError):
+                when = "—"
+            try:
+                self.store.append(["folder" if it["is_dir"] else "text-x-generic", self._text(it["name"]),
+                                   self._text(short(os.path.dirname(it["orig"]))), when,
+                                   "—" if it["is_dir"] else human_size(it["size"]), float(it["when"]),
+                                   int(it["size"]), len(shown)])
+            except Exception:
+                continue                                   # one odd item never hides the rest
+            shown.append(it)
             total += it["size"]
-            self.store.append(["folder" if it["is_dir"] else "text-x-generic", it["name"],
-                               short(os.path.dirname(it["orig"])), time.strftime("%d %b %Y, %H:%M",
-                                                                                 time.localtime(it["when"])),
-                               "—" if it["is_dir"] else human_size(it["size"]), it["when"], it["size"], i])
+        self.items = items = shown
+        if err:
+            self.hint.set_text("Couldn't read the Trash: " + err)
         self.title.set_markup(f"<span size='x-large'><b>🗑 Trash</b></span>  <small>{len(items)} item"
                               f"{'s' if len(items) != 1 else ''} · {human_size(total)}</small>")
-        self.hint.set_text("Select items and click Restore (or double-click) to put them back where they were." if items
-                           else "The Trash is empty.")
+        if not err:
+            self.hint.set_text("Select items and click Restore (or double-click) to put them back where they were."
+                               if items else "The Trash is empty.")
         self.win.update_trash_count(len(items))
 
     def _selected(self):
@@ -20787,6 +20840,10 @@ def settings_entries(win):
           ("chat", "Chat in its own window", "Team chat as a separate window.", "button", "Open", win.open_chat_window),
           ("chat", "Phone", "Your linked phone's notifications, messages, calls, files and screen.", "button", "Open",
            lambda: win.show_right("phone")),
+          ("chat", "Clipboard sync with the phone", "Copy on the PC, paste on the phone, and the other way round "
+           "(text, while Arckad-D is open on the phone).", "switch",
+           lambda: win.cfg.get("clip_sync", True),
+           lambda v: (win.cfg.__setitem__("clip_sync", v), write_json(CONFIG_FILE, win.cfg))),
           ("chat", "Music player", "The music bar at the bottom of the window.", "button", "On / off", win.music_toggle),
           ("chat", "Send files", "To nearby PCs and phones.", "button", "Send…",
            lambda: win.open_share(win.active.selected_paths() or None, "nearby")),
@@ -21303,6 +21360,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.apply_theme(self.cfg["theme"])
         self._build_ui()
         self.watch_drives()
+        self.setup_clip_sync()
         self.connect("key-press-event", self.on_key)
         self.connect("delete-event", self.on_delete)
         self.connect("set-focus", self.on_set_focus)
@@ -24937,8 +24995,60 @@ class MainWindow(Gtk.ApplicationWindow):
             p.update_info()
         return False
 
+    # ---------- 📋 clipboard sync with the linked phone
+    # Copy on the PC → it's on the phone's clipboard. Copy on the phone → it's on the PC's clipboard the next time
+    # Arckad-D is in front on the phone (Android lets apps read the clipboard only then). Text only, local network,
+    # over the encrypted linked-devices connection; nothing while chat is locked.
+    CLIP_MAX = 100_000
+
+    def setup_clip_sync(self):
+        self._clip_last = None
+        self._clip_busy = False
+        self._clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        self._clip.connect("owner-change", lambda *_: self._clip_check())
+        self.connect("notify::is-active", lambda w, _p: w.is_active() and self._clip_check())
+        GLib.idle_add(lambda: self._clip.request_text(          # what's already there isn't "new": don't send it
+            lambda _c, t: setattr(self, "_clip_last", t) if self._clip_last is None else None) or False)
+
+    def _clip_on(self):
+        return self.cfg.get("clip_sync", True) and not self.chat.is_locked()
+
+    def _clip_check(self):
+        if self._clip_on():
+            self._clip.request_text(self._clip_got)
+        return False
+
+    def _clip_got(self, _clip, text):
+        if not text or len(text) > self.CLIP_MAX or text == self._clip_last or not self._clip_on():
+            return
+        self._clip_last = text
+        L = self.chat.linked
+        inst = L.phone_twin()
+        if not inst or not L.twin_online(inst):           # only while the phone is reachable right now
+            return
+
+        def work():
+            try:
+                L.phone_call("/t/phone/clip", {"text": text}, timeout=8)
+            except Exception:
+                pass                                       # the phone went away: never bother the user about it
+        threading.Thread(target=work, daemon=True).start()
+
+    def _clip_from_phone(self, text):
+        if not isinstance(text, str) or not text or len(text) > self.CLIP_MAX or not self._clip_on():
+            return
+        if text == self._clip_last:
+            return
+        self._clip_last = text                             # so it isn't sent straight back
+        self._clip.set_text(text, -1)
+        self._clip.store()
+        self.flash_all("📋 Copied from your phone: paste it here (Ctrl+V)")
+
     def on_phone_event(self, ev):
-        """The linked phone pushed a notification, a new SMS, or a call state."""
+        """The linked phone pushed a notification, a new SMS, a call state, or its clipboard."""
+        if ev.get("type") == "clip":
+            self._clip_from_phone(ev.get("text"))
+            return False
         self.phone_panel.phone_event(ev)
         locked = self.chat.is_locked()
         if ev.get("type") == "call":

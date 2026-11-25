@@ -2039,6 +2039,12 @@ final class ChatScreen implements MainActivity.Screen, ChatHub.Listener {
             if (!c) PhoneControl.stopIfRunning();          // accessibility off as well
         });
         box.addView(ctl, Ui.matchWrap(a, 10));
+        Switch clip = new Switch(a);
+        clip.setText("📋 Clipboard sync with the PC (copy on one, paste on the other; while Arckad-D is open)");
+        clip.setTextColor(Ui.TEXT);
+        clip.setChecked(ClipSync.on(a));
+        clip.setOnCheckedChangeListener((v, c) -> ClipSync.set(a, c));
+        box.addView(clip, Ui.matchWrap(a, 10));
         box.addView(Ui.button(a, (PhoneControl.instance != null ? "✓ " : "") + "Turn on Arckad-D in Accessibility (needed for control)",
                 PhoneControl.instance == null, v -> a.startActivity(new Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS))),
                 Ui.matchWrap(a, 6));

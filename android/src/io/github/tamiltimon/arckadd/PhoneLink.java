@@ -103,6 +103,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
                 return files(req);
             case "/t/phone/read":
                 return read(req);
+            case "/t/phone/clip":
+                return ClipSync.fromPc(c, req);
             default:
                 return err("unknown");
         }
@@ -119,7 +121,8 @@ final class PhoneLink implements ChatEngine.PhoneHandler {
         return new Obj().putOpt("ok", true).putOpt("battery", level < 0 ? null : level * 100 / Math.max(1, scale))
                 .putOpt("charging", plugged != 0).putOpt("notif_ok", notifAllowed()).putOpt("sms_ok", smsAllowed())
                 .putOpt("calls_ok", callsAllowed()).putOpt("control_ok", PhoneControl.instance != null)
-                .putOpt("control_on", Ui.prefs(c).getBoolean("phone_control", false));
+                .putOpt("control_on", Ui.prefs(c).getBoolean("phone_control", false))
+                .putOpt("clip_on", ClipSync.on(c));
     }
 
     // ---------- notifications

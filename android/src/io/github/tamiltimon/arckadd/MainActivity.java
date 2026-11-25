@@ -298,6 +298,23 @@ public class MainActivity extends Activity implements Net.NearbyUi {
         super.onResume();
         if (!ready && hasStorage()) start(getIntent());
         else if (ready && current == files) files.reload();
+        android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (cm != null) cm.addPrimaryClipChangedListener(clipWatch);   // copied inside Arckad-D: send it too
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        android.content.ClipboardManager cm = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        if (cm != null) cm.removePrimaryClipChangedListener(clipWatch);
+    }
+
+    private final android.content.ClipboardManager.OnPrimaryClipChangedListener clipWatch = () -> ClipSync.check(this);
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && ready) ClipSync.check(this);    // 📋 copied in another app: to the PC now (needs focus)
     }
 
     @Override
