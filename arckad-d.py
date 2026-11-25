@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.64.0"
+APP_VERSION = "3.64.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -25132,6 +25132,29 @@ TEAM = TeamFolders()
 TOOLS_DIR = Path(os.environ.get("LOCALAPPDATA") or GLib.get_user_data_dir()) / "Arckad-D" / "tools"
 
 
+def winget_find(winget, name):
+    """Asks winget for the exact package names matching a program (its names change now and then)."""
+    try:
+        r = subprocess.run([winget, "search", "--name", name, "--accept-source-agreements", "--disable-interactivity"],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return parse_winget_ids(r.stdout or "", name)
+
+
+def parse_winget_ids(text, name):
+    """The package IDs in winget's search table that are this program (its name is in the ID). Every word of a row is
+    checked: when an ID is long, winget leaves just one space before the version."""
+    out, word = [], re.sub(r"[^a-z0-9]", "", name.lower())
+    for line in text.splitlines():
+        for tok in line.split():
+            if re.fullmatch(r"[A-Za-z0-9][\w+-]*(\.[\w+-]+)+", tok) and not re.fullmatch(r"[\d.]+", tok) \
+                    and word in re.sub(r"[^a-z0-9]", "", tok.lower()) and tok not in out:
+                out.append(tok)
+    return out[:4]
+
+
 def find_tool(name):
     """A helper program by name: on the PATH, or (Windows) wherever winget / its installer put it."""
     hit = shutil.which(name)
@@ -33003,12 +33026,15 @@ class MainWindow(Gtk.ApplicationWindow):
     # ---------- 🧩 optional features on Windows: installed with Windows' own installer (winget)
     WIN_FEATURES = [("ffmpeg", "Gyan.FFmpeg", "FFmpeg", "Media tools: video to MP3, convert and shrink videos, GIFs",
                      "https://www.gyan.dev/ffmpeg/builds/"),
-                    ("gswin64c", "ArtifexSoftware.GhostScript", "Ghostscript", "PDF tools: make PDFs much smaller",
+                    ("gswin64c", "ArtifexSoftware.Ghostscript", "Ghostscript", "PDF tools: make PDFs much smaller",
                      "https://ghostscript.com/releases/gsdnld.html"),
                     ("qpdf", "QPDF.QPDF", "qpdf", "PDF tools: faster merge, split, rotate (they already work without it)",
                      "https://github.com/qpdf/qpdf/releases")]
 
     def windows_features_dialog(self):
+        return self._windows_features_dialog()
+
+    def _windows_features_dialog(self):
         d = Gtk.Dialog(title="Install optional features", transient_for=self, modal=False)
         d.add_button("Close", Gtk.ResponseType.CLOSE)
         d.set_default_size(620, 360)
@@ -33041,7 +33067,8 @@ class MainWindow(Gtk.ApplicationWindow):
                 if not have:
                     b = Gtk.Button(label="Install" if winget else "Download page")
                     b.get_style_context().add_class("suggested-action")
-                    b.connect("clicked", lambda btn, wid=wid, name=name, url=url: install(btn, wid, name, url))
+                    b._install_cb = lambda btn, wid=wid, name=name, url=url: install(btn, wid, name, url)
+                    b.connect("clicked", b._install_cb)
                     row.add(b)
                 r = Gtk.ListBoxRow()
                 r.add(row)
@@ -33056,16 +33083,46 @@ class MainWindow(Gtk.ApplicationWindow):
             log.set_text(f"Installing {name}… (this can take a minute)")
 
             def work():
+                ok, msg = False, ""
                 try:
-                    r = subprocess.run([winget, "install", "--id", wid, "-e", "--silent", "--accept-package-agreements",
-                                        "--accept-source-agreements"], capture_output=True, text=True, timeout=900,
-                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    ok = r.returncode == 0 or "already installed" in (r.stdout or "").lower()
-                    msg = f"✓ {name} installed" if ok else f"✗ {name}: " + ((r.stdout or r.stderr or "").strip()
-                                                                         .splitlines() or ["failed"])[-1][:200]
+                    tried = []
+                    for pid in [wid, wid.lower()] + winget_find(winget, name):      # known name, then ask winget
+                        if pid.lower() in tried:
+                            continue
+                        tried.append(pid.lower())
+                        GLib.idle_add(lambda p_=pid: log.set_text(f"Installing {name} ({p_})… (this can take a minute)")
+                                      and False)
+                        r = subprocess.run([winget, "install", "--id", pid, "-e", "--silent",
+                                            "--accept-package-agreements", "--accept-source-agreements",
+                                            "--disable-interactivity"], capture_output=True, text=True,
+                                           encoding="utf-8", errors="replace", timeout=900,
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                        out = (r.stdout or "") + (r.stderr or "")
+                        if r.returncode == 0 or "already installed" in out.lower():
+                            ok = True
+                            break
+                        lines = [x.strip() for x in out.splitlines() if x.strip() and not set(x.strip()) <= set("-\\|/█▒ ")]
+                        msg = lines[-1][:200] if lines else "failed"
+                        if "no package found" not in out.lower():
+                            break                                   # a real failure (not just a wrong name)
                 except (OSError, subprocess.SubprocessError) as ex:
-                    msg = f"✗ {name}: {ex}"
-                GLib.idle_add(lambda: (log.set_text(msg), fill()) and False)
+                    msg = str(ex)
+                text = f"✓ {name} installed" if ok else \
+                    f"✗ {name}: {msg.rstrip('.')}. You can get it from its website instead (Download page)."
+
+                def show():
+                    log.set_text(text)
+                    fill()
+                    if not ok:                                  # the website, so the user is never stuck
+                        btn.set_label("Download page")
+                        btn.set_sensitive(True)
+                        try:
+                            btn.disconnect_by_func(btn._install_cb)
+                        except Exception:
+                            pass
+                        btn.connect("clicked", lambda *_: Gtk.show_uri_on_window(self, url, Gdk.CURRENT_TIME))
+                    return False
+                GLib.idle_add(show)
             threading.Thread(target=work, daemon=True).start()
         fill()
         d.connect("response", lambda dlg, _r: dlg.destroy())
