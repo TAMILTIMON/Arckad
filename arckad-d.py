@@ -97,7 +97,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.58.2"
+APP_VERSION = "3.59.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3224,6 +3224,9 @@ class FilePane(Gtk.Box):
         flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=8,
                            column_spacing=4, row_spacing=4, border_width=4, homogeneous=False)
         self.search = Gtk.SearchEntry(placeholder_text="Filter name or note (Ctrl+F)", width_chars=12)
+        self.save_search_btn = Gtk.Button(label="🔖", relief=Gtk.ReliefStyle.NONE)
+        self.save_search_btn.set_tooltip_text("Save this search to the sidebar")
+        self.save_search_btn.connect("clicked", lambda *_: self.win.save_search())
         self.search.connect("stop-search", lambda *_: (self.search.set_text(""),
                                                        (self.icons if self.view_mode == "grid" else self.tree).grab_focus()))
         self.search.connect("search-changed", self.on_filters_changed)
@@ -3253,7 +3256,8 @@ class FilePane(Gtk.Box):
         self.scope_combo.set_tooltip_text("Where to look: this folder only, every folder inside it, "
                                           "or your whole home folder (instant, uses the index)")
         self.scope_combo.connect("changed", self.on_filters_changed)
-        for w in (self.search, self.kind_combo, self.ext_entry, self.date_combo, self.range_btn, self.scope_combo):
+        for w in (self.search, self.kind_combo, self.ext_entry, self.date_combo, self.range_btn, self.scope_combo,
+                  self.save_search_btn):
             flow.add(w)
         for child in flow.get_children():
             child.set_can_focus(False)
@@ -3295,6 +3299,8 @@ class FilePane(Gtk.Box):
         # thumbnail grid view
         self.icons = Gtk.IconView(item_width=110, column_spacing=4, row_spacing=4, margin=8)
         self.icons.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self.icons.get_style_context().add_class("fm-files")
+        self.tree.get_style_context().add_class("fm-files")
         pix_r = Gtk.CellRendererPixbuf()
         self.tile_renderer = pix_r
         pix_r.set_property("stock-size", icon_size("tile") if ICON_STYLE["colour"] else Gtk.IconSize.DIALOG)
@@ -4251,6 +4257,7 @@ class FilePane(Gtk.Box):
             menu.append(Gtk.SeparatorMenuItem())
             add("Move to Trash (Delete)", lambda: win.trash(self, paths))
             add("Delete permanently (Shift+Delete)", lambda: win.delete_forever(self, paths))
+            add("🔏 Secure delete (can't be recovered)…", lambda: win.secure_delete(self, paths))
         else:
             add("Paste (Ctrl+V)", lambda: win.paste_into(self), in_folder)
             add("New folder… (Ctrl+Shift+N)", lambda: win.new_folder(self), in_folder)
@@ -4421,6 +4428,26 @@ class PreviewPanel(Gtk.ScrolledWindow):
         frame.add(text_scroll)
         self.visual.add_named(frame, "text")
         box.add(self.visual)
+        self.edit_bar = Gtk.Box(spacing=6)                    # 📝 quick edit for text and code files
+        self.edit_btn = Gtk.Button(label="✏ Edit")
+        self.edit_btn.set_tooltip_text("Edit this file right here")
+        self.edit_btn.connect("clicked", lambda *_: self.start_edit())
+        self.save_btn = Gtk.Button(label="💾 Save")
+        self.save_btn.get_style_context().add_class("suggested-action")
+        self.save_btn.set_tooltip_text("Save (Ctrl+S)")
+        self.save_btn.connect("clicked", lambda *_: self.save_edit())
+        self.cancel_edit_btn = Gtk.Button(label="Cancel")
+        self.cancel_edit_btn.connect("clicked", lambda *_: self.end_edit(revert=True))
+        self.edit_note = Gtk.Label(xalign=0, hexpand=True)
+        self.edit_note.get_style_context().add_class("dim-label")
+        for wdg in (self.edit_btn, self.save_btn, self.cancel_edit_btn):
+            self.edit_bar.add(wdg)
+        self.edit_bar.pack_start(self.edit_note, True, True, 0)
+        self.edit_bar.set_no_show_all(True)
+        box.add(self.edit_bar)
+        self.editing, self.edit_cut = False, False
+        self.textview.get_buffer().connect("changed", lambda *_: self.editing and self._mark_dirty())
+        self.textview.connect("key-press-event", self._edit_key)
 
         self.name = Gtk.Label(xalign=0, wrap=True, selectable=True)
         self.name.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -4500,8 +4527,100 @@ class PreviewPanel(Gtk.ScrolledWindow):
         self.multi.set_markup(f"<big><b>{len(paths)} items selected</b></big>\n{human_size(size)} in files{extra}")
         self.pages.set_visible_child_name("multi")
 
+    # ---------- 📝 quick edit
+    def start_edit(self):
+        if not self.path or self.edit_cut:
+            return
+        self.editing, self.dirty = True, False
+        self.textview.set_editable(True)
+        self.textview.set_cursor_visible(True)
+        self.textview.grab_focus()
+        self._edit_buttons()
+
+    def _mark_dirty(self):
+        if not self.dirty:
+            self.dirty = True
+            self._edit_buttons()
+
+    def _edit_buttons(self):
+        for wdg in (self.edit_btn, self.save_btn, self.cancel_edit_btn, self.edit_note):
+            wdg.set_no_show_all(False)
+        self.edit_btn.set_visible(not self.editing)
+        self.save_btn.set_visible(self.editing)
+        self.save_btn.set_sensitive(self.editing and getattr(self, "dirty", False))
+        self.cancel_edit_btn.set_visible(self.editing)
+        self.edit_note.set_markup("<small>editing · unsaved</small>" if self.editing and self.dirty else
+                                  "<small>editing</small>" if self.editing else
+                                  ("<small>too big to edit here</small>" if self.edit_cut else ""))
+        self.edit_bar.set_no_show_all(False)
+        self.edit_bar.show()
+
+    def _edit_key(self, _w, ev):
+        if self.editing and ev.state & Gdk.ModifierType.CONTROL_MASK and Gdk.keyval_name(ev.keyval) in ("s", "S"):
+            self.save_edit()
+            return True
+        if self.editing and Gdk.keyval_name(ev.keyval) == "Escape" and not getattr(self, "dirty", False):
+            self.end_edit()
+            return True
+        return False
+
+    def save_edit(self):
+        if not (self.editing and self.path):
+            return
+        buf = self.textview.get_buffer()
+        text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+        path = self.path
+        try:
+            VERSIONS.snapshot(path) if hasattr(VERSIONS, "snapshot") else None      # the old text stays in history
+        except Exception:
+            pass
+        try:
+            raw = open(path, "rb").read(4096)
+            crlf = b"\r\n" in raw
+            data = text.replace("\r\n", "\n")
+            if crlf:
+                data = data.replace("\n", "\r\n")                                    # keep the file's line endings
+            tmp = path + ".arckad-tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(data)
+            try:
+                shutil.copymode(path, tmp)
+            except OSError:
+                pass
+            os.replace(tmp, path)
+        except OSError as ex:
+            return self.win.error(f"Couldn't save {os.path.basename(path)}: {ex.strerror or ex}")
+        self.dirty = False
+        self._edit_buttons()
+        self.win.flash_all(f"💾 Saved {os.path.basename(path)}")
+        self.win.refresh_all()
+
+    def end_edit(self, revert=False):
+        if revert and getattr(self, "dirty", False) and \
+                not self.win.confirm("Throw away your changes to this file?"):
+            return
+        self.editing, self.dirty = False, False
+        self.textview.set_editable(False)
+        self.textview.set_cursor_visible(False)
+        if revert and self.path:
+            p, self.path = self.path, None
+            self.show_file(p)
+        else:
+            self._edit_buttons()
+
+    def leave_edit(self):
+        """Before showing another file: offer to save unsaved changes."""
+        if self.editing and getattr(self, "dirty", False) and self.path:
+            if self.win.confirm(f"Save your changes to {os.path.basename(self.path)}?"):
+                self.save_edit()
+        if self.editing:
+            self.editing, self.dirty = False, False
+            self.textview.set_editable(False)
+            self.textview.set_cursor_visible(False)
+
     def show_file(self, path):
         if path != self.path:
+            self.leave_edit()
             self.flush_note()
         self.path = path
         self.token += 1
@@ -4525,6 +4644,7 @@ class PreviewPanel(Gtk.ScrolledWindow):
         self.image.set_pixel_size(128)
         self.visual.set_visible_child_name("image")
         self.pages.set_visible_child_name("file")
+        self.edit_bar.hide()
 
         def work():
             kind, data, extra = self.build_preview(path, is_dir)
@@ -4557,6 +4677,7 @@ class PreviewPanel(Gtk.ScrolledWindow):
                 text, cut = read_text(path, 60_000)
                 lines = len(text.splitlines())
                 extra.append(("Lines", f"{lines:,}{'+' if cut else ''}"))
+                self.edit_cut = bool(cut) or not os.access(path, os.W_OK)
                 return "text", text, extra
             return "pixbuf", cached_thumbnail(path, self.WIDTH), extra
         except (OSError, GLib.Error):
@@ -4571,6 +4692,9 @@ class PreviewPanel(Gtk.ScrolledWindow):
         elif kind == "text":
             self.textview.get_buffer().set_text(data)
             self.visual.set_visible_child_name("text")
+            self.editing, self.dirty = False, False
+            self._edit_buttons()                              # ✏ Edit (or why it can't be edited)
+            self.edit_btn.set_sensitive(not self.edit_cut)
         if extra:
             self.add_info(extra)
         return False
@@ -5230,6 +5354,25 @@ class DuplicatesWindow(Gtk.Window):
 # ---------------------------------------------------------------- Quick Share (local network)
 
 SHARE_MINUTES = [1, 2, 5, 10]
+LINK_MINUTES = [1, 2, 5, 10, 30, 60, 240, 1440]          # a shared link: up to a day
+
+
+def minutes_label(m):
+    return f"{m} min" if m < 60 else ("1 day" if m == 1440 else f"{m // 60} hour{'s' if m >= 120 else ''}")
+
+
+def share_login_page(wrong=False, wait=0):
+    msg = (f"<p class='sub' style='color:#d33'>Too many wrong tries. Wait {wait} seconds.</p>" if wait else
+           "<p class='sub' style='color:#d33'>That password isn't right.</p>" if wrong else "")
+    return (f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,"
+            f"initial-scale=1'><title>Password needed</title><style>{PAGE_CSS}"
+            "form{display:flex;gap:8px;margin-top:14px}input{flex:1;padding:12px;border-radius:10px;border:1px solid "
+            "var(--line);background:var(--card);color:var(--text);font-size:16px}button{padding:12px 18px;border:0;"
+            "border-radius:10px;background:var(--accent);color:#fff;font-weight:600;font-size:16px}</style></head>"
+            "<body><main><div class='ended'><div class='big'>🔒</div><h1>These files are protected</h1>"
+            "<p class='sub'>Enter the password the sender gave you.</p>"
+            f"{msg}<form method='post'><input type='password' name='pw' autofocus placeholder='Password'>"
+            "<button>Open</button></form></div></main></body></html>")
 KIND_EMOJI = {"Images": "🖼️", "Documents": "📄", "Spreadsheets": "📊", "Presentations": "📽️",
               "Videos": "🎬", "Audio": "🎵", "Archives": "🗜️", "Code": "💻", "Installers": "📦",
               "Others": "📎", "Folder": "📁"}
@@ -5384,6 +5527,42 @@ def make_share_handler(share):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
 
+        def do_POST(self):
+            """The password form."""
+            try:
+                url = urllib.parse.urlsplit(self.path)
+                parts = [p for p in url.path.split("/") if p]
+                client = self.client_address[0]
+                if not parts or not secrets.compare_digest(parts[0], share.token) or not share.active():
+                    return self._send(404, page_message("Link not found", "Check the link and try again."))
+                n = min(int(self.headers.get("Content-Length") or 0), 4096)
+                pw = (urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace")).get("pw") or [""])[0]
+                wait = share.locked_for(client)
+                if wait:
+                    return self._send(429, share_login_page(wait=wait))
+                if not share.password or not secrets.compare_digest(pw.encode(), share.password.encode()):
+                    share.failed(client)
+                    share.event(client, "typed a wrong password")
+                    return self._send(401, share_login_page(wrong=True, wait=share.locked_for(client)))
+                share.event(client, "entered the password")
+                self.send_response(303)
+                self.send_header("Set-Cookie", f"ak{share.token}={share.pass_key()}; Path=/{share.token}/; HttpOnly; "
+                                               "SameSite=Strict")
+                self.send_header("Location", f"/{share.token}/")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, ValueError):
+                pass
+
+        def _authed(self):
+            if not share.password:
+                return True
+            jar = self.headers.get("Cookie") or ""
+            for part in jar.split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == f"ak{share.token}" and secrets.compare_digest(v, share.pass_key()):
+                    return True
+            return False
+
         def _route(self):
             url = urllib.parse.urlsplit(self.path)
             parts = [p for p in url.path.split("/") if p]
@@ -5392,6 +5571,8 @@ def make_share_handler(share):
                 return self._send(404, page_message("Link not found", "Check the link and try again."))
             if not share.active():
                 return self._send(410, page_message("This share has ended", "Ask the sender to share again."))
+            if not self._authed():                            # 🔒 nothing is shown or sent without the password
+                return self._send(401, share_login_page(wait=share.locked_for(client)))
             if len(parts) == 1:
                 if not url.path.endswith("/"):
                     self.send_response(301)
@@ -5463,6 +5644,24 @@ class QuickShare:
         self.port = 0
         self.expires = 0
         self.on_event = on_event
+        self.password = ""                                    # 🔒 optional: asked for before anything is shown
+        self.fails = {}                                       # client → (wrong tries, locked until)
+
+    def pass_key(self):
+        return hmacmod.new(self.password.encode(), self.token.encode(), hashlib.sha256).hexdigest()[:32]
+
+    def failed(self, client):
+        n, _until = self.fails.get(client, (0, 0))
+        n += 1
+        self.fails[client] = (n, time.time() + 60 if n >= 5 else 0)       # 5 wrong tries: a one-minute wait
+
+    def locked_for(self, client):
+        n, until = self.fails.get(client, (0, 0))
+        left = int(until - time.time())
+        if left <= 0 and n >= 5:
+            self.fails[client] = (0, 0)
+            return 0
+        return max(0, left)
 
     def snapshot(self):
         with self.lock:
@@ -5497,12 +5696,13 @@ class QuickShare:
             raise OSError("No free network port")
         self.server.daemon_threads = True
         self.port = self.server.server_address[1]
-        self.expires = time.time() + min(10, max(1, minutes)) * 60
+        self.expires = time.time() + min(1440, max(1, minutes)) * 60
+        self.fails = {}
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def extend(self, minutes):
         if self.server:
-            self.expires = time.time() + min(10, max(1, minutes)) * 60
+            self.expires = time.time() + min(1440, max(1, minutes)) * 60
 
     def stop(self):
         srv, self.server = self.server, None
@@ -6525,15 +6725,26 @@ class ShareWindow(Gtk.Window):
         t.set_markup("<b>Share as a link</b>")
         top.pack_start(t, True, True, 0)
         self.minutes = Gtk.ComboBoxText()
-        for m in SHARE_MINUTES:
-            self.minutes.append_text(f"{m} min")
-        self.minutes.set_active(SHARE_MINUTES.index(self.win.cfg.get("share_minutes", 10)))
+        for m in LINK_MINUTES:
+            self.minutes.append_text(minutes_label(m))
+        want = self.win.cfg.get("share_minutes", 10)
+        self.minutes.set_active(LINK_MINUTES.index(want) if want in LINK_MINUTES else 3)
+        self.minutes.set_tooltip_text("How long the link works")
         self.minutes.connect("changed", self.on_minutes_changed)
         top.add(self.minutes)
         self.switch = Gtk.Switch(valign=Gtk.Align.CENTER)
         self.switch.connect("state-set", self.on_switch)
         top.add(self.switch)
         page.add(top)
+        pwrow = Gtk.Box(spacing=8)
+        pwrow.add(Gtk.Label(label="🔒 Password"))
+        self.pw_entry = Gtk.Entry(visibility=False, hexpand=True, placeholder_text="optional: people must type it to see the files")
+        self.pw_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, "view-reveal-symbolic")
+        self.pw_entry.set_icon_tooltip_text(Gtk.EntryIconPosition.SECONDARY, "Show / hide")
+        self.pw_entry.connect("icon-press", lambda e, *_: e.set_visibility(not e.get_visibility()))
+        self.pw_entry.connect("changed", self.on_password_changed)
+        pwrow.pack_start(self.pw_entry, True, True, 0)
+        page.add(pwrow)
         self.state = Gtk.Label(xalign=0, wrap=True)
         page.add(self.state)
         self.link_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -6613,8 +6824,16 @@ class ShareWindow(Gtk.Window):
                           f"{NEARBY_UDP_PORT}?")
 
     # ---------- link sharing on / off
+    def on_password_changed(self, entry):
+        was = bool(self.share.password)
+        self.share.password = entry.get_text()
+        if self.share.active() and (was or self.share.password):
+            self.log_line("🔒 Password changed: people who had opened the link must type the new one"
+                          if self.share.password else "🔓 Password removed: anyone with the link can open it")
+        self.update_state()
+
     def on_minutes_changed(self, combo):
-        minutes = SHARE_MINUTES[combo.get_active()]
+        minutes = LINK_MINUTES[combo.get_active()]
         self.win.cfg["share_minutes"] = minutes
         if self.share.active():
             self.share.extend(minutes)
@@ -6627,7 +6846,8 @@ class ShareWindow(Gtk.Window):
                 self.win.info("Add at least one file first.")
                 GLib.idle_add(lambda: switch.set_active(False) or False)
                 return True
-            if not self.win.start_share(SHARE_MINUTES[self.minutes.get_active()]):
+            self.share.password = self.pw_entry.get_text()
+            if not self.win.start_share(LINK_MINUTES[self.minutes.get_active()]):
                 GLib.idle_add(lambda: switch.set_active(False) or False)
                 return True
         elif not on and self.share.active():
@@ -19074,7 +19294,9 @@ class ArckadPro:
         btns = Gtk.Box(spacing=8)
         for label, cb in (("💾 Save organisation file…", self.save_file),
                           ("How to install it on office PCs…", self.it_help),
-                          ("🌐 Find people in other networks…", self.networks_dialog)) + \
+                          ("🌐 Find people in other networks…", self.networks_dialog),
+                          ("📢 Announcement to everyone…", self.win.announce_dialog),
+                          ("👥 Directory…", self.win.people_directory)) + \
                          ((("🔑 Issue a Pro licence…", self.issue_dialog),) if owner_key() else ()):
             b = Gtk.Button(label=label)
             b.connect("clicked", lambda _b, cb=cb: cb())
@@ -21249,6 +21471,9 @@ def _paper_svg(t, angle, count, size, seed=7):
 TRASH_ANIM_SPEEDS = [("slow", "🐢 Slow", 1.7), ("normal", "Normal", 1.0), ("fast", "⚡ Fast", 0.5)]
 
 
+TEXT_SIZES = [("100", "Normal", 1.0), ("115", "Larger", 1.15), ("130", "Large", 1.3), ("150", "Extra large", 1.5)]
+
+
 # How big the paper is (Settings → Appearance → Trash animation size), in pixels
 TRASH_ANIM_SIZES = [("small", "Small", 48), ("medium", "Medium", 72), ("large", "Large", 104), ("huge", "Extra large", 144)]
 
@@ -22844,6 +23069,7 @@ SETTINGS_CATS = [("appearance", "🎨", "Appearance", "How Arckad-D looks"),
                  ("safety", "🛡", "Safety & history", "Versions, the vault, the Trash and journeys"),
                  ("chat", "💬", "Chat, phone & sharing", "Team chat, your phone and sending files"),
                  ("org", "🏢", "Organisation", "Your organisation and Arckad-D Pro"),
+                 ("access", "♿", "Accessibility", "Text size, high contrast, calm motion and screen readers"),
                  ("system", "⚙", "Updates & system", "Updates, extras, shortcuts and version")]
 
 _SETTINGS_CSS = b"""
@@ -22893,6 +23119,27 @@ def settings_entries(win):
           ("appearance", "Hear the sounds", "Plays a few of them, one after another.", "button", "▶ Play",
            lambda: [GLib.timeout_add(i * 650, lambda n=n: sfx(win, n) or False)
                     for i, n in enumerate(("crumple", "thud", "zip", "clunk", "ding"))]),
+          ("org", "People directory", "Everyone's work card: designation, department, extension, email.", "button",
+           "Open…", win.people_directory),
+          ("org", "Announcement", "Send one notice to all your contacts (or everyone in your organisation).", "button",
+           "Send…", win.announce_dialog),
+          ("appearance", "Your accent colour", "Pick any colour for buttons and highlights (then choose “Your colour” "
+           "as the theme).", "button", "Choose…", win.choose_accent),
+          ("appearance", "Wallpaper behind your files", "A picture behind the file list, softened so names stay easy to "
+           "read.", "button", "Choose…", win.choose_wallpaper),
+          ("access", "Text size", "Makes all the text in Arckad-D bigger.", "choice",
+           [(k, label) for k, label, _f in TEXT_SIZES], lambda: win.cfg.get("text_size", "100"),
+           lambda k: (win.cfg.__setitem__("text_size", k), write_json(CONFIG_FILE, win.cfg), win.apply_text_size())),
+          ("access", "High contrast", "Pure black and white with bright yellow highlights and strong borders.", "switch",
+           lambda: win.cfg.get("theme") == "contrast", lambda v: win.set_high_contrast(v)),
+          ("access", "Calm motion", "Turns off the animations (paper ball, flying pages and so on).", "switch",
+           lambda: not win.cfg.get("animations", True),
+           lambda v: (win.cfg.__setitem__("animations", not v), write_json(CONFIG_FILE, win.cfg))),
+          ("access", "Sounds", "The little sound effects with the animations.", "switch",
+           lambda: win.cfg.get("sounds", True),
+           lambda v: (win.cfg.__setitem__("sounds", v), write_json(CONFIG_FILE, win.cfg))),
+          ("access", "Screen reader names", "Every button gets a spoken name (for Orca on Ubuntu, Narrator on "
+           "Windows). Done automatically; this refreshes them now.", "button", "Refresh", lambda: win.label_for_readers()),
           ("appearance", "Lock screen wallpaper", "The picture behind the clock when chat is locked.", "button",
            "Choose…", lambda: _LOCK_SCREENS[0].choose() if _LOCK_SCREENS else None),
           ("appearance", "Logo", "Arckad-D's logo in the title bar and menus.", "button", "Change logo…", win.choose_logo),
@@ -23126,6 +23373,7 @@ SHORTCUTS = [
     ("⚙ Other", [
         (("F4",), "Open a terminal here" if not IS_WIN else "Open a Command Prompt here"),
         (("Ctrl", ","), "Settings"),
+        (("Ctrl", "K"), "Command palette: type any action"),
         ("Send / Receive", "Share files with nearby PCs, phones and browsers"),
     ]),
 ]
@@ -23294,6 +23542,28 @@ for _key, _icon, _name, _dark, _light in ACCENTS:
         SKINS[f"dark-{_key}"] = _accent_skin("midnight", _dark)
         SKINS[f"light-{_key}"] = _accent_skin("snow", _light)
 
+
+def make_custom_skins(colour):
+    """🎨 Your own accent colour, in a dark and a light version."""
+    SKINS["dark-custom"] = _accent_skin("midnight", colour)
+    SKINS["light-custom"] = _accent_skin("snow", _mix(colour, "#000000", 0.12))
+
+
+make_custom_skins("#14b8a6")
+
+
+def make_contrast_skin():
+    """♿ High contrast: pure black, white text, bright yellow highlights, strong borders."""
+    s = _accent_skin("midnight", "#ffe500")
+    s.update(bg="#000000", bg2="#000000", surface="#000000", surface_hi="#1a1a1a", side="#000000", text="#ffffff",
+             dim="#ffffff", border="rgba(255,255,255,0.85)", hdr1="#000000", hdr2="#000000", btn1="#000000",
+             btn2="#000000", menu="#000000", scroll="rgba(255,255,255,0.8)", off="#ffffff",
+             glow="rgba(255,229,0,0.0)", glow_soft="rgba(255,229,0,0.0)")
+    SKINS["contrast"] = s
+
+
+make_contrast_skin()
+
 _SKIN_TEMPLATE = """
 * { font-family: "Inter", "Segoe UI Variable Text", "Segoe UI", "Ubuntu", "Cantarell", "Noto Sans", sans-serif; }
 window, dialog, messagedialog, .background { background-color: $bg; color: $text; }
@@ -23427,6 +23697,165 @@ def recent_downloads_in(folder, minutes=30, limit=12):
     except OSError:
         return []
     return [p for _t, p in sorted(found, reverse=True)[:limit]]
+
+
+
+# ---------------------------------------------------------------- 🧭 Command palette (Ctrl+K)
+class CommandPalette(Gtk.Window):
+    """Type what you want to do, press Enter. Every action, setting, place and tool in one search."""
+
+    def __init__(self, win):
+        super().__init__(title="Command palette", transient_for=win, modal=True, decorated=False,
+                         window_position=Gtk.WindowPosition.CENTER_ON_PARENT, skip_taskbar_hint=True)
+        self.win = win
+        self.set_default_size(560, 430)
+        self.get_style_context().add_class("palette")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin=10)
+        self.add(box)
+        self.entry = Gtk.SearchEntry(placeholder_text="Type an action, a setting or a place…  (Esc closes)")
+        box.add(self.entry)
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.list)
+        box.pack_start(sw, True, True, 0)
+        hint = Gtk.Label(xalign=0)
+        hint.set_markup("<small>↑ ↓ choose · Enter runs it · Esc closes</small>")
+        hint.get_style_context().add_class("dim-label")
+        box.add(hint)
+        self.actions = self.collect()
+        self.entry.connect("search-changed", lambda *_: self.fill())
+        self.entry.connect("activate", lambda *_: self.run_selected())
+        self.list.connect("row-activated", lambda _l, r: self.run(r))
+        self.connect("key-press-event", self._key)
+        self.connect("focus-out-event", lambda *_: GLib.timeout_add(150, self._maybe_close) and False)
+        self.fill()
+        self.show_all()
+        self.entry.grab_focus()
+
+    def _maybe_close(self):
+        if self.get_visible() and not self.is_active():
+            self.destroy()
+        return False
+
+    def collect(self):
+        w = self.win
+        here = lambda: w.active.location if is_folder_loc(w.active.location) else str(HOME)   # noqa: E731
+        sel = lambda: w.active.selected_paths()                                           # noqa: E731
+        A = [("📂", "New tab", "Ctrl+T", lambda: w.new_tab()),
+             ("📁", "New folder", "Ctrl+Shift+N", lambda: w.new_folder(w.active)),
+             ("📄", "New empty file", "", lambda: w.new_file(w.active)),
+             ("📋", "Copy the selected files", "Ctrl+C", lambda: sel() and w.set_clipboard(sel(), False)),
+             ("✂", "Cut the selected files", "Ctrl+X", lambda: sel() and w.set_clipboard(sel(), True)),
+             ("📥", "Paste here", "Ctrl+V", lambda: w.paste_into(w.active)),
+             ("✏", "Rename the selected file", "F2", lambda: len(sel()) == 1 and w.rename(w.active, sel()[0])),
+             ("✏", "Batch rename the selected files", "", lambda: len(sel()) > 1 and BatchRenameDialog(w, sel()).run_rename()),
+             ("🗑", "Move the selected files to the Trash", "Delete", lambda: sel() and w.trash(w.active, sel())),
+             ("🔏", "Secure delete the selected files", "", lambda: sel() and w.secure_delete(w.active, sel())),
+             ("🗜", "Compress the selected files", "", lambda: sel() and w.compress(w.active, sel())),
+             ("📑", "Duplicate the selected files", "", lambda: sel() and w.duplicate(w.active, sel())),
+             ("🔖", "Save this search to the sidebar", "", lambda: w.save_search()),
+             ("🔎", "Filter this folder", "Ctrl+F", lambda: w.active.search.grab_focus()),
+             ("⌨", "Type a path", "Ctrl+L", lambda: w.active.edit_btn.clicked()),
+             ("◫", "Dual pane on / off", "F3", lambda: w.dual_btn.set_active(not w.dual_btn.get_active())),
+             ("👁", "Preview panel on / off", "Space", lambda: w.preview_btn.set_active(not w.preview_btn.get_active())),
+             ("☰", "List view", "Ctrl+1", lambda: w.active.set_view("list")),
+             ("▦", "Thumbnail view", "Ctrl+2", lambda: w.active.set_view("grid")),
+             ("🙈", "Show hidden files on / off", "Ctrl+H", lambda: w.hidden_item.set_active(not w.hidden_item.get_active())),
+             ("🎨", "Next theme", "Ctrl+Shift+D", lambda: w.cycle_theme()),
+             ("🎨", "Choose your own accent colour", "", lambda: w.choose_accent()),
+             ("🖼", "Set a wallpaper behind your files", "", lambda: w.choose_wallpaper()),
+             ("🖥", "Open a terminal here", "F4", lambda: w.open_terminal(here())),
+             ("📤", "Send files to a nearby device", "", lambda: w.open_share(sel() or None, "nearby")),
+             ("📥", "Receive files", "", lambda: w.open_share(None, "receive")),
+             ("🔐", "Open the private vault", "", lambda: w.vault_ui.open()),
+             ("🔒", "Lock the private vault", "", lambda: w.vault_ui.lock_now()),
+             ("🗑", "Open the Trash", "", lambda: w.sidebar_activate(w.trash_row)),
+             ("💬", "Team chat", "", lambda: w.chat_btn.set_active(True)),
+             ("👥", "People directory", "", lambda: w.people_directory()),
+             ("📢", "Send an announcement to everyone", "", lambda: w.announce_dialog()),
+             ("⚙", "Settings", "Ctrl+,", lambda: w.open_settings()),
+             ("⌨", "Keyboard shortcuts", "", lambda: show_shortcuts(w)),
+             ("🔄", "Check for updates", "", lambda: w.check_updates(manual=True)),
+             ("ℹ", f"About {APP_NAME}", "", lambda: w.show_about())]
+        A += [("🛠", label.rstrip("…"), "", cb) for label, cb in getattr(w, "_tools_list", [])]
+        for e in settings_entries(w):                      # every setting: switches flip, buttons run, the rest opens
+            cat, title, kind = e[0], e[1], e[3]
+            if kind == "switch":
+                get, set_ = e[4], e[5]
+                A.append(("⚙", f"Setting: {title} (on / off)", "", lambda g=get, s=set_: s(not g())))
+            elif kind == "button":
+                A.append(("⚙", f"{title}: {e[4]}".replace("…", ""), "", e[5]))
+            else:
+                A.append(("⚙", f"Setting: {title}", "", lambda c=cat: w.open_settings()))
+        for row in w.sidebar.get_children():               # places: Home, Downloads, drives, pinned, saved searches
+            key, name = getattr(row, "key", None), getattr(row, "side_name", None)
+            if key and name and not getattr(row, "is_header", False):
+                A.append(("📍", f"Go to {name}", "", lambda r=row: w.sidebar_activate(r)))
+        return A
+
+    @staticmethod
+    def score(q, text):
+        t = text.lower()
+        if not q:
+            return 1
+        words = q.lower().split()
+        if not all(wd in t for wd in words):
+            if not all(any(part.startswith(wd[:3]) for part in t.split()) for wd in words):
+                return 0
+            return 1
+        whole = sum(3 for wd in words if wd in t.replace(":", " ").split())          # whole-word matches first
+        return 10 - min(9, t.find(words[0])) + (5 if t.startswith(words[0]) else 0) + whole
+
+    def fill(self):
+        q = self.entry.get_text().strip()
+        for c in self.list.get_children():
+            self.list.remove(c)
+        found = sorted(((self.score(q, a[1]), i, a) for i, a in enumerate(self.actions)), key=lambda x: (-x[0], x[1]))
+        for sc, _i, (icon, label, accel, cb) in [f for f in found if f[0] > 0][:60]:
+            row = Gtk.ListBoxRow()
+            row.action = cb
+            b = Gtk.Box(spacing=10, margin=6)
+            b.add(Gtk.Label(label=icon))
+            b.pack_start(Gtk.Label(label=label, xalign=0), True, True, 0)
+            if accel:
+                a = Gtk.Label(label=accel)
+                a.get_style_context().add_class("dim-label")
+                b.add(a)
+            row.add(b)
+            self.list.add(row)
+        self.list.show_all()
+        first = self.list.get_row_at_index(0)
+        if first:
+            self.list.select_row(first)
+
+    def _key(self, _w, ev):
+        name = Gdk.keyval_name(ev.keyval)
+        if name == "Escape":
+            self.destroy()
+            return True
+        if name in ("Down", "Up"):
+            rows = self.list.get_children()
+            cur = self.list.get_selected_row()
+            i = rows.index(cur) if cur in rows else -1
+            i = max(0, min(len(rows) - 1, i + (1 if name == "Down" else -1)))
+            if rows:
+                self.list.select_row(rows[i])
+                rows[i].grab_focus()
+                self.entry.grab_focus_without_selecting()
+            return True
+        return False
+
+    def run_selected(self):
+        r = self.list.get_selected_row()
+        if r:
+            self.run(r)
+
+    def run(self, row):
+        cb = getattr(row, "action", None)
+        self.destroy()
+        if cb:
+            GLib.idle_add(lambda: (cb(), False)[1])
 
 
 class TabWindow(Gtk.Window):
@@ -23565,6 +23994,8 @@ class MainWindow(Gtk.ApplicationWindow):
         self._build_ui()
         self.watch_drives()
         self.setup_clip_sync()
+        self.apply_text_size()
+        GLib.timeout_add(1500, lambda: self.label_for_readers() and False)
         self.connect("key-press-event", self.on_key)
         self.connect("delete-event", self.on_delete)
         self.connect("set-focus", self.on_set_focus)
@@ -23879,6 +24310,9 @@ class MainWindow(Gtk.ApplicationWindow):
             ("Keyboard shortcuts", lambda: show_shortcuts(self)),
             ("Default file manager…", self.default_fm_dialog),
             ("🏢 Organisation…", self.org_dialog),
+            ("👥 People directory…", self.people_directory),
+            ("📢 Send an announcement…", self.announce_dialog),
+            ("🧭 Command palette (Ctrl+K)", lambda: CommandPalette(self)),
             ("🔐 Change the vault password…", self.vault_password),
             ("🏢 Arckad-D Pro (organisation admin)…", self.open_pro),
             ("Change logo…", self.choose_logo),
@@ -24287,7 +24721,9 @@ class MainWindow(Gtk.ApplicationWindow):
               [(f"dark-{k}", i, f"Dark · {n}") for k, i, n, d, _l in ACCENTS if d] +
               [("snow", "🔆", "Light · Orange")] +
               [(f"light-{k}", i, f"Light · {n}") for k, i, n, d, _l in ACCENTS if d] +
-              [("mono", "◐", "Mono (black + white)"), ("system", "🖥", "Classic: follow system"),
+              [("dark-custom", "🎨", "Dark · Your colour"), ("light-custom", "🎨", "Light · Your colour"),
+               ("contrast", "♿", "High contrast"),
+               ("mono", "◐", "Mono (black + white)"), ("system", "🖥", "Classic: follow system"),
                ("light", "☀", "Classic light"), ("dark", "🌙", "Classic dark")])
 
     def _theme_button(self):
@@ -24337,7 +24773,120 @@ class MainWindow(Gtk.ApplicationWindow):
                [Path(d) / "themes" for d in GLib.get_system_data_dirs()]
         return any((d / name / "gtk-3.0").is_dir() for d in dirs)
 
+    # ---------- ♿ accessibility
+    def apply_text_size(self):
+        s = Gtk.Settings.get_default()
+        if not hasattr(self, "_base_dpi"):
+            d = s.get_property("gtk-xft-dpi")
+            self._base_dpi = d if d and d > 0 else 96 * 1024
+        f = next((f for k, _l, f in TEXT_SIZES if k == self.cfg.get("text_size", "100")), 1.0)
+        s.set_property("gtk-xft-dpi", int(self._base_dpi * f))
+
+    def set_high_contrast(self, on):
+        if on:
+            if self.cfg.get("theme") != "contrast":
+                self.cfg["theme_before_contrast"] = self.cfg.get("theme", "midnight")
+            self.theme_items["contrast"].set_active(True)
+        else:
+            back = self.cfg.get("theme_before_contrast", "midnight")
+            self.theme_items.get(back, self.theme_items["midnight"]).set_active(True)
+
+    def label_for_readers(self, root=None):
+        """Buttons that show only an icon or emoji get a proper spoken name (from their tooltip)."""
+        roots = [root] if root else [self] + [w for w in Gtk.Window.list_toplevels() if w.get_transient_for() is self]
+        done = 0
+
+        def visit(w):
+            nonlocal done
+            if isinstance(w, (Gtk.Button, Gtk.MenuButton, Gtk.ToggleButton)):
+                acc = w.get_accessible()
+                tip = w.get_tooltip_text()
+                if acc is not None and tip and not any(ch.isalnum() for ch in (acc.get_name() or "")):   # icon / symbol only
+                    acc.set_name(tip.split("(")[0].strip() or tip)
+                    done += 1
+            if isinstance(w, Gtk.Container):
+                for c in w.get_children():
+                    visit(c)
+                if isinstance(w, Gtk.Window) and w.get_titlebar():
+                    visit(w.get_titlebar())
+        for r in roots:
+            visit(r)
+        return done
+
+    def choose_accent(self):
+        d = Gtk.ColorChooserDialog(title="Your accent colour", transient_for=self)
+        rgba = Gdk.RGBA()
+        rgba.parse(self.cfg.get("custom_accent", "#14b8a6"))
+        d.set_rgba(rgba)
+        if d.run() == Gtk.ResponseType.OK:
+            c = d.get_rgba()
+            colour = "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
+            self.cfg["custom_accent"] = colour
+            make_custom_skins(colour)
+            dark = SKINS.get(self.cfg.get("theme"), {}).get("dark", True)
+            want = "dark-custom" if dark else "light-custom"
+            write_json(CONFIG_FILE, self.cfg)
+            if self.cfg.get("theme") == want:
+                self.apply_theme(want)
+            else:
+                self.theme_items[want].set_active(True)
+        d.destroy()
+
+    def choose_wallpaper(self):
+        d = Gtk.FileChooserDialog(title="Wallpaper behind your files", transient_for=self,
+                                  action=Gtk.FileChooserAction.OPEN)
+        d.add_buttons("No wallpaper", 1, "Cancel", Gtk.ResponseType.CANCEL, "Use this picture", Gtk.ResponseType.OK)
+        f = Gtk.FileFilter()
+        f.set_name("Pictures")
+        for pat in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.JPG", "*.JPEG", "*.PNG"):
+            f.add_pattern(pat)
+        d.add_filter(f)
+        r = d.run()
+        path = d.get_filename()
+        d.destroy()
+        if r == 1:
+            self.cfg.pop("wallpaper", None)
+        elif r == Gtk.ResponseType.OK and path:
+            try:                                              # a copy, so moving the original doesn't break it
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 2400, 2400, True)
+                dest = CONFIG_DIR / "wallpaper.jpg"
+                pb.savev(str(dest), "jpeg", ["quality"], ["88"])
+                self.cfg["wallpaper"] = str(dest)
+            except GLib.Error as ex:
+                return self.error(f"Couldn't use that picture: {ex.message}")
+        else:
+            return
+        write_json(CONFIG_FILE, self.cfg)
+        self.apply_wallpaper()
+
+    def apply_wallpaper(self):
+        """🖼 The picture behind the file list, softened by the theme's colour so names stay easy to read."""
+        if not hasattr(self, "_wall_css"):
+            self._wall_css = Gtk.CssProvider()
+            Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), self._wall_css,
+                                                     Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 9)
+        path = self.cfg.get("wallpaper")
+        if not path or not os.path.isfile(path) or self.cfg.get("theme") == "contrast":   # never in high contrast
+            self._wall_css.load_from_data(b"")
+            return
+        skin = SKINS.get(self.cfg.get("theme"))
+        dark = skin["dark"] if skin else Gtk.Settings.get_default().get_property("gtk-application-prefer-dark-theme")
+        base = (skin or {}).get("bg2") or ("#1b1b20" if dark else "#ffffff")
+        r, g, b = (round(v * 255) for v in _rgb(base))
+        veil = f"rgba({r},{g},{b},{0.80 if dark else 0.82})"
+        uri = Path(path).as_uri()
+        css = (f"treeview.fm-files, iconview.fm-files {{ background-image: linear-gradient({veil}, {veil}), url('{uri}'); "
+               "background-size: cover; background-position: center; }\n"
+               "treeview.fm-files:selected, iconview.fm-files:selected { background-image: none; }")
+        try:
+            self._wall_css.load_from_data(css.encode())
+        except GLib.Error:
+            self._wall_css.load_from_data(b"")
+
     def apply_theme(self, mode):
+        if mode == "dark-custom" or mode == "light-custom":
+            make_custom_skins(self.cfg.get("custom_accent", "#14b8a6"))
+        GLib.idle_add(lambda: self.apply_wallpaper() or False)
         s = Gtk.Settings.get_default()
         if not hasattr(self, "_skin_css"):
             self._skin_css = Gtk.CssProvider()
@@ -24610,6 +25159,11 @@ class MainWindow(Gtk.ApplicationWindow):
             self._side_row(tag, None, "tag:" + tag, dot=color)
         self._side_row("Files with notes", "accessories-text-editor-symbolic", "notes")
         pinned = [p for p in self.cfg["pinned"] if os.path.isdir(p)]
+        saved = self.cfg.get("saved_searches", [])
+        if saved:
+            self._side_header("Saved searches")
+            for i, s in enumerate(saved):
+                self._side_row(s.get("name") or "Search", "edit-find-symbolic", f"search:{i}")
         self._side_header("Pinned")
         if not pinned:
             self._side_header("Right-click a folder → Pin to sidebar", dim=True)
@@ -24823,7 +25377,7 @@ class MainWindow(Gtk.ApplicationWindow):
             if w is None or not w.get_mapped():
                 return None
             a = w.get_allocation()
-            if a.width < 40 or a.height < 30:                 # not laid out yet (a brand-new tab): don't trust it
+            if a.width < 8 or a.height < 8:                   # not laid out yet (a brand-new tab): don't trust it
                 return None
             return w.translate_coordinates(self.overlay, int(a.width * fx), int(a.height * fy))
         except Exception:
@@ -24926,6 +25480,10 @@ class MainWindow(Gtk.ApplicationWindow):
         if key == "trash:":
             self.lib_stack.set_visible_child_name("trash")
             self.trash_view.refresh()
+            return
+        if key.startswith("search:"):
+            self.show_files()
+            self.run_saved_search(int(key.split(":", 1)[1]))
             return
         self.show_files()
         volume = getattr(row, "volume", None)
@@ -25270,6 +25828,10 @@ class MainWindow(Gtk.ApplicationWindow):
             items.append(("Open in other pane", lambda: self.open_in_other(row.key)))
         if row.pinned:
             items.append(("Unpin", lambda: self.unpin(row.key)))
+        if str(row.key).startswith("search:"):
+            i = int(row.key.split(":", 1)[1])
+            items = [("Run this search", lambda: self.run_saved_search(i)),
+                     ("Rename…", lambda: self.rename_saved_search(i)), ("Remove", lambda: self.remove_saved_search(i))]
         for label, cb in items:
             item = Gtk.MenuItem(label=label)
             item.connect("activate", lambda _i, cb=cb: cb())
@@ -25298,6 +25860,66 @@ class MainWindow(Gtk.ApplicationWindow):
         mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
         self.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
                          bool(mods & Gdk.ModifierType.SHIFT_MASK))
+
+    # ---------- 🔖 saved searches: a search kept in the sidebar, always showing what matches right now
+    def save_search(self):
+        pane = self.active
+        f = pane.filters
+        if not f.active:
+            return self.info("Type something to search for, or pick a type, extension or date first; then save it.")
+        bits = [f.query] if f.query else []
+        if f.kind != "All types":
+            bits.append(f.kind)
+        if f.exts:
+            bits.append(", ".join(sorted(f.exts)))
+        if pane.date_combo.get_active() > 0:
+            bits.append(pane.date_combo.get_active_text())
+        name = self.ask_text("Save search", "Name in the sidebar:", " · ".join(bits)[:40] or "My search")
+        if not name:
+            return
+        self.cfg.setdefault("saved_searches", []).append({
+            "name": name.strip()[:40], "location": pane.location if is_folder_loc(pane.location) else str(HOME),
+            "query": pane.search.get_text(), "kind": pane.kind_combo.get_active(), "exts": pane.ext_entry.get_text(),
+            "date": pane.date_combo.get_active() if DATE_CHOICES[pane.date_combo.get_active()][1] != "custom" else 0,
+            "scope": pane.scope_combo.get_active()})
+        write_json(CONFIG_FILE, self.cfg)
+        self.build_sidebar()
+        self.flash_all(f"🔖 Saved “{name}” in the sidebar")
+
+    def run_saved_search(self, i):
+        saved = self.cfg.get("saved_searches", [])
+        if not 0 <= i < len(saved):
+            return
+        s = saved[i]
+        pane = self.active
+        loc = s.get("location") or str(HOME)
+        if is_folder_loc(loc) and os.path.isdir(loc) and pane.location != loc:
+            pane.go(loc)
+        for combo, val in ((pane.kind_combo, s.get("kind", 0)), (pane.date_combo, s.get("date", 0)),
+                           (pane.scope_combo, s.get("scope", 0))):
+            try:
+                combo.set_active(int(val))
+            except (TypeError, ValueError):
+                pass
+        pane.ext_entry.set_text(s.get("exts", ""))
+        pane.search.set_text(s.get("query", ""))
+        pane.on_filters_changed()
+
+    def rename_saved_search(self, i):
+        saved = self.cfg.get("saved_searches", [])
+        if 0 <= i < len(saved):
+            name = self.ask_text("Rename saved search", "Name:", saved[i].get("name", ""))
+            if name:
+                saved[i]["name"] = name.strip()[:40]
+                write_json(CONFIG_FILE, self.cfg)
+                self.build_sidebar()
+
+    def remove_saved_search(self, i):
+        saved = self.cfg.get("saved_searches", [])
+        if 0 <= i < len(saved):
+            saved.pop(i)
+            write_json(CONFIG_FILE, self.cfg)
+            self.build_sidebar()
 
     def pin(self, path):
         if is_folder_loc(path) and path not in self.cfg["pinned"]:
@@ -26234,6 +26856,64 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.flash(f"Deleted {n - len(errors)} item{'s' if n - len(errors) != 1 else ''} permanently")
         if errors:
             self.error("Some items couldn't be deleted:\n\n" + "\n".join(errors[:10]))
+
+    def secure_delete(self, pane, paths):
+        """Overwrite each file with random data (then zeros), rename it to a random name, then delete it, so recovery
+        tools can't bring it back. Folders: everything inside them."""
+        n = len(paths)
+        names = ", ".join(os.path.basename(p) for p in paths[:3]) + ("…" if n > 3 else "")
+        if not self.confirm(f"Securely delete {n} item{'s' if n != 1 else ''}?\n\n{names}\n\n"
+                            "Each file is overwritten before it's deleted, so it can't be recovered, not even with "
+                            "recovery tools. This can't be undone.\n\n(On SSDs and USB sticks the drive itself may "
+                            "keep old copies hidden away; for those, the vault is the safest place for secrets.)"):
+            return
+        self.play("shred", at=self.pt_sel(pane))
+        self.spinner.start()
+
+        def wipe_file(fp):
+            size = os.path.getsize(fp)
+            with open(fp, "r+b", buffering=0) as f:
+                for chunk_src in (lambda k: os.urandom(k), lambda k: bytes(k)):        # random, then zeros
+                    f.seek(0)
+                    left = size
+                    while left > 0:
+                        k = min(left, 1 << 20)
+                        f.write(chunk_src(k))
+                        left -= k
+                    f.flush()
+                    os.fsync(f.fileno())
+                f.truncate(0)
+            tmp = os.path.join(os.path.dirname(fp), secrets.token_hex(8))
+            os.replace(fp, tmp)                                # the old name goes too
+            os.remove(tmp)
+
+        def work():
+            errors, done = [], 0
+            for p in paths:
+                try:
+                    JOURNEY.removed(p, trash=False)
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        for fp, _st, is_dir in list(walk_entries(p, hidden=True)):
+                            if not is_dir and not os.path.islink(fp):
+                                wipe_file(fp)
+                        shutil.rmtree(p)
+                    elif os.path.islink(p):
+                        os.remove(p)
+                    else:
+                        wipe_file(p)
+                    done += 1
+                except OSError as ex:
+                    errors.append(f"{os.path.basename(p)}: {ex.strerror or ex}")
+            GLib.idle_add(finish, done, errors)
+
+        def finish(done, errors):
+            self.update_spinner()
+            pane.refresh()
+            pane.flash(f"🔏 Securely deleted {done} item{'s' if done != 1 else ''}")
+            if errors:
+                self.error("Some items couldn't be securely deleted:\n\n" + "\n".join(errors[:10]))
+            return False
+        threading.Thread(target=work, daemon=True).start()
 
     @staticmethod
     def terminal_choices():
@@ -27911,6 +28591,9 @@ class MainWindow(Gtk.ApplicationWindow):
         if ctrl and key == "comma":
             self.open_settings()                                # Ctrl+,  all settings in one place
             return True
+        if ctrl and low == "k":
+            CommandPalette(self)                                # Ctrl+K  type any action
+            return True
         if self.lib_stack.get_visible_child_name() == "trash" and not typing:
             if self.trash_view.handle_key(key, low, ctrl, shift, alt, typing):
                 return True
@@ -28343,6 +29026,202 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.flash_all("🔐 Vault password changed")
                 break
         d.destroy()
+
+    # ---------- 👥 people directory: everyone's work card in one place
+    def _directory_people(self):
+        chat = self.chat
+        out = []
+        me = chat.me
+        out.append({"pid": me, "name": chat.my_name() + " (you)", "card": chat.my_card(), "online": True,
+                    "contact": False})
+        seen = set()
+        for pid, f in chat.contacts["friends"].items():
+            seen.add(pid)
+            try:
+                online = bool(chat.is_online(pid))
+            except Exception:
+                online = False
+            out.append({"pid": pid, "name": f.get("name") or (chat.people.get(pid) or {}).get("name") or "?",
+                        "card": chat.card_of(pid), "online": online, "contact": True})
+        for pid, pp in chat.people.items():                  # people on the network who aren't contacts yet
+            if pid in seen or pid == me or time.time() - pp.get("seen", 0) > 600:
+                continue
+            out.append({"pid": pid, "name": pp.get("name") or "?", "card": chat.card_of(pid), "online": True,
+                        "contact": False})
+        return out
+
+    def _direct_gid(self, pid):
+        for gid, g in self.chat.groups.items():
+            if g.get("kind") == "direct" and g.get("peer") == pid and not g.get("removed"):
+                return gid
+        return None
+
+    def people_directory(self):
+        w = Gtk.Window(title="👥 People directory", transient_for=self)
+        w.set_default_size(720, 620)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=14)
+        w.add(box)
+        head = Gtk.Label(xalign=0, wrap=True)
+        head.set_markup("<span size='x-large'><b>👥 People directory</b></span>\n<small>Everyone's work card: designation, "
+                        "department, extension and email. Add yours under Chat profile.</small>")
+        box.add(head)
+        top = Gtk.Box(spacing=8)
+        search = Gtk.SearchEntry(placeholder_text="Search by name, department, designation, extension…", hexpand=True)
+        top.pack_start(search, True, True, 0)
+        group = Gtk.ComboBoxText()
+        for label in ("Group by department", "A to Z"):
+            group.append_text(label)
+        group.set_active(0)
+        top.add(group)
+        mine = Gtk.Button(label="✏ My card…")
+        mine.connect("clicked", lambda *_: self.chat_panel.edit_profile())
+        top.add(mine)
+        box.add(top)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        box.pack_start(sw, True, True, 0)
+        count = Gtk.Label(xalign=0)
+        count.get_style_context().add_class("dim-label")
+        box.add(count)
+        icons = {"designation": "💼", "department": "🏢", "company": "🏛", "location": "📍", "phone": "📞", "email": "✉"}
+
+        def fill(*_):
+            for c in lst.get_children():
+                lst.remove(c)
+            q = search.get_text().strip().lower()
+            people = []
+            for person in self._directory_people():
+                hay = " ".join([person["name"]] + list(person["card"].values())).lower()
+                if all(word in hay for word in q.split()):
+                    people.append(person)
+            by_dept = group.get_active() == 0
+            key = (lambda x: ((x["card"].get("department") or "~").lower(), x["name"].lower())) if by_dept else \
+                (lambda x: x["name"].lower())
+            last = None
+            for person in sorted(people, key=key):
+                dept = person["card"].get("department") or "No department"
+                if by_dept and dept != last:
+                    last = dept
+                    h = Gtk.Label(xalign=0, margin_top=10, margin_start=6)
+                    h.set_markup(f"<b>{esc(dept.upper())}</b>")
+                    h.get_style_context().add_class("dim-label")
+                    hr = Gtk.ListBoxRow(selectable=False, activatable=False)
+                    hr.add(h)
+                    lst.add(hr)
+                row = Gtk.Box(spacing=12, margin=8)
+                photo = None
+                try:
+                    photo = self.chat.avatar_file(person["pid"])
+                except Exception:
+                    pass
+                row.add(Gtk.Image.new_from_pixbuf(avatar_pixbuf(person["name"], photo, 44)))
+                c = person["card"]
+                lines = [f"<b>{esc(person['name'])}</b>" + ("  <small>🟢 online</small>" if person["online"] and
+                                                            not person["name"].endswith("(you)") else "")]
+                sub = " · ".join(x for x in (c.get("designation"), c.get("department") if not by_dept else "",
+                                             c.get("company")) if x)
+                if sub:
+                    lines.append(f"<small>{esc(sub)}</small>")
+                reach = "   ".join(f"{icons[k]} {esc(c[k])}" for k in ("phone", "email", "location") if c.get(k))
+                if reach:
+                    lines.append(f"<small>{reach}</small>")
+                if c.get("about"):
+                    lines.append(f"<small><i>{esc(c['about'])}</i></small>")
+                lbl = Gtk.Label(xalign=0, wrap=True, selectable=True)
+                lbl.set_markup("\n".join(lines))
+                row.pack_start(lbl, True, True, 0)
+                gid = self._direct_gid(person["pid"]) if person["contact"] else None
+                if gid:
+                    b = Gtk.Button(label="💬 Chat")
+                    b.connect("clicked", lambda _b, g=gid: (self.chat_btn.set_active(True),
+                                                            self.chat_panel.open_chat(g), w.destroy()))
+                    row.add(b)
+                if c.get("phone"):
+                    b2 = Gtk.Button(label="📋")
+                    b2.set_tooltip_text("Copy the phone / extension")
+                    b2.connect("clicked", lambda _b, t=c["phone"]: (
+                        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(t, -1), self.flash_all(f"Copied {t}")))
+                    row.add(b2)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            n = len(people)
+            count.set_text(f"{n} {'person' if n == 1 else 'people'}" + ("" if q else " · contacts and people online now"))
+            lst.show_all()
+        search.connect("search-changed", fill)
+        group.connect("changed", fill)
+        fill()
+        w.show_all()
+        self.label_for_readers(w)
+        return w
+
+    # ---------- 📢 announcements: one notice to everyone at once
+    def announce_dialog(self):
+        chat = self.chat
+        friends = list(chat.contacts["friends"].keys())
+        try:
+            from_org = getattr(self, "pro", None) and self.pro.has_key()
+            me_fp = self.pro.fp().replace(" ", "") if from_org else None
+        except Exception:
+            from_org, me_fp = False, None
+        org_people = [pid for pid in friends if me_fp and me_fp in ((chat.people.get(pid) or {}).get("orgs") or [])]
+        if not friends:
+            return self.info("You have no chat contacts yet. Add people in Chat first, then send them announcements.")
+        d = Gtk.Dialog(title="📢 Send an announcement", transient_for=self, modal=True)
+        d.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "📢 Send to everyone", Gtk.ResponseType.OK)
+        d.get_widget_for_response(Gtk.ResponseType.OK).get_style_context().add_class("suggested-action")
+        box = d.get_content_area()
+        box.set_spacing(10)
+        box.set_border_width(16)
+        intro = Gtk.Label(xalign=0, wrap=True, max_width_chars=60)
+        intro.set_markup("One notice, sent to each person as a private message, marked <b>📢 Announcement</b>. "
+                         "People who are offline get it when they come back.")
+        box.add(intro)
+        title = Gtk.Entry(placeholder_text="Title, e.g. Server maintenance tonight")
+        box.add(title)
+        tv = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, left_margin=8, right_margin=8, top_margin=8, bottom_margin=8)
+        tv.set_size_request(460, 140)
+        fr = Gtk.Frame()
+        fr.add(tv)
+        box.add(fr)
+        who = Gtk.ComboBoxText()
+        who.append("all", f"All my contacts ({len(friends)})")
+        if org_people:
+            who.append("org", f"Only people in my organisation ({len(org_people)})")
+        who.set_active(0)
+        box.add(who)
+        d.show_all()
+        result = None
+        while True:
+            if d.run() != Gtk.ResponseType.OK:
+                break
+            buf = tv.get_buffer()
+            body = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).strip()
+            head = title.get_text().strip()
+            if not body and not head:
+                continue
+            result = (head, body, org_people if who.get_active_id() == "org" else friends)
+            break
+        d.destroy()
+        if not result:
+            return
+        head, body, targets = result
+        text = "📢 Announcement" + (f": {head}" if head else "") + (f"\n\n{body}" if body else "")
+        sent = missing = 0
+        for pid in targets:
+            gid = self._direct_gid(pid)
+            if not gid:
+                missing += 1
+                continue
+            try:
+                chat.send_text(gid, text)
+                sent += 1
+            except Exception:
+                missing += 1
+        self.play("plane", src=self.pt_center(0.6), dst=self.pt_widget(self.chat_btn) or self.pt_center(0.2), lift=80)
+        self.flash_all(f"📢 Announcement sent to {sent} {'person' if sent == 1 else 'people'}"
+                       + (f" ({missing} without a chat yet)" if missing else ""))
 
     def org_dialog(self):
         """Organisations this PC trusts: their admin (Arckad-D Pro) can add you as a contact without a request."""
