@@ -29,7 +29,9 @@ import stat as statmod
 import subprocess
 import sys
 import tarfile
+import importlib.util
 import tempfile
+import traceback
 import threading
 import time
 import re
@@ -205,7 +207,6 @@ try:
     except ImportError:
         cairo = None
 except Exception:                       # also broken installs, not just missing GTK
-    import traceback
     _err = traceback.format_exc()
     if "--selftest" in sys.argv:         # the automatic build test reads this file
         _i = sys.argv.index("--selftest")
@@ -229,7 +230,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.64.1"
+APP_VERSION = "3.65.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3654,6 +3655,8 @@ class FilePane(Gtk.Box):
 
     # ---------- navigation
     def go(self, location, push=True):
+        if is_folder_loc(location):
+            GLib.idle_add(lambda: PLUGINS.emit("folder_opened", str(location)) and False)
         location = str(location)
         if getattr(self, "spotlight", None) and os.path.dirname(self.spotlight) != location:
             self.clear_spotlight()                           # went somewhere else: the spotlight ends
@@ -4430,6 +4433,15 @@ class FilePane(Gtk.Box):
                 add("🖼 Image tools (resize, rotate, convert, compress)…", lambda: win.image_tools(paths))
             if all(ext_of(x) == "pdf" for x in paths):
                 add("📄 PDF tools (merge, split, rotate, compress, extract)…", lambda: win.pdf_tools(paths))
+            plugin_items = []
+            for pl, r in PLUGINS.regs("file_action"):               # 🧩 what plugins add for these files
+                fits = True if r["when"] is None else PLUGINS.guard(pl, r["when"], list(paths))
+                if fits:
+                    plugin_items.append((pl, r))
+            if plugin_items:
+                menu.append(Gtk.SeparatorMenuItem())
+                for pl, r in plugin_items:
+                    add(f"{r['icon']} {r['label']}", lambda pl=pl, r=r: PLUGINS.guard(pl, r["run"], pl["api"], list(paths)))
             if len(paths) == 1 and category_of(paths[0]) in ("Videos", "Audio"):
                 add("🎞 Media tools (details, convert, MP3)…", lambda: win.media_tools(paths[0]))
             add("Compare these two…", lambda: win.compare(paths[0], paths[1]), len(paths) == 2)
@@ -4899,6 +4911,20 @@ class PreviewPanel(Gtk.ScrolledWindow):
     def apply_preview(self, tok, kind, data, extra):
         if tok != self.token:
             return False
+        hit = PLUGINS.preview_for(self.path) if self.path and os.path.isfile(self.path) else None
+        if hit:                                                   # 🧩 a plugin shows this kind of file
+            pl, r = hit
+            widget = PLUGINS.guard(pl, r["build"], pl["api"], self.path)
+            if isinstance(widget, Gtk.Widget):
+                old = self.visual.get_child_by_name("plugin")
+                if old is not None:
+                    self.visual.remove(old)
+                self.visual.add_named(widget, "plugin")
+                widget.show_all()
+                self.visual.set_visible_child_name("plugin")
+                if extra:
+                    self.add_info(extra + [("Shown by", pl["name"])])
+                return False
         if kind == "pixbuf" and data is not None:
             self.image.set_from_pixbuf(data)
             self.visual.set_visible_child_name("image")
@@ -18598,6 +18624,7 @@ class DownloadWatcher:
         if size != last:                                     # still being written: look again shortly
             GLib.timeout_add(1500, self._check, path, size)
             return False
+        PLUGINS.emit("download_finished", path)
         try:
             self.win.play("download", at=self.win.pt_row(os.path.dirname(path)) or self.win.pt_pane(None, 0.4))
         except Exception:
@@ -23656,6 +23683,8 @@ def settings_entries(win):
            lambda: win.choose_phone_folder("scan_folder", "Phone scans go to")),
           ("chat", "Phone photos go to", "Where photos imported from the phone are saved (in year / month folders).",
            "button", "Choose…", lambda: win.choose_phone_folder("phone_photos_folder", "Phone photos go to")),
+          ("system", "Plugins", "Add features: install from the catalogue or a file, switch plugins on and off, make "
+           "your own.", "button", "Open…", win.plugins_window),
           ("chat", "Team folders", "Folders that stay the same on everyone's PC in a chat group, encrypted, no "
            "cloud.", "button", "Open…", win.team_folders),
           ("files", "Tags", "Make your own tags, rename or remove them.", "button", "Manage…", win.manage_tags),
@@ -24468,7 +24497,10 @@ class CommandPalette(Gtk.Window):
              ("⌨", "Keyboard shortcuts", "", lambda: show_shortcuts(w)),
              ("🔄", "Check for updates", "", lambda: w.check_updates(manual=True)),
              ("📘", f"About {APP_NAME}: every feature explained", "", lambda: w.show_about())]
-        A += [("🛠", label.rstrip("…"), "", cb) for label, cb in getattr(w, "_tools_list", [])]
+        A += [("🛠", label.rstrip("…"), "", cb) for label, cb in getattr(w, "_tools_list", []) if isinstance(label, str)]
+        A += [("🧩", f"{r['label']} ({pl['name']})", "", lambda pl=pl, r=r: PLUGINS.guard(pl, r["run"], pl["api"]))
+              for pl, r in PLUGINS.regs("tool")]
+        A.append(("🧩", "Plugins: install, manage, create", "", lambda: w.plugins_window()))
         for e in settings_entries(w):                      # every setting: switches flip, buttons run, the rest opens
             cat, title, kind = e[0], e[1], e[3]
             if kind == "switch":
@@ -26007,6 +26039,10 @@ GUIDE = [
          "a GIF.", "Right-click a video or song → Media tools", "", None),
         ("🖥", "Terminal here", "A terminal (or Command Prompt on Windows) already in this folder.", "☰ → Open terminal",
          "F4", lambda w: w.open_terminal(_here(w))),
+        ("🧩", "Plugins", "Add features made for Arckad-D: they show up in the right-click menu, Tools → Plugins, the "
+         "command palette, their own sidebar page or the preview panel. Owner-signed ✓ plugins are checked; you can "
+         "make your own (the format is in PLUGINS.md).", "☰ → Plugins · Settings → Updates & system → Plugins", "",
+         lambda w: w.plugins_window()),
         ("🧩", "Optional features", "One click installs the free extras: smaller PDFs (Ghostscript), media conversion "
          "(FFmpeg), PDF thumbnails, 7-Zip, QR codes. On Windows they come through Windows' own installer.",
          "Tools → Install optional features", "",
@@ -26110,6 +26146,8 @@ GUIDE = [
 ]
 
 WHATS_NEW = [
+    ("3.65", "Plugins: add features from the catalogue or a file, owner-signed or community, each in its own place "
+             "(right-click, Tools, palette, sidebar page, preview), with a public format anyone can write for"),
     ("3.64", "Glass see-through levels, Reset appearance to default (and single resets for wallpaper, accent colour and "
              "lock screen), real app icons on Windows, and fixes for big Windows file IDs and Settings search"),
     ("3.63", "Professional line icons everywhere, the new Glass theme (white, see-through, blurred on Windows 11), "
@@ -26927,6 +26965,573 @@ class PcRemote:
 PC_REMOTE = PcRemote()
 
 
+# ---------------------------------------------------------------- 🧩 Plugins
+# A plugin is a folder:  plugin.json (what it is)  +  plugin.py (a setup(arckad) function)  [+ icon.png, plugin.sig].
+# It talks to Arckad-D only through the `arckad` object below, and appears only in fixed places: the right-click menu,
+# the Tools menu, the command palette, its own page in the sidebar, the preview panel, its settings, and events.
+# Plugins signed with the owner key install with one click; others need “Allow community plugins”.
+# Everything a plugin does is guarded: if it fails, only that plugin is switched off. (Format: PLUGINS.md)
+PLUGIN_API = 1
+PLUGINS_DIR = CONFIG_DIR / "plugins"
+PLUGIN_DATA = CONFIG_DIR / "plugin-data"
+PLUGIN_EVENTS = ("startup", "folder_opened", "download_finished", "files_trashed", "drive_added")
+PLUGIN_CATALOG = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/plugins/catalog.json"
+
+
+def _version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3]) or (0,)
+
+
+def version_ok(spec, current=None):
+    """'>=3.65', '>=3.65,<4', '==3.64.1' … against this Arckad-D. Empty = any version."""
+    cur = _version_tuple(current or APP_VERSION)
+    for part in [x.strip() for x in str(spec or "").split(",") if x.strip()]:
+        m = re.fullmatch(r"(>=|<=|==|>|<)?\s*([\d.]+)", part)
+        if not m:
+            return False
+        op, want = m.group(1) or ">=", _version_tuple(m.group(2))
+        n = max(len(cur), len(want))
+        a, b = cur + (0,) * (n - len(cur)), want + (0,) * (n - len(want))
+        if not {">=": a >= b, "<=": a <= b, "==": a == b, ">": a > b, "<": a < b}[op]:
+            return False
+    return True
+
+
+def plugin_files_digest(folder):
+    """A fingerprint of every file in a plugin (except its signature): any change breaks the signature."""
+    folder = Path(folder)
+    h = hashlib.sha256()
+    for p in sorted(folder.rglob("*")):
+        rel = p.relative_to(folder).as_posix()
+        if p.is_dir() or rel == "plugin.sig" or "__pycache__" in rel or rel.endswith(".pyc"):
+            continue
+        h.update(rel.encode() + b"\0" + hashlib.sha256(p.read_bytes()).digest() + b"\n")
+    return h.digest()
+
+
+def plugin_signed(folder):
+    sig = Path(folder) / "plugin.sig"
+    if not sig.exists() or not OWNER_PUB:
+        return False
+    try:
+        return rsa_verify(OWNER_PUB, plugin_files_digest(folder), sig.read_text().strip())
+    except OSError:
+        return False
+
+
+def sign_plugin(folder):
+    """The owner's PC only: signs a plugin folder and makes the zip to publish. Returns (zip path, catalogue entry)."""
+    k = owner_key()
+    if not k:
+        raise PermissionError("Only the owner's PC can sign plugins (it has the owner key).")
+    folder = Path(folder)
+    problems, man, _report = check_plugin(folder)
+    if problems:
+        raise ValueError("Fix these first:\n" + "\n".join(problems))
+    (folder / "plugin.sig").write_text(rsa_sign(k, plugin_files_digest(folder)))
+    out = folder.parent / f"{man['id']}-{man['version']}.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted(folder.rglob("*")):
+            rel = p.relative_to(folder).as_posix()
+            if p.is_file() and "__pycache__" not in rel and not rel.endswith(".pyc"):
+                z.write(p, f"{man['id']}/{rel}")
+    entry = {k2: man.get(k2) for k2 in ("id", "name", "version", "author", "description", "arckad", "platforms")}
+    entry["download"] = f"https://raw.githubusercontent.com/{UPDATE_REPO}/main/plugins/{out.name}"
+    return out, entry
+
+
+def read_manifest(folder):
+    try:
+        man = json.loads((Path(folder) / "plugin.json").read_text(encoding="utf-8"))
+        return man if isinstance(man, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+class _DryRun:
+    """Stands in for `arckad` when checking a plugin: records what it would add, does nothing."""
+
+    def __init__(self):
+        self.added = []
+
+    def __getattr__(self, name):
+        if name.startswith("add_") or name == "on":
+            return lambda *a, **k: self.added.append(name if name != "on" else f"on:{a[0] if a else '?'}")
+        return lambda *a, **k: None
+
+
+def check_plugin(folder):
+    """(problems, manifest, report lines). problems is empty when the plugin is fine to use and share."""
+    folder = Path(folder)
+    problems, report = [], []
+    man = read_manifest(folder)
+    if man is None:
+        return ["plugin.json is missing or isn't valid JSON"], {}, report
+    for key in ("id", "name", "version"):
+        if not str(man.get(key) or "").strip():
+            problems.append(f"plugin.json needs \"{key}\"")
+    if man.get("id") and not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,40}", str(man["id"])):
+        problems.append("\"id\" may only use small letters, digits and - (2–41 characters), e.g. \"invoice-renamer\"")
+    if man.get("version") and not re.fullmatch(r"\d+(\.\d+){0,2}", str(man["version"])):
+        problems.append("\"version\" must look like 1.0 or 1.2.3")
+    if not version_ok(man.get("arckad", "")):
+        problems.append(f"\"arckad\": \"{man.get('arckad')}\" doesn't match this Arckad-D ({APP_VERSION})")
+    plats = man.get("platforms", ["linux", "windows"])
+    if not isinstance(plats, list) or any(p not in ("linux", "windows") for p in plats):
+        problems.append("\"platforms\" must be a list of \"linux\" and/or \"windows\"")
+    if int(man.get("api", PLUGIN_API) or PLUGIN_API) > PLUGIN_API:
+        problems.append(f"it needs plugin API {man.get('api')}; this Arckad-D has API {PLUGIN_API}")
+    code = folder / "plugin.py"
+    if not code.exists():
+        problems.append("plugin.py is missing")
+    else:
+        src = code.read_text(encoding="utf-8", errors="replace")
+        try:
+            compile(src, str(code), "exec")
+        except SyntaxError as ex:
+            problems.append(f"plugin.py line {ex.lineno}: {ex.msg}")
+        else:
+            if not re.search(r"^def setup\(\s*\w+", src, re.M):
+                problems.append("plugin.py needs a  def setup(arckad):  function")
+            else:
+                try:                                            # what would it add? (a dry run, nothing happens)
+                    ns = {"__name__": f"arckad_check_{man.get('id', 'x')}", "__file__": str(code)}
+                    exec(compile(src, str(code), "exec"), ns)
+                    dry = _DryRun()
+                    ns["setup"](dry)
+                    report.append("Adds: " + (", ".join(sorted(set(dry.added))) or "nothing yet"))
+                except Exception as ex:
+                    problems.append(f"setup() failed: {type(ex).__name__}: {ex}")
+    report.insert(0, f"{man.get('name', '?')} {man.get('version', '?')} by {man.get('author', '?')}")
+    report.append("Signed by the owner ✓" if plugin_signed(folder) else "Not signed (a community plugin)")
+    return problems, man, report
+
+
+class PluginAPI:
+    """What a plugin's setup(arckad) receives. Every function here is safe to call; the plugin can't reach
+    Arckad-D's insides any other way."""
+
+    def __init__(self, manager, plugin):
+        self._m, self._p = manager, plugin
+        self.id = plugin["id"]
+        self.name = plugin["name"]
+        self.version = APP_VERSION
+        self.platform = "windows" if IS_WIN else "linux"
+        self.data_dir = PLUGIN_DATA / plugin["id"]
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.config = read_json(self.data_dir / "config.json", {})
+        self.Gtk, self.Gdk, self.GLib, self.Pango = Gtk, Gdk, GLib, Pango
+
+    # ---------- the places a plugin can appear
+    def add_file_action(self, label, run, when=None, icon="🧩"):
+        """Right-click menu (🧩 group) for selected files. run(arckad, paths); when(paths) → show it or not."""
+        self._p["regs"].append(("file_action", {"label": label, "run": run, "when": when, "icon": icon}))
+
+    def add_tool(self, label, run, icon="🧩"):
+        """Tools menu → Plugins, and the command palette (Ctrl+K). run(arckad)."""
+        self._p["regs"].append(("tool", {"label": label, "run": run, "icon": icon}))
+
+    def add_page(self, title, build, icon="🧩"):
+        """Its own page in the main area, listed in the sidebar under PLUGINS. build(arckad, box) fills a Gtk.Box;
+        it runs every time the page is opened."""
+        self._p["regs"].append(("page", {"title": title, "build": build, "icon": icon,
+                                         "key": f"plugin:{self.id}:{len([r for r in self._p['regs'] if r[0] == 'page'])}"}))
+
+    def add_preview(self, extensions, build):
+        """The preview panel, for these file types (e.g. ["dwg", "dxf"]). build(arckad, path) → a Gtk widget."""
+        self._p["regs"].append(("preview", {"exts": {e.lower().lstrip(".") for e in extensions}, "build": build}))
+
+    def add_settings(self, build):
+        """A Settings button in Settings → Plugins. build(arckad, box) fills a Gtk.Box; use arckad.config."""
+        self._p["regs"].append(("settings", {"build": build}))
+
+    def on(self, event, fn):
+        """React to: startup, folder_opened(path), download_finished(path), files_trashed(paths), drive_added(path)."""
+        if event not in PLUGIN_EVENTS:
+            raise ValueError(f"unknown event {event!r}; known: {', '.join(PLUGIN_EVENTS)}")
+        self._p["regs"].append(("event", {"event": event, "fn": fn}))
+
+    # ---------- things a plugin can ask Arckad-D to do
+    def notify(self, text):
+        GLib.idle_add(lambda: self._m.win.flash_all(f"🧩 {text}") or False)
+
+    def error(self, text):
+        GLib.idle_add(lambda: self._m.win.error(f"{self.name}: {text}") or False)
+
+    def confirm(self, text):
+        return self._m.win.confirm(text)
+
+    def ask(self, title, prompt, default=""):
+        return self._m.win.ask_text(title, prompt, default)
+
+    def selected_paths(self):
+        return list(self._m.win.active.selected_paths())
+
+    def current_folder(self):
+        loc = self._m.win.active.location
+        return loc if is_folder_loc(loc) else None
+
+    def open_folder(self, path, select=None):
+        w = self._m.win
+        w.show_files()
+        if select:
+            w.active.pending_select = list(select)
+        w.active.go(path)
+
+    def refresh(self):
+        GLib.idle_add(lambda: self._m.win.refresh_all() or False)
+
+    def rename(self, path, new_name):
+        """Renames in place (the name only), keeping the file's history. Returns the new path."""
+        new_name = os.path.basename(str(new_name).strip())
+        if not new_name:
+            raise ValueError("empty name")
+        target = str(unique_target(Path(os.path.dirname(path)) / new_name))
+        os.rename(path, target)
+        try:
+            JOURNEY.moved(path, target, how="plugin")
+            TAG_STORE.moved(str(path), target)
+        except Exception:
+            pass
+        return target
+
+    def make_folder(self, path):
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def copy_to(self, paths, folder):
+        GLib.idle_add(lambda: self._m.win.transfer(list(paths), False, folder) or False)
+
+    def move_to(self, paths, folder):
+        GLib.idle_add(lambda: self._m.win.transfer(list(paths), True, folder) or False)
+
+    def run_in_background(self, work, done=None):
+        """work() runs off the main thread; done(result) runs back on it. Both are guarded."""
+        def runner():
+            res = self._m.guard(self._p, work)
+            if done is not None:
+                GLib.idle_add(lambda: self._m.guard(self._p, done, res) and False)
+        threading.Thread(target=runner, daemon=True).start()
+
+    def save_config(self):
+        write_json(self.data_dir / "config.json", self.config)
+
+    def play(self, animation, **where):
+        """One of Arckad-D's animations (e.g. "new_folder", "zip", "plane"), in the middle of the window."""
+        w = self._m.win
+        if animation in ANIMS:
+            w.play(animation, **(where or {"at": w.pt_center()}))
+
+    def log(self, *text):
+        try:
+            with open(self.data_dir / "plugin.log", "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(t) for t in text) + "\n")
+        except OSError:
+            pass
+
+
+class PluginManager:
+    def __init__(self):
+        self.win = None
+        self.plugins = {}                                      # id → {id, name, folder, man, enabled, signed, ...}
+
+    def folders(self):
+        out = [PLUGINS_DIR]
+        dev = self.win.cfg.get("plugin_dev_dir") if self.win else None
+        if dev and os.path.isdir(dev):
+            out.append(Path(dev))
+        return out
+
+    def start(self, win):
+        self.win = win
+        PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+        self.load_all()
+        self.emit("startup")
+
+    def load_all(self):
+        for pid in list(self.plugins):
+            self.unload(pid, rebuild=False)
+        self.plugins = {}
+        for root in self.folders():
+            for folder in sorted(p for p in Path(root).iterdir() if p.is_dir()) if Path(root).is_dir() else []:
+                man = read_manifest(folder)
+                if not man or not man.get("id"):
+                    continue
+                dev = root != PLUGINS_DIR
+                self.plugins[man["id"]] = {"id": man["id"], "name": man.get("name", man["id"]), "folder": folder,
+                                           "man": man, "dev": dev, "signed": plugin_signed(folder), "regs": [],
+                                           "errors": 0, "state": "off", "why": ""}
+        for pid in self.plugins:
+            if pid not in (self.win.cfg.get("plugins_off") or []):
+                self.load(pid, rebuild=False)
+        self.rebuild()
+
+    def allowed(self, p):
+        if p["signed"]:
+            return True, ""
+        if p["dev"] and self.win.cfg.get("plugin_dev_dir"):
+            return True, ""
+        if self.win.cfg.get("allow_community_plugins"):
+            return True, ""
+        return False, "not signed by the owner (switch on “Allow community plugins” to use it)"
+
+    def load(self, pid, rebuild=True):
+        p = self.plugins.get(pid)
+        if p is None:
+            return False
+        p["regs"], p["errors"] = [], 0
+        man = p["man"]
+        ok, why = self.allowed(p)
+        if ok and not version_ok(man.get("arckad", "")):
+            ok, why = False, f"made for Arckad-D {man.get('arckad')} (this is {APP_VERSION})"
+        plat = "windows" if IS_WIN else "linux"
+        if ok and plat not in man.get("platforms", ["linux", "windows"]):
+            ok, why = False, f"not made for {'Windows' if IS_WIN else 'Linux'}"
+        if not ok:
+            p["state"], p["why"] = "blocked", why
+            return False
+        try:
+            spec = importlib.util.spec_from_file_location(f"arckad_plugin_{pid.replace('-', '_')}",
+                                                          str(p["folder"] / "plugin.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            p["module"] = mod
+            p["api"] = PluginAPI(self, p)
+            mod.setup(p["api"])
+            p["state"], p["why"] = "on", ""
+        except Exception as ex:
+            p["regs"] = []
+            p["state"], p["why"] = "failed", f"couldn't start: {type(ex).__name__}: {ex}"
+            self._log(p, traceback.format_exc())
+            return False
+        if rebuild:
+            self.rebuild()
+        return True
+
+    def unload(self, pid, rebuild=True):
+        p = self.plugins.get(pid)
+        if p:
+            p["regs"] = []
+            p["state"] = "off"
+            p.pop("module", None)
+        if rebuild:
+            self.rebuild()
+
+    def set_enabled(self, pid, on):
+        off = set(self.win.cfg.get("plugins_off") or [])
+        (off.discard if on else off.add)(pid)
+        self.win.cfg["plugins_off"] = sorted(off)
+        write_json(CONFIG_FILE, self.win.cfg)
+        self.load(pid) if on else self.unload(pid)
+
+    def _log(self, p, text):
+        try:
+            d = PLUGIN_DATA / p["id"]
+            d.mkdir(parents=True, exist_ok=True)
+            with open(d / "plugin.log", "a", encoding="utf-8") as f:
+                f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text + "\n")
+        except OSError:
+            pass
+
+    def guard(self, p, fn, *args):
+        """Runs plugin code. A failure is logged and shown; after 3 failures the plugin is switched off."""
+        try:
+            return fn(*args)
+        except Exception as ex:
+            p["errors"] = p.get("errors", 0) + 1
+            self._log(p, traceback.format_exc())
+            msg = f"🧩 {p['name']} had a problem: {type(ex).__name__}: {ex}"
+            if p["errors"] >= 3:
+                msg += " · it has been switched off (Settings → Plugins)"
+                why = f"switched off after errors: {type(ex).__name__}: {ex}"
+
+                def off():
+                    self.unload(p["id"])
+                    p["state"], p["why"] = "failed", why
+                    return False
+                GLib.idle_add(off)
+            GLib.idle_add(lambda: self.win.flash_all(msg) or False)
+            return None
+
+    def regs(self, kind):
+        for p in self.plugins.values():
+            if p["state"] == "on":
+                for k, r in p["regs"]:
+                    if k == kind:
+                        yield p, r
+
+    def emit(self, event, *args):
+        for p, r in list(self.regs("event")):
+            if r["event"] == event:
+                self.guard(p, r["fn"], p["api"], *args)
+
+    def rebuild(self):
+        """Pages and sidebar entries follow the plugins that are on."""
+        if not self.win:
+            return
+        win = self.win
+        for name in [n for n in getattr(win, "_plugin_pages", [])]:
+            child = win.lib_stack.get_child_by_name(name)
+            if child is not None:
+                win.lib_stack.remove(child)
+        win._plugin_pages = []
+        for p, r in self.regs("page"):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=12)
+            win.lib_stack.add_named(box, r["key"])
+            win._plugin_pages.append(r["key"])
+            box.show_all()
+        win.build_sidebar()
+
+    def open_page(self, key):
+        for p, r in self.regs("page"):
+            if r["key"] == key:
+                box = self.win.lib_stack.get_child_by_name(key)
+                for c in box.get_children():
+                    box.remove(c)
+                head = Gtk.Label(xalign=0)
+                head.set_markup(f"<span size='x-large'><b>{esc(r['icon'])} {esc(r['title'])}</b></span>  "
+                                f"<small>· plugin: {esc(p['name'])}</small>")
+                box.add(head)
+                inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+                sw = Gtk.ScrolledWindow(vexpand=True)
+                sw.add(inner)
+                box.pack_start(sw, True, True, 0)
+                self.guard(p, r["build"], p["api"], inner)
+                box.show_all()
+                self.win.lib_stack.set_visible_child_name(key)
+                return True
+        return False
+
+    def preview_for(self, path):
+        ext = ext_of(path)
+        for p, r in self.regs("preview"):
+            if ext in r["exts"]:
+                return p, r
+        return None
+
+    # ---------- installing
+    def install_folder(self, src, require_signed=False):
+        problems, man, _r = check_plugin(src)
+        if problems:
+            raise ValueError("This plugin has problems:\n• " + "\n• ".join(problems))
+        signed = plugin_signed(src)
+        if require_signed and not signed:
+            raise PermissionError("This plugin isn't signed by the owner.")
+        if not signed and not self.win.cfg.get("allow_community_plugins"):
+            raise PermissionError("This plugin isn't signed by the owner. To install community plugins, switch on "
+                                  "“Allow community plugins” in the Plugins window first.")
+        dest = PLUGINS_DIR / man["id"]
+        if dest.exists():
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        self.load_all()
+        return man
+
+    def install_zip(self, zpath, require_signed=False):
+        tmp = Path(tempfile.mkdtemp(prefix="arckad-plugin-"))
+        try:
+            with zipfile.ZipFile(zpath) as z:
+                for info in z.infolist():                       # nothing may land outside the folder
+                    target = (tmp / info.filename).resolve()
+                    if not str(target).startswith(str(tmp.resolve()) + os.sep) and target != tmp.resolve():
+                        raise ValueError("unsafe file name inside the zip")
+                z.extractall(tmp)
+            roots = [p.parent for p in tmp.rglob("plugin.json")]
+            if len(roots) != 1:
+                raise ValueError("the zip must contain exactly one plugin (one plugin.json)")
+            return self.install_folder(roots[0], require_signed)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def remove(self, pid):
+        p = self.plugins.get(pid)
+        if p and not p["dev"]:
+            self.unload(pid, rebuild=False)
+            shutil.rmtree(p["folder"], ignore_errors=True)
+        self.load_all()
+
+    def catalogue(self):
+        with urllib.request.urlopen(PLUGIN_CATALOG, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return [e for e in data.get("plugins", []) if isinstance(e, dict) and e.get("id")]
+
+    def install_from_catalogue(self, entry):
+        url = str(entry.get("download", ""))
+        if not url.startswith("https://"):
+            raise ValueError("the catalogue entry has no download link")
+        tmp = Path(tempfile.mkdtemp(prefix="arckad-dl-")) / "plugin.zip"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+                shutil.copyfileobj(r, f)
+            return self.install_zip(tmp, require_signed=True)     # from the catalogue: owner-signed only
+        finally:
+            shutil.rmtree(tmp.parent, ignore_errors=True)
+
+
+PLUGINS = PluginManager()
+
+PLUGIN_TEMPLATE_JSON = """{
+  "id": "my-plugin",
+  "name": "My plugin",
+  "version": "1.0.0",
+  "author": "Your name",
+  "description": "What it does, in one line.",
+  "arckad": ">=%s",
+  "platforms": ["linux", "windows"],
+  "api": 1
+}
+"""
+
+PLUGIN_TEMPLATE_PY = '''"""My plugin for Arckad-D. The format is explained in PLUGINS.md."""
+
+
+def setup(arckad):
+    # 1. a right-click item, only for PDF files
+    arckad.add_file_action("Count the selected PDFs", count_pdfs,
+                           when=lambda paths: all(p.lower().endswith(".pdf") for p in paths))
+    # 2. a Tools menu item (also in the command palette, Ctrl+K)
+    arckad.add_tool("Say hello", say_hello)
+    # 3. its own page, in the sidebar under PLUGINS
+    arckad.add_page("My plugin", build_page)
+    # 4. something that happens by itself
+    arckad.on("download_finished", lambda arckad, path: arckad.log("downloaded", path))
+
+
+def count_pdfs(arckad, paths):
+    arckad.notify(f"{len(paths)} PDF file(s) selected")
+
+
+def say_hello(arckad):
+    name = arckad.ask("Hello", "What's your name?", "")
+    if name:
+        arckad.notify(f"Hello, {name}!")
+
+
+def build_page(arckad, box):
+    Gtk = arckad.Gtk
+    box.add(Gtk.Label(label="This page belongs to My plugin.", xalign=0))
+    button = Gtk.Button(label="Show the current folder")
+    button.connect("clicked", lambda *_: arckad.notify(arckad.current_folder() or "no folder"))
+    box.add(button)
+'''
+
+
+def new_plugin(folder):
+    """Makes a new plugin folder from the template (for anyone writing a plugin)."""
+    folder = Path(folder)
+    if folder.exists() and any(folder.iterdir()):
+        raise FileExistsError(f"{folder} isn't empty")
+    folder.mkdir(parents=True, exist_ok=True)
+    pid = re.sub(r"[^a-z0-9-]", "-", folder.name.lower()).strip("-")[:40] or "my-plugin"
+    if len(pid) < 2:
+        pid = "my-plugin"
+    (folder / "plugin.json").write_text(PLUGIN_TEMPLATE_JSON.replace('"my-plugin"', json.dumps(pid))
+                                        % ".".join(APP_VERSION.split(".")[:2]), encoding="utf-8")
+    (folder / "plugin.py").write_text(PLUGIN_TEMPLATE_PY, encoding="utf-8")
+    return folder
+
+
+
 class TabWindow(Gtk.Window):
     """A tab pulled out of Arckad-D (like Chrome): its own window, with its own tab bar. Tabs drag back and forth
     between windows; shortcuts work here too; the window closes when its last tab leaves."""
@@ -27069,6 +27674,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self.setup_clip_sync()
         TEAM.start(self)
         GUARD.start(self)
+        GLib.idle_add(lambda: PLUGINS.start(self) or False)
         if ICON_FONTS:
             GLib.timeout_add(2500, lambda: (os.environ.pop("FONTCONFIG_FILE", None),
                                             os.environ.pop("PANGOCAIRO_BACKEND", None)) and False)
@@ -27391,6 +27997,7 @@ class MainWindow(Gtk.ApplicationWindow):
             ("🏢 Organisation…", self.org_dialog),
             ("👥 People directory…", self.people_directory),
             ("📁 Team folders…", self.team_folders),
+            ("🧩 Plugins…", self.plugins_window),
             ("💾 Backups…", self.backups_dialog),
             ("📢 Send an announcement…", self.announce_dialog),
             ("🧭 Command palette (Ctrl+K)", lambda: CommandPalette(self)),
@@ -27441,7 +28048,8 @@ class MainWindow(Gtk.ApplicationWindow):
             None,
             ("Update search index now", INDEX.rebuild),
             ("🎵 Music player (on / off)", self.music_toggle),
-        ] + [("Install optional features…", self.windows_features_dialog if IS_WIN else self.features_dialog)] + [
+        ] + [("Install optional features…", self.windows_features_dialog if IS_WIN else self.features_dialog),
+             self._plugins_menu_item()] + [
             ("🕘 Version history…", self.version_settings),
             ("⚙ Folder rules…", lambda: (lambda d: (d.run(), d.destroy()))(RulesDialog(self))),
             ("📊 Disk usage map…", lambda: DiskUsageWindow(self, self.active.location if is_folder_loc(self.active.location)
@@ -28375,6 +28983,11 @@ class MainWindow(Gtk.ApplicationWindow):
             self._side_row(tag, None, "tag:" + tag, dot=color)
         self._side_row("Files with notes", "accessories-text-editor-symbolic", "notes")
         pinned = [p for p in self.cfg["pinned"] if os.path.isdir(p)]
+        pages = list(PLUGINS.regs("page"))
+        if pages:
+            self._side_header("Plugins")
+            for _pl, r in pages:
+                self._side_row(r["title"], "application-x-addon-symbolic", r["key"])
         teams = TEAM.folders()
         if teams:
             self._side_header("Team folders")
@@ -28431,6 +29044,9 @@ class MainWindow(Gtk.ApplicationWindow):
     def _drives_changed(self, monitor, obj, sig):
         if sig == "mount-added" and hasattr(obj, "get_name"):
             self.active.flash(f"“{obj.get_name()}” connected: it's in the sidebar under Devices")
+            root = obj.get_root().get_path() if hasattr(obj, "get_root") and obj.get_root() else None
+            if root:
+                PLUGINS.emit("drive_added", root)
         if sig == "mount-removed":
             root = obj.get_root().get_path() if obj.get_root() else None
             if root:
@@ -28701,6 +29317,9 @@ class MainWindow(Gtk.ApplicationWindow):
         if key == "trash:":
             self.lib_stack.set_visible_child_name("trash")
             self.trash_view.refresh()
+            return
+        if key.startswith("plugin:"):
+            PLUGINS.open_page(key)
             return
         if key == "timeline:":
             self.lib_stack.set_visible_child_name("timeline")
@@ -30267,6 +30886,7 @@ class MainWindow(Gtk.ApplicationWindow):
         pane.refresh()
 
     def trash(self, pane, paths):
+        GLib.idle_add(lambda p=list(paths): PLUGINS.emit("files_trashed", p) and False)
         if paths and animations_on(self):
             fly_to_trash(self, self._trash_start_point(pane), len(paths))     # crumple, fly into the Trash
         done = 0
@@ -33427,6 +34047,290 @@ class MainWindow(Gtk.ApplicationWindow):
             return self._pp.get_visible()
         GLib.timeout_add_seconds(2, maybe_hide)
 
+    def _plugins_menu_item(self):
+        """Tools → 🧩 Plugins: the plugins' own tools (filled each time it opens) and the Plugins window."""
+        item = Gtk.MenuItem(label="🧩 Plugins")
+        sub = Gtk.Menu()
+        item.set_submenu(sub)
+
+        def fill(*_):
+            for c in sub.get_children():
+                sub.remove(c)
+            tools = list(PLUGINS.regs("tool"))
+            for pl, r in tools:
+                it = Gtk.MenuItem(label=f"{r['icon']} {r['label']}")
+                it.connect("activate", lambda _i, pl=pl, r=r: PLUGINS.guard(pl, r["run"], pl["api"]))
+                sub.append(it)
+            if tools:
+                sub.append(Gtk.SeparatorMenuItem())
+            m = Gtk.MenuItem(label="Manage plugins…")
+            m.connect("activate", lambda *_: self.plugins_window())
+            sub.append(m)
+            sub.show_all()
+        item.connect("activate", fill)
+        fill()
+        return item
+
+    # ---------- 🧩 the Plugins window
+    def plugins_window(self):
+        w = getattr(self, "_plugins_win", None)
+        if w is not None and w.get_visible():
+            return w.present()
+        d = Gtk.Window(title="🧩 Plugins", transient_for=self)
+        d.set_default_size(760, 600)
+        self._plugins_win = d
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin=14)
+        d.add(box)
+        head = Gtk.Label(xalign=0, wrap=True)
+        head.set_markup("<span size='x-large'><b>🧩 Plugins</b></span>\nAdd features to Arckad-D. Plugins appear in the "
+                        "right-click menu, Tools → Plugins, the command palette, the sidebar and the preview panel. "
+                        "Plugins <b>signed by the owner ✓</b> are checked; community plugins are not.")
+        box.add(head)
+        bar = Gtk.Box(spacing=6)
+        for label, cb in (("📦 Catalogue…", lambda: self._plugin_catalogue(d)),
+                          ("＋ Install from a file…", lambda: self._plugin_install_file(d)),
+                          ("🛠 Create a plugin…", lambda: self._plugin_create(d)),
+                          ("✔ Check a plugin…", lambda: self._plugin_check(d))):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, cb=cb: cb())
+            bar.add(b)
+        if owner_key():
+            sb = Gtk.Button(label="✍ Sign a plugin (owner)…")
+            sb.connect("clicked", lambda *_: self._plugin_sign(d))
+            bar.add(sb)
+        box.add(bar)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        box.pack_start(sw, True, True, 0)
+        opts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        allow = Gtk.CheckButton(label="Allow community plugins (not signed by the owner: only install ones you trust)")
+        allow.set_active(bool(self.cfg.get("allow_community_plugins")))
+        dev_row = Gtk.Box(spacing=8)
+        dev = Gtk.CheckButton(label="Developer mode: also load plugins from this folder")
+        dev.set_active(bool(self.cfg.get("plugin_dev_dir")))
+        dev_dir = Gtk.FileChooserButton(title="Plugin development folder", action=Gtk.FileChooserAction.SELECT_FOLDER)
+        if self.cfg.get("plugin_dev_dir"):
+            dev_dir.set_filename(self.cfg["plugin_dev_dir"])
+        dev_row.add(dev)
+        dev_row.pack_start(dev_dir, True, True, 0)
+        opts.add(allow)
+        opts.add(dev_row)
+        box.add(opts)
+
+        def fill():
+            for c in lst.get_children():
+                lst.remove(c)
+            items = sorted(PLUGINS.plugins.values(), key=lambda p: p["name"].lower())
+            if not items:
+                lst.add(Gtk.Label(label="No plugins yet. Open the Catalogue, or install one from a file.", margin=24))
+            for p in items:
+                man = p["man"]
+                row = Gtk.Box(spacing=10, margin=8)
+                icon = Gtk.Image()
+                ip = p["folder"] / "icon.png"
+                try:
+                    icon.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file_at_scale(str(ip), 40, 40, True)) if ip.exists() \
+                        else icon.set_from_icon_name("application-x-addon", Gtk.IconSize.DND)
+                except GLib.Error:
+                    icon.set_from_icon_name("application-x-addon", Gtk.IconSize.DND)
+                row.add(icon)
+                places = sorted({ {"file_action": "right-click", "tool": "Tools menu", "page": "own page",
+                                   "preview": "preview panel", "settings": "settings", "event": "runs by itself"}[k]
+                                  for k, _r in p["regs"]})
+                trust = "✓ signed by the owner" if p["signed"] else ("developer folder" if p["dev"] else "community")
+                state = {"on": "On", "off": "Off", "blocked": "Blocked", "failed": "Stopped"}[p["state"]]
+                lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+                lbl.set_markup(f"<b>{esc(p['name'])}</b>  <small>{esc(str(man.get('version', '')))} · "
+                               f"{esc(str(man.get('author', '?')))} · {esc(trust)}</small>\n"
+                               f"<small>{esc(str(man.get('description', '')))}</small>\n"
+                               f"<small>{esc(state)}" + (f": {esc(p['why'])}" if p["why"] else "") +
+                               (f" · appears in: {esc(', '.join(places))}" if places else "") + "</small>")
+                row.pack_start(lbl, True, True, 0)
+                sw_ = Gtk.Switch(valign=Gtk.Align.CENTER)
+                sw_.set_active(p["state"] == "on")
+                sw_.set_sensitive(p["state"] != "blocked")
+                sw_.connect("notify::active", lambda s, _p, pid=p["id"]: (PLUGINS.set_enabled(pid, s.get_active()),
+                                                                         GLib.idle_add(lambda: fill() or False)))
+                row.add(sw_)
+                for kind, r in [x for x in p["regs"] if x[0] == "settings"][:1]:
+                    sb = Gtk.Button(label="Settings", valign=Gtk.Align.CENTER)
+                    sb.connect("clicked", lambda _b, p=p, r=r: self._plugin_settings(d, p, r))
+                    row.add(sb)
+                if not p["dev"]:
+                    rb = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
+                    rb.connect("clicked", lambda _b, p=p: self.confirm(f"Remove the plugin “{p['name']}”?")
+                               and (PLUGINS.remove(p["id"]), fill()))
+                    row.add(rb)
+                r_ = Gtk.ListBoxRow()
+                r_.add(row)
+                lst.add(r_)
+            lst.show_all()
+        self._plugins_fill = fill
+
+        def toggle_allow(b):
+            if b.get_active() and not self.cfg.get("allow_community_plugins") and not self.confirm(
+                    "Allow community plugins?\n\nThey aren't checked by the owner. A plugin runs with your permissions "
+                    "and can read and change your files. Only install plugins from people you trust."):
+                b.set_active(False)
+                return
+            self.cfg["allow_community_plugins"] = b.get_active()
+            write_json(CONFIG_FILE, self.cfg)
+            PLUGINS.load_all()
+            fill()
+        allow.connect("toggled", toggle_allow)
+
+        def dev_changed(*_):
+            self.cfg["plugin_dev_dir"] = dev_dir.get_filename() if dev.get_active() and dev_dir.get_filename() else ""
+            write_json(CONFIG_FILE, self.cfg)
+            PLUGINS.load_all()
+            fill()
+        dev.connect("toggled", dev_changed)
+        dev_dir.connect("file-set", dev_changed)
+        fill()
+        d.show_all()
+        return d
+
+    def _plugin_settings(self, parent, p, r):
+        dlg = Gtk.Dialog(title=f"{p['name']} · settings", transient_for=parent, modal=True)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=14)
+        dlg.get_content_area().add(inner)
+        PLUGINS.guard(p, r["build"], p["api"], inner)
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+        p["api"].save_config()
+
+    def _pick(self, parent, title, folder=False, patterns=None):
+        ch = Gtk.FileChooserDialog(title=title, transient_for=parent,
+                                   action=Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN)
+        ch.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Choose", Gtk.ResponseType.OK)
+        if patterns:
+            f = Gtk.FileFilter()
+            f.set_name("Plugins")
+            for pat in patterns:
+                f.add_pattern(pat)
+            ch.add_filter(f)
+        got = ch.get_filename() if ch.run() == Gtk.ResponseType.OK else None
+        ch.destroy()
+        return got
+
+    def _plugin_install_file(self, parent):
+        path = self._pick(parent, "A plugin (.zip, or its plugin.json)", patterns=["*.zip", "plugin.json"])
+        if not path:
+            return
+        try:
+            man = PLUGINS.install_zip(path) if path.lower().endswith(".zip") else \
+                PLUGINS.install_folder(os.path.dirname(path))
+        except (ValueError, PermissionError, OSError, zipfile.BadZipFile) as ex:
+            return self.error(str(ex))
+        self.flash_all(f"🧩 Installed “{man.get('name')}”")
+        getattr(self, "_plugins_fill", lambda: None)()
+
+    def _plugin_catalogue(self, parent):
+        dlg = Gtk.Dialog(title="📦 Plugin catalogue", transient_for=parent, modal=True)
+        dlg.add_button("Close", Gtk.ResponseType.CLOSE)
+        dlg.set_default_size(620, 460)
+        box = dlg.get_content_area()
+        box.set_border_width(12)
+        box.set_spacing(8)
+        info = Gtk.Label(label="Loading the catalogue…", xalign=0)
+        box.add(info)
+        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        sw = Gtk.ScrolledWindow(vexpand=True)
+        sw.add(lst)
+        box.pack_start(sw, True, True, 0)
+
+        def show(entries, err):
+            if err:
+                info.set_text(f"Couldn't load the catalogue: {err}")
+                return False
+            info.set_text(f"{len(entries)} plugin{'s' if len(entries) != 1 else ''}, all signed by the owner." if entries
+                          else "The catalogue is empty for now.")
+            for e in entries:
+                row = Gtk.Box(spacing=10, margin=8)
+                have = PLUGINS.plugins.get(e["id"])
+                fits = version_ok(e.get("arckad", "")) and ("windows" if IS_WIN else "linux") in \
+                    e.get("platforms", ["linux", "windows"])
+                lbl = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+                lbl.set_markup(f"<b>{esc(e.get('name', e['id']))}</b>  <small>{esc(str(e.get('version', '')))} · "
+                               f"{esc(str(e.get('author', '')))}</small>\n<small>{esc(str(e.get('description', '')))}"
+                               + ("" if fits else " · not for this Arckad-D") + "</small>")
+                row.pack_start(lbl, True, True, 0)
+                newer = have and _version_tuple(e.get("version")) > _version_tuple(have["man"].get("version"))
+                b = Gtk.Button(label="Update" if newer else ("Installed" if have else "Install"))
+                b.set_sensitive(fits and (not have or newer))
+                b.get_style_context().add_class("suggested-action")
+
+                def go(btn, e=e):
+                    btn.set_sensitive(False)
+                    btn.set_label("Installing…")
+
+                    def work():
+                        try:
+                            PLUGINS_RES = (PLUGINS.install_from_catalogue(e), None)
+                        except Exception as ex:
+                            PLUGINS_RES = (None, str(ex))
+                        GLib.idle_add(lambda: (btn.set_label("Installed" if not PLUGINS_RES[1] else "Failed"),
+                                               PLUGINS_RES[1] and self.error(PLUGINS_RES[1]),
+                                               getattr(self, "_plugins_fill", lambda: None)()) and False)
+                    threading.Thread(target=work, daemon=True).start()
+                b.connect("clicked", go)
+                row.add(b)
+                r = Gtk.ListBoxRow()
+                r.add(row)
+                lst.add(r)
+            lst.show_all()
+            return False
+
+        def work():
+            try:
+                GLib.idle_add(show, PLUGINS.catalogue(), None)
+            except Exception as ex:
+                GLib.idle_add(show, [], str(ex))
+        threading.Thread(target=work, daemon=True).start()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def _plugin_create(self, parent):
+        folder = self._pick(parent, "Make the new plugin inside this folder", folder=True)
+        if not folder:
+            return
+        name = self.ask_text("Create a plugin", "Plugin name (small letters and -, e.g. invoice-renamer):", "my-plugin")
+        if not name:
+            return
+        try:
+            made = new_plugin(os.path.join(folder, re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-") or "my-plugin"))
+        except (OSError, FileExistsError) as ex:
+            return self.error(str(ex))
+        self.info(f"🛠 Made {made}\n\nEdit plugin.json and plugin.py in any text editor (the format is in PLUGINS.md).\n\n"
+                  "To try it: switch on Developer mode in the Plugins window and choose the folder that holds it.")
+        self.show_files()
+        self.active.go(str(made))
+
+    def _plugin_check(self, parent):
+        folder = self._pick(parent, "The plugin's folder", folder=True)
+        if not folder:
+            return
+        problems, _man, report = check_plugin(folder)
+        self.info(("✔ Ready to use and share.\n\n" if not problems else "✗ Needs fixing:\n• " + "\n• ".join(problems) + "\n\n")
+                  + "\n".join(report))
+
+    def _plugin_sign(self, parent):
+        folder = self._pick(parent, "The plugin to sign", folder=True)
+        if not folder:
+            return
+        try:
+            out, entry = sign_plugin(folder)
+        except (PermissionError, ValueError, OSError) as ex:
+            return self.error(str(ex))
+        txt = json.dumps(entry, indent=2)
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(txt, -1)
+        self.info(f"✍ Signed. Made {out.name}.\n\nTo publish: put the zip in your repository's plugins/ folder and add "
+                  f"this entry to plugins/catalog.json (it's on the clipboard):\n\n{txt}")
+
     # ---------- 📁 team folders
     def team_folders(self):
         d = Gtk.Dialog(title="📁 Team folders", transient_for=self, modal=False)
@@ -33891,6 +34795,28 @@ def main():
     install_error_recorder()
     if "--owner-setup" in sys.argv:
         sys.exit(owner_setup())
+    for flag in ("--check-plugin", "--sign-plugin", "--new-plugin"):        # 🧩 tools for plugin writers
+        if flag in sys.argv:
+            i = sys.argv.index(flag)
+            folder = sys.argv[i + 1] if len(sys.argv) > i + 1 else ""
+            if not folder:
+                print(f"Usage: arckad-d {flag} <plugin folder>")
+                sys.exit(2)
+            try:
+                if flag == "--new-plugin":
+                    print(f"Made {new_plugin(folder)}: edit plugin.json and plugin.py (see PLUGINS.md).")
+                    sys.exit(0)
+                if flag == "--sign-plugin":
+                    out, entry = sign_plugin(folder)
+                    print(f"Signed. Publish {out} and add this to plugins/catalog.json:\n" + json.dumps(entry, indent=2))
+                    sys.exit(0)
+                problems, _man, report = check_plugin(folder)
+                print("\n".join(report))
+                print("\n✔ Ready to use and share." if not problems else "\n✗ Needs fixing:\n  • " + "\n  • ".join(problems))
+                sys.exit(1 if problems else 0)
+            except (OSError, ValueError, PermissionError) as ex:
+                print(f"✗ {ex}")
+                sys.exit(1)
     if "--selftest" in sys.argv:
         i = sys.argv.index("--selftest")
         sys.exit(selftest(sys.argv[i + 1] if len(sys.argv) > i + 1 else "selftest.txt"))

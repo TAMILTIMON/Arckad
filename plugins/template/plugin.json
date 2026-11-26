@@ -1,0 +1,10 @@
+{
+  "id": "my-plugin",
+  "name": "My plugin",
+  "version": "1.0.0",
+  "author": "Your name",
+  "description": "What it does, in one line.",
+  "arckad": ">=3.65",
+  "platforms": ["linux", "windows"],
+  "api": 1
+}
