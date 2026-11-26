@@ -230,7 +230,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.65.1"
+APP_VERSION = "3.65.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -27214,6 +27214,55 @@ class PluginAPI:
 
     def move_to(self, paths, folder):
         GLib.idle_add(lambda: self._m.win.transfer(list(paths), True, folder) or False)
+
+    def install_system_software(self, label, reason, win_id=None, linux_packages=None, done=None):
+        """Installs something the plugin needs using the PC's own installer — the same safe, one-password-prompt
+        mechanism Arckad-D uses for its own optional features (winget on Windows, apt via pkexec on Linux). Never
+        silent: the person always sees the system's own install window or password prompt.
+        win_id: a winget package id (e.g. "ArtifexSoftware.Ghostscript"). linux_packages: apt package name(s), tried
+        in order (e.g. ["clamav"]). done(ok, message) runs back on the main thread when it finishes, or right away
+        if this platform or install path isn't available."""
+        if not self.confirm(f"{label} isn't installed.\n\n{reason}\n\nInstall it now?"):
+            return
+        if IS_WIN:
+            if not win_id:
+                return self.error(f"{label} needs to be installed by hand on Windows (no automatic installer for it "
+                                  "is set up for this plugin).")
+            winget = shutil.which("winget")
+            if not winget:
+                return self.error("Windows' own installer (winget) isn't on this PC.")
+
+            def work():
+                ids = [win_id] + winget_find(winget, label)
+                ok, msg = False, "not found"
+                for pid in ids:
+                    try:
+                        r = subprocess.run([winget, "install", "--id", pid, "-e", "--silent",
+                                            "--accept-package-agreements", "--accept-source-agreements",
+                                            "--disable-interactivity"], capture_output=True, text=True,
+                                           encoding="utf-8", errors="replace", timeout=900,
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                        out = (r.stdout or "") + (r.stderr or "")
+                        if r.returncode == 0 or "already installed" in out.lower():
+                            ok, msg = True, f"{label} installed"
+                            break
+                        if "no package found" not in out.lower():
+                            msg = (out.strip().splitlines() or ["failed"])[-1][:200]
+                            break
+                    except (OSError, subprocess.SubprocessError) as ex:
+                        msg = str(ex)
+                GLib.idle_add(lambda: (self.notify(msg) if ok else self.error(f"{label}: {msg}"),
+                                       done and done(ok, msg)) and False)
+        else:
+            if not linux_packages:
+                return self.error(f"{label} needs to be installed by hand on this Linux distribution (no automatic "
+                                  "installer for it is set up for this plugin).")
+
+            def work():
+                ok, msg = install_packages(linux_packages)
+                GLib.idle_add(lambda: (self.notify(msg) if ok else self.error(f"{label}: {msg}"),
+                                       done and done(ok, msg)) and False)
+        self.run_in_background(work)
 
     def run_in_background(self, work, done=None):
         """work() runs off the main thread; done(result) runs back on it. Both are guarded."""

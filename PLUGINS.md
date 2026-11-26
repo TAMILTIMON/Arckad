@@ -88,6 +88,7 @@ Each `fn` gets `arckad` first, e.g. `def saved(arckad, path): …`.
 | `arckad.copy_to(paths, folder)` / `arckad.move_to(paths, folder)` | Copies / moves, like Ctrl+C / Ctrl+X then Ctrl+V |
 | `arckad.refresh()` | Re-reads the folders on screen |
 | `arckad.run_in_background(work, done=None)` | `work()` off the main thread, then `done(result)` back on it (for slow jobs) |
+| `arckad.install_system_software(label, reason, win_id=None, linux_packages=None, done=None)` | Installs something your plugin needs, using the PC's own installer — the same mechanism Arckad-D uses for its own optional features (winget on Windows, apt via one password prompt on Linux). Always asks first, never silent. `done(ok, msg)` runs when it finishes. |
 | `arckad.config` / `arckad.save_config()` | The plugin's own settings (a dict, saved for it) |
 | `arckad.data_dir` | A folder where the plugin may keep its own files |
 | `arckad.play(name)` | One of Arckad-D's animations: `new_folder`, `zip`, `plane`, `download`… |

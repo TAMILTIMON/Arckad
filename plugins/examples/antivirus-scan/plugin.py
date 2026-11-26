@@ -58,9 +58,9 @@ def _run_clamav(exe, path):
 def scan_paths(arckad, paths, quiet=False):
     kind, exe = find_scanner()
     if not exe:
-        msg = ("Windows Defender wasn't found on this PC." if sys.platform == "win32" else
-              "ClamAV isn't installed. On Ubuntu: sudo apt install clamav, then sudo freshclam once.")
-        return arckad.error(msg) if not quiet else arckad.log("no scanner:", msg)
+        if quiet:
+            return arckad.log("no scanner installed; skipped the automatic scan")
+        return offer_install(arckad, lambda: scan_paths(arckad, paths, quiet))
     if not quiet:
         arckad.notify(f"🛡 Scanning {len(paths)} item{'s' if len(paths) != 1 else ''}…")
 
@@ -108,6 +108,17 @@ def scan_download(arckad, path):
         scan_paths(arckad, [path], quiet=True)
 
 
+def offer_install(arckad, then):
+    """No scanner found: install it with one password prompt, the same way Arckad-D installs its own optional
+    features, then run the scan that was waiting on it."""
+    if sys.platform == "win32":
+        return arckad.error("Windows Defender wasn't found on this PC (it may be turned off in Windows Security).")
+    arckad.install_system_software(
+        "ClamAV", "It checks files for known viruses. (After installing, Arckad-D also needs the virus database — "
+                  "run “sudo freshclam” once in a terminal, the first time only.)",
+        linux_packages=["clamav"], done=lambda ok, msg: ok and then())
+
+
 def build_settings(arckad, box):
     Gtk = arckad.Gtk
     kind, exe = find_scanner()
@@ -115,8 +126,12 @@ def build_settings(arckad, box):
     status = Gtk.Label(xalign=0, wrap=True)
     status.set_markup(f"Using: <b>{'Windows Defender' if kind == 'defender' else 'ClamAV' if kind == 'clamav' else 'not found'}</b>"
                       + (f"\n<small>{exe}</small>" if exe else
-                         "\n<small>Install ClamAV, or make sure Windows Defender is on, then reopen this page.</small>"))
+                         "\n<small>Install ClamAV, or make sure Windows Defender is on.</small>"))
     box.add(status)
+    if not exe and sys.platform != "win32":
+        install_btn = Gtk.Button(label="⬇ Install ClamAV…")
+        install_btn.connect("clicked", lambda *_: offer_install(arckad, lambda: None))
+        box.add(install_btn)
     auto = Gtk.CheckButton(label="Automatically scan every download")
     auto.set_active(bool(arckad.config.get("scan_downloads")))
 

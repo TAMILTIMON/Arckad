@@ -1,7 +1,7 @@
 {
   "id": "antivirus-scan",
   "name": "Antivirus scan",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "TAMILTIMON",
   "description": "Right-click any file or folder to scan it with Windows Defender or ClamAV. Can also scan downloads automatically.",
   "arckad": ">=3.65",
