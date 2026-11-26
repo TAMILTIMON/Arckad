@@ -1,0 +1,10 @@
+{
+  "id": "folder-lock",
+  "name": "Folder lock",
+  "version": "1.0.0",
+  "author": "TAMILTIMON",
+  "description": "Lock any folder with its own password, blocking access until you unlock it.",
+  "arckad": ">=3.65",
+  "platforms": ["linux", "windows"],
+  "api": 1
+}

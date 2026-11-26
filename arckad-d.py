@@ -230,7 +230,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.65.0"
+APP_VERSION = "3.65.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -26146,6 +26146,9 @@ GUIDE = [
 ]
 
 WHATS_NEW = [
+    ("3.65.1", "Two example plugins: Folder lock (password-lock any folder) and Antivirus scan (right-click to scan "
+               "with Windows Defender or ClamAV); fixed the plugin checker misreporting plugins that read their own "
+               "settings in setup()"),
     ("3.65", "Plugins: add features from the catalogue or a file, owner-signed or community, each in its own place "
              "(right-click, Tools, palette, sidebar page, preview), with a public format anyone can write for"),
     ("3.64", "Glass see-through levels, Reset appearance to default (and single resets for wallpaper, accent colour and "
@@ -27049,10 +27052,17 @@ def read_manifest(folder):
 
 
 class _DryRun:
-    """Stands in for `arckad` when checking a plugin: records what it would add, does nothing."""
+    """Stands in for `arckad` when checking a plugin: records what it would add, does nothing. Plain data attributes
+    (config, data_dir, id, name, platform, version) are real values, since plugins commonly read them in setup()."""
 
-    def __init__(self):
+    def __init__(self, folder):
         self.added = []
+        self.config = {}
+        self.data_dir = Path(tempfile.mkdtemp(prefix="arckad-plugin-check-"))
+        self.id = self.name = Path(folder).name
+        self.platform = "windows" if IS_WIN else "linux"
+        self.version = APP_VERSION
+        self.Gtk, self.Gdk, self.GLib, self.Pango = Gtk, Gdk, GLib, Pango
 
     def __getattr__(self, name):
         if name.startswith("add_") or name == "on":
@@ -27097,7 +27107,7 @@ def check_plugin(folder):
                 try:                                            # what would it add? (a dry run, nothing happens)
                     ns = {"__name__": f"arckad_check_{man.get('id', 'x')}", "__file__": str(code)}
                     exec(compile(src, str(code), "exec"), ns)
-                    dry = _DryRun()
+                    dry = _DryRun(folder)
                     ns["setup"](dry)
                     report.append("Adds: " + (", ".join(sorted(set(dry.added))) or "nothing yet"))
                 except Exception as ex:
