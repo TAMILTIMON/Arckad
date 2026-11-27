@@ -193,8 +193,7 @@ def _wait_for_previous():
 
 _wait_for_previous()
 ICON_FONTS = _professional_icons()
-if sys.platform == "win32":
-    os.environ.setdefault("GDK_WIN32_USE_EXPERIMENTAL_OLE2_DND", "1")     # drops from Explorer and other apps
+# Standard Win32 DnD is used on Windows for reliable Explorer and multi-file drops
 
 try:
     import gi
@@ -3537,17 +3536,50 @@ class FilePane(Gtk.Box):
 
     # ---------- drag and drop
     def _setup_dnd(self):
-        targets = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
+        targets = [
+            Gtk.TargetEntry.new("text/uri-list", 0, 0),
+            Gtk.TargetEntry.new("UTF8_STRING", 0, 1),
+            Gtk.TargetEntry.new("text/plain", 0, 2),
+        ]
         actions = Gdk.DragAction.MOVE | Gdk.DragAction.COPY
-        self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.tree.enable_model_drag_dest(targets, actions)
-        self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.icons.enable_model_drag_dest(targets, actions)
+        self._drag_press = None
         for view in (self.tree, self.icons):
+            view.drag_dest_set(Gtk.DestDefaults.HIGHLIGHT | Gtk.DestDefaults.DROP, targets, actions)
+            view.connect("button-release-event", self._on_drag_release)
+            view.connect("motion-notify-event", self._on_drag_motion, targets, actions)
+            view.connect("drag-motion", self.on_drag_motion_dest)
             view.connect("drag-data-get", self.on_drag_get)
             view.connect("drag-data-received", self.on_drag_received)
-            view.connect("drag-drop", self.on_drag_drop)
-            view.connect_after("drag-begin", self.on_drag_begin)     # after GTK's own (it sets a picture of the row)
+            view.connect_after("drag-begin", self.on_drag_begin)
+
+    def _on_drag_release(self, _view, _event):
+        self._drag_press = None
+        return False
+
+    def _on_drag_motion(self, view, event, targets, actions):
+        if not self._drag_press or not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+        sx, sy = self._drag_press
+        if not view.drag_check_threshold(int(sx), int(sy), int(event.x), int(event.y)):
+            return False
+        self._drag_press = None
+        if not self.selected_paths():
+            return False
+        tl = Gtk.TargetList.new(targets)
+        tl.add_uri_targets(0)
+        tl.add_text_targets(1)
+        view.drag_begin_with_coordinates(tl, actions, 1, event, int(event.x), int(event.y))
+        return True
+
+    def on_drag_motion_dest(self, view, context, x, y, time_):
+        if view is self.tree:
+            hit = self.tree.get_dest_row_at_pos(x, y)
+            if hit and self.sorted[hit[0]][C_ISDIR]:
+                self.tree.set_drag_dest_row(hit[0], Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+            else:
+                self.tree.set_drag_dest_row(None, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+        Gdk.drag_status(context, context.get_suggested_action() or Gdk.DragAction.MOVE, time_)
+        return True
 
     def on_drag_begin(self, view, context):
         """A small picture while dragging: the item's icon, plus a count badge for several (not the whole row)."""
@@ -3599,20 +3631,25 @@ class FilePane(Gtk.Box):
                     return row[C_PATH]
         return self.location if self.mode == "folder" else None
 
-    def on_drag_drop(self, view, context, x, y, time_):
-        view.stop_emission_by_name("drag-drop")            # sorted lists can't take rows; ask for the files instead
-        view.drag_get_data(context, Gdk.Atom.intern("text/uri-list", False), time_)
-        return True
-
     def on_drag_received(self, view, context, x, y, selection, info, time_):
-        view.stop_emission_by_name("drag-data-received")      # we handle it; don't let GTK reorder rows
         dest = self.drop_target(view, x, y)
-        paths = [Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])]
-        paths = [p for p in paths if p]
+        uris = list(selection.get_uris() or [])
+        if not uris:
+            txt = selection.get_text() or ""
+            uris = [ln.strip() for ln in txt.replace("\r", "").split("\n") if ln.strip()]
+        paths = []
+        for u in uris:
+            p = Gio.File.new_for_uri(u).get_path() if "://" in u else u
+            if not p and u.startswith("file://"):
+                p = urllib.request.url2pathname(urllib.parse.urlsplit(u).path)
+            if p and os.path.exists(p):
+                paths.append(p)
         internal = Gtk.drag_get_source_widget(context) is not None
+        action = context.get_selected_action()
         mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
-        ok = self.win.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
-                                  bool(mods & Gdk.ModifierType.SHIFT_MASK))
+        ctrl = (action == Gdk.DragAction.COPY) or bool(mods & Gdk.ModifierType.CONTROL_MASK)
+        shift = (action == Gdk.DragAction.MOVE and not internal) or bool(mods & Gdk.ModifierType.SHIFT_MASK)
+        ok = self.win.handle_drop(paths, dest, internal, ctrl, shift)
         Gtk.drag_finish(context, ok, False, time_)
 
     def apply_icon_style(self):
@@ -4337,6 +4374,15 @@ class FilePane(Gtk.Box):
 
     def on_view_click(self, view, event):
         if event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if event.button == 1:
+            self._drag_press = (event.x, event.y)
+            hit = self._path_at(view, event)
+            if hit is not None and not (event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
+                if view is self.tree and self.tree.get_selection().path_is_selected(hit):
+                    return True
+                if view is self.icons and self.icons.path_is_selected(hit):
+                    return True
             return False
         if event.button == 2:          # middle click a folder: open in new tab
             hit = self._path_at(view, event)
@@ -16319,30 +16365,49 @@ def install_packages(pkgs):
 
 
 # ---------------------------------------------------------------- System clipboard: files to and from other apps
+def _win_open_clipboard(u32):
+    hwnd = u32.GetActiveWindow() or u32.GetForegroundWindow() or None
+    for _ in range(15):
+        if u32.OpenClipboard(hwnd):
+            return True
+        time.sleep(0.015)
+    return bool(u32.OpenClipboard(None))
+
+
 def win_clip_set_files(paths, move):
     """Windows: put files on the clipboard the way Explorer does (CF_HDROP), marked as Cut or Copy."""
     import ctypes
     from ctypes import wintypes
     u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
     k32.GlobalAlloc.restype = wintypes.HGLOBAL
-    k32.GlobalLock.restype = ctypes.c_void_p
     k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalLock.restype = ctypes.c_void_p
     k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
     u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-    files = ("\0".join(os.path.abspath(p) for p in paths) + "\0\0").encode("utf-16-le")
-    header = (20).to_bytes(4, "little") + bytes(12) + (1).to_bytes(4, "little")    # DROPFILES, wide names
-    data = header + files
+    u32.SetClipboardData.restype = wintypes.HANDLE
+
+    abs_paths = [os.path.abspath(p) for p in paths if p]
+    files = ("\0".join(abs_paths) + "\0\0").encode("utf-16-le")
+    header = (20).to_bytes(4, "little") + bytes(12) + (1).to_bytes(4, "little")
+    drop_blob = header + files
+    effect_blob = (2 if move else 5).to_bytes(4, "little")
+    text_blob = ("\r\n".join(abs_paths) + "\0").encode("utf-16-le")
     effect_fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
-    if not u32.OpenClipboard(None):
+
+    if not _win_open_clipboard(u32):
         return False
     try:
         u32.EmptyClipboard()
-        for fmt, blob in ((15, data), (effect_fmt, (2 if move else 5).to_bytes(4, "little"))):   # 15 = CF_HDROP
-            h = k32.GlobalAlloc(0x0042, len(blob))                     # GMEM_MOVEABLE | GMEM_ZEROINIT
+        for fmt, blob in ((15, drop_blob), (effect_fmt, effect_blob), (13, text_blob)):
+            h = k32.GlobalAlloc(0x0042, len(blob))
+            if not h:
+                continue
             ptr = k32.GlobalLock(h)
-            ctypes.memmove(ptr, blob, len(blob))
-            k32.GlobalUnlock(h)
-            u32.SetClipboardData(fmt, h)
+            if ptr:
+                ctypes.memmove(ptr, blob, len(blob))
+                k32.GlobalUnlock(h)
+                u32.SetClipboardData(fmt, h)
     finally:
         u32.CloseClipboard()
     return u32.GetClipboardSequenceNumber()
@@ -16353,12 +16418,15 @@ def win_clip_get_files():
     import ctypes
     from ctypes import wintypes
     u32, k32, sh = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.shell32
+    u32.GetClipboardData.argtypes = [wintypes.UINT]
     u32.GetClipboardData.restype = wintypes.HANDLE
-    k32.GlobalLock.restype = ctypes.c_void_p
     k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalLock.restype = ctypes.c_void_p
     k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
     sh.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
-    if not u32.IsClipboardFormatAvailable(15) or not u32.OpenClipboard(None):
+    sh.DragQueryFileW.restype = wintypes.UINT
+
+    if not u32.IsClipboardFormatAvailable(15) or not _win_open_clipboard(u32):
         return None
     try:
         h = u32.GetClipboardData(15)
@@ -16370,7 +16438,8 @@ def win_clip_get_files():
             size = sh.DragQueryFileW(h, i, None, 0) + 1
             buf = ctypes.create_unicode_buffer(size)
             sh.DragQueryFileW(h, i, buf, size)
-            paths.append(buf.value)
+            if buf.value:
+                paths.append(buf.value)
         move = False
         fmt = u32.RegisterClipboardFormatW("Preferred DropEffect")
         if u32.IsClipboardFormatAvailable(fmt):
@@ -16379,7 +16448,7 @@ def win_clip_get_files():
             if ptr:
                 move = bool(ctypes.c_uint32.from_address(ptr).value & 2)
                 k32.GlobalUnlock(he)
-        return paths, move
+        return (paths, move) if paths else None
     finally:
         u32.CloseClipboard()
 
@@ -29758,11 +29827,22 @@ class MainWindow(Gtk.ApplicationWindow):
         dest = getattr(row, "key", None) if row else None
         if not dest or not is_folder_loc(dest):
             return
-        paths = [p for p in (Gio.File.new_for_uri(u).get_path() for u in (selection.get_uris() or [])) if p]
+        uris = list(selection.get_uris() or [])
+        if not uris and selection.get_text():
+            uris = [ln.strip() for ln in selection.get_text().splitlines() if ln.strip()]
+        paths = []
+        for u in uris:
+            p = Gio.File.new_for_uri(u).get_path() if "://" in u else u
+            if not p and u.startswith("file://"):
+                p = urllib.request.url2pathname(urllib.parse.urlsplit(u).path)
+            if p and os.path.exists(p):
+                paths.append(p)
         internal = Gtk.drag_get_source_widget(context) is not None
+        action = context.get_selected_action()
         mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
-        self.handle_drop(paths, dest, internal, bool(mods & Gdk.ModifierType.CONTROL_MASK),
-                         bool(mods & Gdk.ModifierType.SHIFT_MASK))
+        ctrl = (action == Gdk.DragAction.COPY) or bool(mods & Gdk.ModifierType.CONTROL_MASK)
+        shift = (action == Gdk.DragAction.MOVE and not internal) or bool(mods & Gdk.ModifierType.SHIFT_MASK)
+        self.handle_drop(paths, dest, internal, ctrl, shift)
 
     # ---------- 🔖 saved searches: a search kept in the sidebar, always showing what matches right now
     def save_search(self):
@@ -30620,8 +30700,12 @@ class MainWindow(Gtk.ApplicationWindow):
             return False
         if IS_WIN:
             try:
-                import ctypes
-                return getattr(self, "_clip_seq", None) == ctypes.windll.user32.GetClipboardSequenceNumber()
+                got = win_clip_get_files()
+                if not got:
+                    return False
+                ours = [os.path.normcase(os.path.abspath(p)) for p in self.clipboard[0]]
+                theirs = [os.path.normcase(os.path.abspath(p)) for p in got[0]]
+                return ours == theirs
             except Exception:
                 return True
         return getattr(self, "_clip_owned", True)
