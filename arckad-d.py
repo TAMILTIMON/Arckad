@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.65.3"
+APP_VERSION = "3.65.4"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3471,7 +3471,7 @@ class FilePane(Gtk.Box):
         self.add(flow)
 
         # list view
-        self.tree = Gtk.TreeView(enable_search=False, rubber_banding=False)   # press-and-drag = drag files
+        self.tree = Gtk.TreeView(enable_search=False, rubber_banding=True)    # empty-space drag = select; item drag = files
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.get_selection().connect("changed", self.on_selection_changed)
         self.tree.connect("row-activated", lambda t, p, c: self.activate_row(p))
@@ -3483,6 +3483,7 @@ class FilePane(Gtk.Box):
         col.pack_start(icon_r, False)
         col.add_attribute(icon_r, "gicon", C_ICON)
         text_r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        self.name_renderer = text_r
         col.pack_start(text_r, True)
         col.add_attribute(text_r, "text", C_NAME)
         col.set_expand(True)
@@ -3490,6 +3491,7 @@ class FilePane(Gtk.Box):
         col.set_min_width(180)
         col.set_sort_column_id(C_NAME)
         self.tree.append_column(col)
+        self.name_column = col
         tag_r = Gtk.CellRendererText()
         tag_col = Gtk.TreeViewColumn("Tags", tag_r, markup=C_TAGS)
         tag_col.set_resizable(True)
@@ -3543,18 +3545,43 @@ class FilePane(Gtk.Box):
         ]
         actions = Gdk.DragAction.MOVE | Gdk.DragAction.COPY
         self._drag_press = None
+        self._dnd_targets = targets
+        self._dnd_actions = actions
         for view in (self.tree, self.icons):
+            # Source: allow initiating drags (needed for reliable icon + cursor on Windows)
+            view.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
+            view.drag_source_set_target_list(Gtk.TargetList.new(targets))
+            # Dest
             view.drag_dest_set(Gtk.DestDefaults.HIGHLIGHT | Gtk.DestDefaults.DROP, targets, actions)
             view.connect("button-release-event", self._on_drag_release)
             view.connect("motion-notify-event", self._on_drag_motion, targets, actions)
             view.connect("drag-motion", self.on_drag_motion_dest)
+            view.connect("drag-leave", self.on_drag_leave)
             view.connect("drag-data-get", self.on_drag_get)
             view.connect("drag-data-received", self.on_drag_received)
             view.connect_after("drag-begin", self.on_drag_begin)
+            view.connect("drag-end", self._on_drag_end)
+            view.connect("drag-failed", self._on_drag_failed)
 
     def _on_drag_release(self, _view, _event):
         self._drag_press = None
         return False
+
+    def _on_drag_end(self, _view, _context):
+        self._drag_press = None
+        if hasattr(self, "_drop_highlight"):
+            self._drop_highlight = False
+            self.queue_draw()
+
+    def _on_drag_failed(self, _view, _context, _result):
+        self._drag_press = None
+        return False
+
+    def on_drag_leave(self, view, context, time_):
+        if view is self.tree:
+            self.tree.set_drag_dest_row(None, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+        self._drop_highlight = False
+        self.queue_draw()
 
     def _on_drag_motion(self, view, event, targets, actions):
         if not self._drag_press or not (event.state & Gdk.ModifierType.BUTTON1_MASK):
@@ -3572,6 +3599,8 @@ class FilePane(Gtk.Box):
         return True
 
     def on_drag_motion_dest(self, view, context, x, y, time_):
+        # Highlight whole pane + specific folder row when hovering a directory
+        self._drop_highlight = True
         if view is self.tree:
             hit = self.tree.get_dest_row_at_pos(x, y)
             if hit and self.sorted[hit[0]][C_ISDIR]:
@@ -3579,6 +3608,7 @@ class FilePane(Gtk.Box):
             else:
                 self.tree.set_drag_dest_row(None, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
         Gdk.drag_status(context, context.get_suggested_action() or Gdk.DragAction.MOVE, time_)
+        self.queue_draw()
         return True
 
     def on_drag_begin(self, view, context):
@@ -3612,8 +3642,14 @@ class FilePane(Gtk.Box):
         Gtk.drag_set_icon_pixbuf(context, canvas, 24, 32)
 
     def on_drag_get(self, view, context, selection, info, time_):
-        uris = [Gio.File.new_for_path(p).get_uri() for p in self.selected_paths()]
+        paths = self.selected_paths()
+        uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
         selection.set_uris(uris)
+        # Also offer plain text paths (helps some Windows drop targets)
+        try:
+            selection.set_text("\r\n".join(os.path.abspath(p) for p in paths), -1)
+        except Exception:
+            pass
 
     def drop_target(self, view, x, y):
         """The folder under the pointer, or this pane's folder."""
@@ -4372,17 +4408,151 @@ class FilePane(Gtk.Box):
             self.pending_select = [path]
             self.go(parent)
 
+    def start_inline_rename(self):
+        """Start in-place rename of the single selected item (list view preferred).
+        Returns True if the floating editor was shown, False to fall back to dialog."""
+        paths = self.selected_paths()
+        if len(paths) != 1 or self.view_mode != "list":
+            return False
+        path = paths[0]
+        sel = self.tree.get_selection()
+        model, rows = sel.get_selected_rows()
+        if not rows:
+            return False
+        treepath = rows[0]
+        # Make sure the row is visible
+        self.tree.scroll_to_cell(treepath, self.name_column, False, 0, 0)
+        # Get cell area in tree coordinates
+        area = self.tree.get_cell_area(treepath, self.name_column)
+        if area.width < 20:
+            return False
+        # Convert to widget coordinates (account for header + bin window)
+        ox, oy = self.tree.convert_bin_window_to_widget_coords(area.x, area.y)
+        # Build floating entry
+        if getattr(self, "_rename_entry", None):
+            self._rename_entry.destroy()
+        entry = Gtk.Entry()
+        entry.set_text(os.path.basename(path))
+        entry.set_size_request(max(area.width + 8, 120), max(area.height, 22))
+        entry.set_width_chars(0)
+        # Select stem (everything before last dot) for files
+        name = os.path.basename(path)
+        if os.path.isfile(path) and "." in name and not name.startswith("."):
+            stem_len = name.rfind(".")
+            entry.select_region(0, stem_len)
+        else:
+            entry.select_region(0, -1)
+        # Overlay on the scrolled window / tree parent
+        parent = self.tree.get_parent()
+        if parent is None:
+            return False
+        # Use an overlay if available, otherwise absolute positioning via fixed
+        if not hasattr(self, "_rename_fixed"):
+            # Put a Gtk.Fixed on top of the list scrolled window for the entry
+            self._rename_fixed = Gtk.Fixed()
+            self._rename_fixed.set_has_window(False)
+            # Re-parent carefully: many layouts already have the scrolled window
+            # Simplest reliable approach for GTK3: put entry in a popup window
+            pass
+        # Use a short-lived undecorated window positioned over the cell
+        win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        win.set_transient_for(self.get_toplevel())
+        win.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
+        win.set_decorated(False)
+        win.set_resizable(False)
+        win.add(entry)
+        win.show_all()
+        # Position the popup exactly over the name cell
+        try:
+            gdk_win = self.tree.get_bin_window() or self.tree.get_window()
+            if gdk_win:
+                ox2, oy2 = gdk_win.get_root_coords(area.x, area.y)
+                win.move(int(ox2), int(oy2))
+            else:
+                win.move(int(ox), int(oy))
+        except Exception:
+            try:
+                wx, wy = self.tree.get_window().get_origin()[1:3]
+                win.move(int(wx + ox), int(wy + oy))
+            except Exception:
+                pass
+        entry.grab_focus()
+        self._rename_entry = entry
+        self._rename_popup = win
+        self._rename_path = path
+
+        def finish(ok):
+            if not getattr(self, "_rename_popup", None):
+                return
+            new_name = entry.get_text().strip()
+            popup = self._rename_popup
+            self._rename_popup = None
+            self._rename_entry = None
+            try:
+                popup.destroy()
+            except Exception:
+                pass
+            if not ok or not new_name or new_name == os.path.basename(self._rename_path):
+                return
+            self._apply_rename(self._rename_path, new_name)
+
+        def on_key(e, event):
+            if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                finish(True)
+                return True
+            if event.keyval == Gdk.KEY_Escape:
+                finish(False)
+                return True
+            return False
+
+        def on_focus_out(*_):
+            # Small delay so a click on OK-style focus doesn't cancel immediately
+            GLib.timeout_add(80, lambda: (finish(True) or False))
+            return False
+
+        entry.connect("key-press-event", on_key)
+        entry.connect("focus-out-event", on_focus_out)
+        return True
+
+    def _apply_rename(self, old_path, new_name):
+        """Apply a rename that came from the inline editor (or fall back path)."""
+        p = Path(old_path)
+        bad = set('/\\\\:*?"<>|') if IS_WIN else {"/"}
+        if any(c in bad for c in new_name):
+            self.win.error("A name can't contain any of these characters:  " + " ".join(sorted(bad)))
+            return
+        target = p.with_name(new_name)
+        if target.exists() and str(target) != str(p):
+            self.win.error(f"“{new_name}” already exists here.")
+            return
+        try:
+            p.rename(target)
+        except OSError as ex:
+            self.win.error(f"Couldn't rename: {ex.strerror}")
+            return
+        try:
+            TAG_STORE.moved(str(p), str(target))
+        except Exception:
+            pass
+        self.pending_select = [str(target)]
+        self.refresh()
+
+
     def on_view_click(self, view, event):
         if event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         if event.button == 1:
             self._drag_press = (event.x, event.y)
             hit = self._path_at(view, event)
+            # If the user pressed on an already-selected item (no Ctrl/Shift), keep the
+            # multi-selection so a subsequent drag moves all selected files. Returning
+            # True stops the default "select only this row" behaviour.
             if hit is not None and not (event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
                 if view is self.tree and self.tree.get_selection().path_is_selected(hit):
                     return True
                 if view is self.icons and self.icons.path_is_selected(hit):
                     return True
+            # Empty space or unselected item: let GTK do normal selection / rubber-band
             return False
         if event.button == 2:          # middle click a folder: open in new tab
             hit = self._path_at(view, event)
@@ -4510,7 +4680,7 @@ class FilePane(Gtk.Box):
             if len(paths) > 1:
                 add(f"✏ Rename these {len(paths)} items… (F2)", lambda: BatchRenameDialog(win, paths).run_rename())
             else:
-                add("Rename… (F2)", lambda: win.rename(self, first), len(paths) == 1)
+                add("Rename… (F2)", lambda: self.start_inline_rename() or win.rename(self, first), len(paths) == 1)
             add("Duplicate", lambda: win.duplicate(self, paths))
             add("Send to chat 💬", lambda: win.send_to_chat(paths))
             add("Copy path", lambda: win.copy_text("\n".join(paths)))
@@ -4591,7 +4761,8 @@ class FilePane(Gtk.Box):
             else:
                 self.win.trash(self, self.selected_paths())
         elif key == "F2" and not typing and len(self.selected_paths()) == 1:
-            self.win.rename(self, self.selected_paths()[0])
+            if not self.start_inline_rename():
+                self.win.rename(self, self.selected_paths()[0])
         elif key == "F2" and not typing and len(self.selected_paths()) > 1:       # several: batch rename
             BatchRenameDialog(self.win, self.selected_paths()).run_rename()
         else:
