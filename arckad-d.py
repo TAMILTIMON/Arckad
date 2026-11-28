@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.66.4"
+APP_VERSION = "3.66.5"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3755,6 +3755,9 @@ class FilePane(Gtk.Box):
             self.icons.set_drag_dest_item(folder_path, Gtk.IconViewDropPosition.DROP_INTO)
         dest = self.sorted[folder_path][C_PATH] if folder_path is not None else (
             self.location if self.mode == "folder" else None)
+        if dest != getattr(self, "_dnd_last_dest", None):
+            self._dnd_last_dest = dest
+            _dnd_log(f"drag-motion view={'tree' if view is self.tree else 'icons'} xy=({x},{y}) dest={dest} actions={context.get_actions()} suggested={context.get_suggested_action()}")
         if dest is None:
             self._drop_highlight = False
             Gdk.drag_status(context, 0, time_)
