@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.66.5"
+APP_VERSION = "3.66.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3585,8 +3585,11 @@ class FilePane(Gtk.Box):
 
         # list view
         self.tree = Gtk.TreeView(enable_search=False, rubber_banding=True)    # empty-space drag = select; item drag = files
-        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        self.tree.get_selection().connect("changed", self.on_selection_changed)
+        self._keep_sel = None
+        sel = self.tree.get_selection()
+        sel.set_mode(Gtk.SelectionMode.MULTIPLE)
+        sel.set_select_function(self._tree_can_select, None)
+        sel.connect("changed", self.on_selection_changed)
         self.tree.connect("row-activated", lambda t, p, c: self.activate_row(p))
         self.tree.connect("button-press-event", self.on_view_click)
         col = Gtk.TreeViewColumn("Name")
@@ -3661,9 +3664,9 @@ class FilePane(Gtk.Box):
         # Source: GTK starts the drag when the user drags a selected row/icon.
         # Dest: accept drops from Arckad and other apps.
         self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.tree.drag_dest_set(0, targets, actions)
+        self.tree.enable_model_drag_dest(targets, actions)
         self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.icons.drag_dest_set(0, targets, actions)
+        self.icons.enable_model_drag_dest(targets, actions)
         for view in (self.tree, self.icons):
             view.add_events(Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
             view.connect("motion-notify-event", self._on_drag_motion, targets, actions)
@@ -3677,7 +3680,18 @@ class FilePane(Gtk.Box):
             view.connect("drag-end", self._on_drag_end)
             view.connect("drag-failed", self._on_drag_failed)
 
+    def _tree_can_select(self, _sel, _model, _path, _currently_selected, *_data):
+        return self._keep_sel is None
+
     def _on_drag_release(self, view, event):
+        if event.button == 1 and self._keep_sel is not None:
+            keep_view, hit = self._keep_sel
+            self._keep_sel = None
+            if keep_view is self.tree and hit is not None:
+                sel = self.tree.get_selection()
+                sel.unselect_all()
+                sel.select_path(hit)
+                self.tree.set_cursor(hit, None, False)
         if event.button == 1 and self._drag_press is not None:
             _, _, hit = self._drag_press
             self._drag_press = None
@@ -3695,7 +3709,10 @@ class FilePane(Gtk.Box):
         return False
 
     def _on_drag_end(self, _view, _context):
+        _dnd_log("drag-end")
         self._drag_press = None
+        self._keep_sel = None
+        self._dnd_motion_seen = False
         if hasattr(self, "_drop_highlight"):
             self._drop_highlight = False
             self.queue_draw()
@@ -3703,9 +3720,12 @@ class FilePane(Gtk.Box):
     def _on_drag_failed(self, _view, _context, result):
         _dnd_log(f"drag-failed result={result}")
         self._drag_press = None
+        self._keep_sel = None
+        self._dnd_motion_seen = False
         return False
 
     def on_drag_leave(self, view, context, time_):
+        self._dnd_last_dest = "__unset__"
         if view is self.tree:
             self.tree.set_drag_dest_row(None, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
         else:
@@ -3747,28 +3767,38 @@ class FilePane(Gtk.Box):
         return None
 
     def on_drag_motion_dest(self, view, context, x, y, time_):
-        # Highlight whole pane + specific folder row/tile when hovering a directory
-        folder_path = self._drop_row_path(view, x, y)
-        if view is self.tree:
-            self.tree.set_drag_dest_row(folder_path, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
-        else:
-            self.icons.set_drag_dest_item(folder_path, Gtk.IconViewDropPosition.DROP_INTO)
-        dest = self.sorted[folder_path][C_PATH] if folder_path is not None else (
-            self.location if self.mode == "folder" else None)
-        if dest != getattr(self, "_dnd_last_dest", None):
-            self._dnd_last_dest = dest
-            _dnd_log(f"drag-motion view={'tree' if view is self.tree else 'icons'} xy=({x},{y}) dest={dest} actions={context.get_actions()} suggested={context.get_suggested_action()}")
-        if dest is None:
-            self._drop_highlight = False
-            Gdk.drag_status(context, 0, time_)
-        else:
-            self._drop_highlight = True
-            Gdk.drag_status(context, _drop_action(context), time_)
-        self.queue_draw()
-        return True
+        if not getattr(self, "_dnd_motion_seen", False):
+            self._dnd_motion_seen = True
+            _dnd_log(f"drag-motion ENTER view={'tree' if view is self.tree else 'icons'} xy=({x},{y})")
+        try:
+            # Highlight whole pane + specific folder row/tile when hovering a directory
+            folder_path = self._drop_row_path(view, x, y)
+            if view is self.tree:
+                self.tree.set_drag_dest_row(folder_path, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+            else:
+                self.icons.set_drag_dest_item(folder_path, Gtk.IconViewDropPosition.DROP_INTO)
+            dest = self.sorted[folder_path][C_PATH] if folder_path is not None else (
+                self.location if self.mode == "folder" else None)
+            if dest is None:
+                self._drop_highlight = False
+                chosen = 0
+            else:
+                self._drop_highlight = True
+                chosen = _drop_action(context)
+            if dest != getattr(self, "_dnd_last_dest", "__unset__"):
+                self._dnd_last_dest = dest
+                _dnd_log(f"drag-motion view={'tree' if view is self.tree else 'icons'} xy=({x},{y}) dest={dest} chosen={chosen} actions={context.get_actions()} suggested={context.get_suggested_action()}")
+            Gdk.drag_status(context, chosen, time_)
+            self.queue_draw()
+            return True
+        except Exception:
+            _dnd_log("drag-motion EXCEPTION:\n" + traceback.format_exc())
+            return False
 
     def on_drag_begin(self, view, context):
         """A small picture while dragging: the item's icon, plus a count badge for several (not the whole row)."""
+        self._keep_sel = None
+        _dnd_log(f"drag-begin view={'tree' if view is self.tree else 'icons'} paths={self.selected_paths()}")
         paths = self.selected_paths()
         n = len(paths)
         if n == 0:
@@ -4703,18 +4733,24 @@ class FilePane(Gtk.Box):
 
 
     def on_view_click(self, view, event):
+        self._keep_sel = None
         if event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         if event.button == 1:
             hit = self._path_at(view, event)
             # If the user pressed on an already-selected item (no Ctrl/Shift), keep the
-            # multi-selection so a subsequent drag moves all selected files. Returning
-            # True stops the default "select only this row" behaviour, so _on_drag_motion
-            # starts the drag and _on_drag_release narrows the selection if there was no drag.
+            # multi-selection so a subsequent drag moves all selected files. For TreeView,
+            # _tree_can_select blocks deselection while letting GTK's native drag source run.
             if hit is not None and not (event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
-                is_sel = (self.tree.get_selection().path_is_selected(hit) if view is self.tree
-                          else self.icons.path_is_selected(hit))
-                if is_sel:
+                if view is self.tree and self.tree.get_selection().path_is_selected(hit):
+                    self._keep_sel = (self.tree, hit)
+                    self._drag_press = None
+                    _dnd_log(f"tree press on selected hit={hit} -> native drag armed")
+                    return False
+                if view is self.icons and self.icons.path_is_selected(hit):
+                    if len(self.icons.get_selected_items()) <= 1:
+                        self._drag_press = None
+                        return False
                     self._drag_press = (event.x, event.y, hit)
                     view.grab_focus()
                     self.win.set_active(self)
@@ -35318,7 +35354,10 @@ def main():
         failed = sys.argv[i + 1] if len(sys.argv) > i + 1 else "?"
     start, select = parse_open_args(sys.argv[1:])
     background = "--background" in sys.argv
-    if not failed and hand_over_to_running(start, background, select):
+    new_inst = "--new-instance" in sys.argv or "--debug-dnd" in sys.argv
+    if new_inst:
+        _dnd_log(f"starting fresh instance pid={os.getpid()} file={os.path.abspath(__file__)}")
+    if not failed and not new_inst and hand_over_to_running(start, background, select):
         return                                     # already running (maybe in the tray): it shows itself
     fix_user_launcher()
     GLib.set_prgname(APP_SLUG)
