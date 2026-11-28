@@ -1,0 +1,10 @@
+{
+  "id": "antivirus",
+  "name": "Antivirus Scanner",
+  "version": "1.0.0",
+  "author": "TAMILTIMON",
+  "description": "Scans downloads and files for malware/threats using ClamAV, Windows Defender, and heuristic checks with prominent center threat alerts.",
+  "arckad": ">=3.65",
+  "platforms": ["linux", "windows"],
+  "api": 1
+}

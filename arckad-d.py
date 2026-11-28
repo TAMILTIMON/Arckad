@@ -3545,20 +3545,18 @@ class FilePane(Gtk.Box):
         ]
         actions = Gdk.DragAction.MOVE | Gdk.DragAction.COPY
         self._drag_press = None
-        self._dnd_targets = targets
-        self._dnd_actions = actions
+        # Source: GTK starts the drag when the user drags a selected row/icon.
+        # Dest: accept drops from Arckad and other apps.
+        self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
+        self.tree.enable_model_drag_dest(targets, actions)
+        self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
+        self.icons.enable_model_drag_dest(targets, actions)
         for view in (self.tree, self.icons):
-            # Source: allow initiating drags (needed for reliable icon + cursor on Windows)
-            view.drag_source_set(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-            view.drag_source_set_target_list(Gtk.TargetList.new(targets))
-            # Dest
-            view.drag_dest_set(Gtk.DestDefaults.HIGHLIGHT | Gtk.DestDefaults.DROP, targets, actions)
-            view.connect("button-release-event", self._on_drag_release)
-            view.connect("motion-notify-event", self._on_drag_motion, targets, actions)
-            view.connect("drag-motion", self.on_drag_motion_dest)
-            view.connect("drag-leave", self.on_drag_leave)
             view.connect("drag-data-get", self.on_drag_get)
             view.connect("drag-data-received", self.on_drag_received)
+            view.connect("drag-drop", self.on_drag_drop)
+            view.connect("drag-motion", self.on_drag_motion_dest)
+            view.connect("drag-leave", self.on_drag_leave)
             view.connect_after("drag-begin", self.on_drag_begin)
             view.connect("drag-end", self._on_drag_end)
             view.connect("drag-failed", self._on_drag_failed)
@@ -3667,12 +3665,20 @@ class FilePane(Gtk.Box):
                     return row[C_PATH]
         return self.location if self.mode == "folder" else None
 
+    def on_drag_drop(self, view, context, x, y, time_):
+        # Must request the data ourselves; otherwise the drop is rejected and the icon snaps back
+        view.stop_emission_by_name("drag-drop")
+        target = Gdk.Atom.intern("text/uri-list", False)
+        view.drag_get_data(context, target, time_)
+        return True
+
     def on_drag_received(self, view, context, x, y, selection, info, time_):
+        view.stop_emission_by_name("drag-data-received")
         dest = self.drop_target(view, x, y)
         uris = list(selection.get_uris() or [])
         if not uris:
             txt = selection.get_text() or ""
-            uris = [ln.strip() for ln in txt.replace("\r", "").split("\n") if ln.strip()]
+            uris = [ln.strip() for ln in txt.replace('\r', "").split('\n') if ln.strip()]
         paths = []
         for u in uris:
             p = Gio.File.new_for_uri(u).get_path() if "://" in u else u
@@ -3680,13 +3686,16 @@ class FilePane(Gtk.Box):
                 p = urllib.request.url2pathname(urllib.parse.urlsplit(u).path)
             if p and os.path.exists(p):
                 paths.append(p)
+        if not paths:
+            Gtk.drag_finish(context, False, False, time_)
+            return
         internal = Gtk.drag_get_source_widget(context) is not None
         action = context.get_selected_action()
         mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
         ctrl = (action == Gdk.DragAction.COPY) or bool(mods & Gdk.ModifierType.CONTROL_MASK)
         shift = (action == Gdk.DragAction.MOVE and not internal) or bool(mods & Gdk.ModifierType.SHIFT_MASK)
         ok = self.win.handle_drop(paths, dest, internal, ctrl, shift)
-        Gtk.drag_finish(context, ok, False, time_)
+        Gtk.drag_finish(context, bool(ok), False, time_)
 
     def apply_icon_style(self):
         colour = ICON_STYLE["colour"]
