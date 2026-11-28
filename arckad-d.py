@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.66.0"
+APP_VERSION = "3.66.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -735,23 +735,87 @@ def opened_history():
                 except OSError:
                     pass
         return items
-    xbel = Path(GLib.get_user_data_dir()) / "recently-used.xbel"
-    try:
-        root = ET.parse(xbel).getroot()
-    except (OSError, ET.ParseError):
-        return []
+
+    # Linux / other: prefer GTK RecentManager (same source GNOME Files uses)
     items = []
-    for bm in root.iter("bookmark"):
-        href = bm.get("href", "")
-        if not href.startswith("file://"):
-            continue
-        path = Path(urllib.parse.unquote(href[7:]))
-        stamp = bm.get("visited") or bm.get("modified") or ""
+    seen = set()
+    try:
+        for info in Gtk.RecentManager.get_default().get_items():
+            try:
+                uri = info.get_uri() or ""
+                if not uri.startswith("file:"):
+                    continue
+                p = Gio.File.new_for_uri(uri).get_path()
+                if not p or p in seen:
+                    continue
+                # get_visited() / get_modified() return time_t
+                ts = 0
+                try:
+                    ts = float(info.get_visited() or 0)
+                except Exception:
+                    pass
+                if not ts:
+                    try:
+                        ts = float(info.get_modified() or 0)
+                    except Exception:
+                        pass
+                if not ts:
+                    try:
+                        ts = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                seen.add(p)
+                items.append((ts, Path(p)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if items:
+        return items
+
+    # Fallback: parse recently-used.xbel (namespace-safe)
+    xbel_paths = [
+        Path(GLib.get_user_data_dir()) / "recently-used.xbel",
+        Path.home() / ".local" / "share" / "recently-used.xbel",
+    ]
+    for xbel in xbel_paths:
         try:
-            ts = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
-        except ValueError:
+            root = ET.parse(str(xbel)).getroot()
+        except (OSError, ET.ParseError):
             continue
-        items.append((ts, path))
+        for bm in root.iter():
+            tag = bm.tag.rsplit("}", 1)[-1] if isinstance(bm.tag, str) else ""
+            if tag != "bookmark":
+                continue
+            href = bm.get("href") or ""
+            if not href.startswith("file:"):
+                continue
+            try:
+                p = Gio.File.new_for_uri(href).get_path()
+            except Exception:
+                p = urllib.parse.unquote(href[7:] if href.startswith("file://") else href)
+            if not p or p in seen:
+                continue
+            stamp = bm.get("visited") or bm.get("modified") or bm.get("added") or ""
+            ts = 0
+            if stamp:
+                try:
+                    ts = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    try:
+                        ts = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+                    except ValueError:
+                        ts = 0
+            if not ts:
+                try:
+                    ts = os.path.getmtime(p)
+                except OSError:
+                    continue
+            seen.add(p)
+            items.append((ts, Path(p)))
+        if items:
+            break
     return items
 
 
