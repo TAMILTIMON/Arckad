@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.66.1"
+APP_VERSION = "3.66.2"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3369,6 +3369,50 @@ def root_label(p):
     return p.name or (p.drive or str(p) if IS_WIN else "Computer")
 
 
+def _drop_action(context):
+    """Choose MOVE for internal drags (COPY with Ctrl) and COPY for external drags (MOVE with Shift)."""
+    internal = Gtk.drag_get_source_widget(context) is not None
+    avail = context.get_actions()
+    mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
+    if internal:
+        want = Gdk.DragAction.COPY if (mods & Gdk.ModifierType.CONTROL_MASK) else Gdk.DragAction.MOVE
+    else:
+        want = Gdk.DragAction.MOVE if (mods & Gdk.ModifierType.SHIFT_MASK) else (
+            context.get_suggested_action() or Gdk.DragAction.COPY)
+    if avail & want:
+        return want
+    for fallback in (context.get_suggested_action(), Gdk.DragAction.MOVE, Gdk.DragAction.COPY):
+        if fallback and (avail & fallback):
+            return fallback
+    return Gdk.DragAction.MOVE
+
+
+def _drop_flags(context):
+    """Return (internal, ctrl, shift) for a completed drop."""
+    internal = Gtk.drag_get_source_widget(context) is not None
+    action = context.get_selected_action()
+    mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
+    ctrl = (action == Gdk.DragAction.COPY) or bool(mods & Gdk.ModifierType.CONTROL_MASK)
+    shift = (action == Gdk.DragAction.MOVE and not internal) or bool(mods & Gdk.ModifierType.SHIFT_MASK)
+    return internal, ctrl, shift
+
+
+def _drop_paths(selection):
+    """Extract existing local filesystem paths from a drop SelectionData."""
+    uris = list(selection.get_uris() or [])
+    if not uris:
+        txt = selection.get_text() or ""
+        uris = [ln.strip() for ln in txt.replace('\r', "").split('\n') if ln.strip()]
+    paths = []
+    for u in uris:
+        p = Gio.File.new_for_uri(u).get_path() if "://" in u else u
+        if not p and u.startswith("file://"):
+            p = urllib.request.url2pathname(urllib.parse.urlsplit(u).path)
+        if p and os.path.exists(p):
+            paths.append(p)
+    return paths
+
+
 class FilePane(Gtk.Box):
     def __init__(self, win, location):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -3616,6 +3660,9 @@ class FilePane(Gtk.Box):
         self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
         self.icons.enable_model_drag_dest(targets, actions)
         for view in (self.tree, self.icons):
+            view.add_events(Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
+            view.connect("motion-notify-event", self._on_drag_motion, targets, actions)
+            view.connect("button-release-event", self._on_drag_release)
             view.connect("drag-data-get", self.on_drag_get)
             view.connect("drag-data-received", self.on_drag_received)
             view.connect("drag-drop", self.on_drag_drop)
@@ -3625,8 +3672,21 @@ class FilePane(Gtk.Box):
             view.connect("drag-end", self._on_drag_end)
             view.connect("drag-failed", self._on_drag_failed)
 
-    def _on_drag_release(self, _view, _event):
-        self._drag_press = None
+    def _on_drag_release(self, view, event):
+        if event.button == 1 and self._drag_press is not None:
+            _, _, hit = self._drag_press
+            self._drag_press = None
+            # Clicked an already-selected item without dragging: collapse multi-selection to it
+            if hit is not None:
+                if view is self.tree:
+                    sel = self.tree.get_selection()
+                    sel.unselect_all()
+                    sel.select_path(hit)
+                    self.tree.set_cursor(hit, None, False)
+                else:
+                    self.icons.unselect_all()
+                    self.icons.select_path(hit)
+                    self.icons.set_cursor(hit, None, False)
         return False
 
     def _on_drag_end(self, _view, _context):
@@ -3642,13 +3702,15 @@ class FilePane(Gtk.Box):
     def on_drag_leave(self, view, context, time_):
         if view is self.tree:
             self.tree.set_drag_dest_row(None, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+        else:
+            self.icons.set_drag_dest_item(None, Gtk.IconViewDropPosition.DROP_INTO)
         self._drop_highlight = False
         self.queue_draw()
 
     def _on_drag_motion(self, view, event, targets, actions):
         if not self._drag_press or not (event.state & Gdk.ModifierType.BUTTON1_MASK):
             return False
-        sx, sy = self._drag_press
+        sx, sy, _ = self._drag_press
         if not view.drag_check_threshold(int(sx), int(sy), int(event.x), int(event.y)):
             return False
         self._drag_press = None
@@ -3660,16 +3722,38 @@ class FilePane(Gtk.Box):
         view.drag_begin_with_coordinates(tl, actions, 1, event, int(event.x), int(event.y))
         return True
 
-    def on_drag_motion_dest(self, view, context, x, y, time_):
-        # Highlight whole pane + specific folder row when hovering a directory
-        self._drop_highlight = True
+    def _drop_row_path(self, view, x, y):
+        """TreePath of the directory row/item actually under widget coords (x, y), or None."""
+        if self.sorted is None:
+            return None
         if view is self.tree:
-            hit = self.tree.get_dest_row_at_pos(x, y)
-            if hit and self.sorted[hit[0]][C_ISDIR]:
-                self.tree.set_drag_dest_row(hit[0], Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
-            else:
-                self.tree.set_drag_dest_row(None, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
-        Gdk.drag_status(context, context.get_suggested_action() or Gdk.DragAction.MOVE, time_)
+            bx, by = self.tree.convert_widget_to_bin_window_coords(int(x), int(y))
+            if bx < 0 or by < 0:
+                return None
+            hit = self.tree.get_path_at_pos(bx, by)
+            path = hit[0] if hit else None
+        else:
+            hit = self.icons.get_dest_item_at_pos(int(x), int(y))
+            path = hit[0] if (hit and hit[1] == Gtk.IconViewDropPosition.DROP_INTO) else None
+        if path is not None and self.sorted[path][C_ISDIR]:
+            return path
+        return None
+
+    def on_drag_motion_dest(self, view, context, x, y, time_):
+        # Highlight whole pane + specific folder row/tile when hovering a directory
+        folder_path = self._drop_row_path(view, x, y)
+        if view is self.tree:
+            self.tree.set_drag_dest_row(folder_path, Gtk.TreeViewDropPosition.INTO_OR_BEFORE)
+        else:
+            self.icons.set_drag_dest_item(folder_path, Gtk.IconViewDropPosition.DROP_INTO)
+        dest = self.sorted[folder_path][C_PATH] if folder_path is not None else (
+            self.location if self.mode == "folder" else None)
+        if dest is None:
+            self._drop_highlight = False
+            Gdk.drag_status(context, 0, time_)
+        else:
+            self._drop_highlight = True
+            Gdk.drag_status(context, _drop_action(context), time_)
         self.queue_draw()
         return True
 
@@ -3677,87 +3761,79 @@ class FilePane(Gtk.Box):
         """A small picture while dragging: the item's icon, plus a count badge for several (not the whole row)."""
         paths = self.selected_paths()
         n = len(paths)
-        theme = Gtk.IconTheme.get_default()
-        if n == 1:
-            name = "folder" if os.path.isdir(paths[0]) else "text-x-generic"
-            try:
-                info = Gio.content_type_get_icon(Gio.content_type_guess(paths[0], None)[0]) if name != "folder" else None
-                pb = theme.lookup_by_gicon(info, 48, 0).load_icon() if info else theme.load_icon(name, 48, 0)
-            except (GLib.Error, AttributeError, TypeError):
-                pb = theme.load_icon(name, 48, 0)
-        else:
-            pb = theme.load_icon("folder-documents" if theme.has_icon("folder-documents") else "folder", 48, 0)
-        pb = pb.scale_simple(48, 48, GdkPixbuf.InterpType.BILINEAR) if pb.get_width() != 48 else pb
-        canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 64, 64)
-        canvas.fill(0x00000000)
-        pb.composite(canvas, 0, 8, 48, 48, 0, 8, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
-        if n > 1:
-            txt = str(n) if n < 100 else "99+"
-            svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30"><circle cx="15" cy="15" r="14" '
-                   f'fill="#ff7a1a" stroke="white" stroke-width="2"/><text x="15" y="20" font-size="{13 if n < 100 else 10}" '
-                   f'font-family="sans-serif" font-weight="bold" text-anchor="middle" fill="white">{txt}</text></svg>')
-            loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
-            loader.write(svg.encode())
-            loader.close()
-            badge = loader.get_pixbuf()
-            badge.composite(canvas, 34, 0, 30, 30, 34, 0, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
-        Gtk.drag_set_icon_pixbuf(context, canvas, 24, 32)
-
-    def on_drag_get(self, view, context, selection, info, time_):
-        paths = self.selected_paths()
-        uris = [Gio.File.new_for_path(p).get_uri() for p in paths]
-        selection.set_uris(uris)
-        # Also offer plain text paths (helps some Windows drop targets)
+        if n == 0:
+            return
         try:
-            selection.set_text("\r\n".join(os.path.abspath(p) for p in paths), -1)
+            theme = Gtk.IconTheme.get_default()
+            if n == 1:
+                name = "folder" if os.path.isdir(paths[0]) else "text-x-generic"
+                try:
+                    info = Gio.content_type_get_icon(Gio.content_type_guess(paths[0], None)[0]) if name != "folder" else None
+                    pb = theme.lookup_by_gicon(info, 48, 0).load_icon() if info else theme.load_icon(name, 48, 0)
+                except (GLib.Error, AttributeError, TypeError):
+                    pb = theme.load_icon(name, 48, 0)
+            else:
+                pb = theme.load_icon("folder-documents" if theme.has_icon("folder-documents") else "folder", 48, 0)
+            pb = pb.scale_simple(48, 48, GdkPixbuf.InterpType.BILINEAR) if pb.get_width() != 48 else pb
+            canvas = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, 64, 64)
+            canvas.fill(0x00000000)
+            pb.composite(canvas, 0, 8, 48, 48, 0, 8, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+            if n > 1:
+                txt = str(n) if n < 100 else "99+"
+                svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30"><circle cx="15" cy="15" r="14" '
+                       f'fill="#ff7a1a" stroke="white" stroke-width="2"/><text x="15" y="20" font-size="{13 if n < 100 else 10}" '
+                       f'font-family="sans-serif" font-weight="bold" text-anchor="middle" fill="white">{txt}</text></svg>')
+                loader = GdkPixbuf.PixbufLoader.new_with_type("svg")
+                loader.write(svg.encode())
+                loader.close()
+                badge = loader.get_pixbuf()
+                badge.composite(canvas, 34, 0, 30, 30, 34, 0, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+            Gtk.drag_set_icon_pixbuf(context, canvas, 24, 32)
         except Exception:
             pass
 
+    def on_drag_get(self, view, context, selection, info, time_):
+        view.stop_emission_by_name("drag-data-get")
+        paths = self.selected_paths()
+        if not paths:
+            return
+        if info == 0 or selection.get_target().name() == "text/uri-list":
+            selection.set_uris([Gio.File.new_for_path(p).get_uri() for p in paths])
+        else:
+            # Also offer plain text paths (helps some Windows drop targets)
+            try:
+                selection.set_text("\r\n".join(os.path.abspath(p) for p in paths), -1)
+            except Exception:
+                pass
+
     def drop_target(self, view, x, y):
         """The folder under the pointer, or this pane's folder."""
-        if view is self.tree:
-            hit = self.tree.get_dest_row_at_pos(x, y)
-            if hit and hit[1] in (Gtk.TreeViewDropPosition.INTO_OR_BEFORE, Gtk.TreeViewDropPosition.INTO_OR_AFTER):
-                row = self.sorted[hit[0]]
-                if row[C_ISDIR]:
-                    return row[C_PATH]
-        else:
-            hit = self.icons.get_dest_item_at_pos(x, y)
-            if hit:
-                row = self.sorted[hit[0]]
-                if row[C_ISDIR]:
-                    return row[C_PATH]
+        path = self._drop_row_path(view, x, y)
+        if path is not None:
+            return self.sorted[path][C_PATH]
         return self.location if self.mode == "folder" else None
 
     def on_drag_drop(self, view, context, x, y, time_):
         # Must request the data ourselves; otherwise the drop is rejected and the icon snaps back
         view.stop_emission_by_name("drag-drop")
-        target = Gdk.Atom.intern("text/uri-list", False)
+        if not self.drop_target(view, x, y):
+            Gtk.drag_finish(context, False, False, time_)
+            return True
+        target = view.drag_dest_find_target(context, None)
+        if target is None or target.name() == "NONE":
+            target = Gdk.Atom.intern("text/uri-list", False)
         view.drag_get_data(context, target, time_)
         return True
 
     def on_drag_received(self, view, context, x, y, selection, info, time_):
         view.stop_emission_by_name("drag-data-received")
         dest = self.drop_target(view, x, y)
-        uris = list(selection.get_uris() or [])
-        if not uris:
-            txt = selection.get_text() or ""
-            uris = [ln.strip() for ln in txt.replace('\r', "").split('\n') if ln.strip()]
-        paths = []
-        for u in uris:
-            p = Gio.File.new_for_uri(u).get_path() if "://" in u else u
-            if not p and u.startswith("file://"):
-                p = urllib.request.url2pathname(urllib.parse.urlsplit(u).path)
-            if p and os.path.exists(p):
-                paths.append(p)
+        self.on_drag_leave(view, context, time_)
+        paths = _drop_paths(selection)
         if not paths:
             Gtk.drag_finish(context, False, False, time_)
             return
-        internal = Gtk.drag_get_source_widget(context) is not None
-        action = context.get_selected_action()
-        mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
-        ctrl = (action == Gdk.DragAction.COPY) or bool(mods & Gdk.ModifierType.CONTROL_MASK)
-        shift = (action == Gdk.DragAction.MOVE and not internal) or bool(mods & Gdk.ModifierType.SHIFT_MASK)
+        internal, ctrl, shift = _drop_flags(context)
         ok = self.win.handle_drop(paths, dest, internal, ctrl, shift)
         Gtk.drag_finish(context, bool(ok), False, time_)
 
@@ -4615,17 +4691,21 @@ class FilePane(Gtk.Box):
         if event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         if event.button == 1:
-            self._drag_press = (event.x, event.y)
             hit = self._path_at(view, event)
             # If the user pressed on an already-selected item (no Ctrl/Shift), keep the
             # multi-selection so a subsequent drag moves all selected files. Returning
-            # True stops the default "select only this row" behaviour.
+            # True stops the default "select only this row" behaviour, so _on_drag_motion
+            # starts the drag and _on_drag_release narrows the selection if there was no drag.
             if hit is not None and not (event.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
-                if view is self.tree and self.tree.get_selection().path_is_selected(hit):
+                is_sel = (self.tree.get_selection().path_is_selected(hit) if view is self.tree
+                          else self.icons.path_is_selected(hit))
+                if is_sel:
+                    self._drag_press = (event.x, event.y, hit)
+                    view.grab_focus()
+                    self.win.set_active(self)
                     return True
-                if view is self.icons and self.icons.path_is_selected(hit):
-                    return True
-            # Empty space or unselected item: let GTK do normal selection / rubber-band
+            self._drag_press = None
+            # Empty space or unselected item: let GTK do normal selection / rubber-band / drag
             return False
         if event.button == 2:          # middle click a folder: open in new tab
             hit = self._path_at(view, event)
@@ -30061,9 +30141,11 @@ class MainWindow(Gtk.ApplicationWindow):
         row = lb.get_row_at_y(y)
         if row is not None and is_folder_loc(getattr(row, "key", "") or ""):
             lb.drag_highlight_row(row)
+            Gdk.drag_status(context, _drop_action(context), time_)
         else:
             lb.drag_unhighlight_row()
-        return False
+            Gdk.drag_status(context, 0, time_)
+        return True
 
     def on_sidebar_drop(self, lb, context, x, y, selection, info, time_):
         lb.drag_unhighlight_row()
@@ -30071,21 +30153,10 @@ class MainWindow(Gtk.ApplicationWindow):
         dest = getattr(row, "key", None) if row else None
         if not dest or not is_folder_loc(dest):
             return
-        uris = list(selection.get_uris() or [])
-        if not uris and selection.get_text():
-            uris = [ln.strip() for ln in selection.get_text().splitlines() if ln.strip()]
-        paths = []
-        for u in uris:
-            p = Gio.File.new_for_uri(u).get_path() if "://" in u else u
-            if not p and u.startswith("file://"):
-                p = urllib.request.url2pathname(urllib.parse.urlsplit(u).path)
-            if p and os.path.exists(p):
-                paths.append(p)
-        internal = Gtk.drag_get_source_widget(context) is not None
-        action = context.get_selected_action()
-        mods = Gdk.Keymap.get_for_display(Gdk.Display.get_default()).get_modifier_state()
-        ctrl = (action == Gdk.DragAction.COPY) or bool(mods & Gdk.ModifierType.CONTROL_MASK)
-        shift = (action == Gdk.DragAction.MOVE and not internal) or bool(mods & Gdk.ModifierType.SHIFT_MASK)
+        paths = _drop_paths(selection)
+        if not paths:
+            return
+        internal, ctrl, shift = _drop_flags(context)
         self.handle_drop(paths, dest, internal, ctrl, shift)
 
     # ---------- 🔖 saved searches: a search kept in the sidebar, always showing what matches right now
