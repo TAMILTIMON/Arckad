@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.67.0"
+APP_VERSION = "3.67.1"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -736,7 +736,11 @@ def opened_history():
                     pass
         return items
 
-    # Linux / other: prefer GTK RecentManager (same source GNOME Files uses)
+    # Linux / other: read recently-used.xbel directly (this runs in a worker thread, where GTK must not be used);
+    # GTK's RecentManager is only the fallback when the file can't be read.
+    items = _read_xbel()
+    if items:
+        return items
     items = []
     seen = set()
     try:
@@ -748,17 +752,14 @@ def opened_history():
                 p = Gio.File.new_for_uri(uri).get_path()
                 if not p or p in seen:
                     continue
-                # get_visited() / get_modified() return time_t
                 ts = 0
-                try:
-                    ts = float(info.get_visited() or 0)
-                except Exception:
-                    pass
-                if not ts:
+                for getter in (info.get_visited, info.get_modified, info.get_added):
                     try:
-                        ts = float(info.get_modified() or 0)
+                        ts = float(getter() or 0)
                     except Exception:
-                        pass
+                        ts = 0
+                    if ts:
+                        break
                 if not ts:
                     try:
                         ts = os.path.getmtime(p)
@@ -770,16 +771,18 @@ def opened_history():
                 continue
     except Exception:
         pass
+    return items
 
-    if items:
-        return items
 
-    # Fallback: parse recently-used.xbel (namespace-safe)
-    xbel_paths = [
-        Path(GLib.get_user_data_dir()) / "recently-used.xbel",
-        Path.home() / ".local" / "share" / "recently-used.xbel",
-    ]
-    for xbel in xbel_paths:
+def _read_xbel():
+    """Files listed in recently-used.xbel (what GNOME Files and most Linux apps write): [(time, Path), ...]."""
+    items, seen = [], set()
+    candidates = []
+    for base in (os.environ.get("XDG_DATA_HOME"), os.path.join(str(Path.home()), ".local", "share")):
+        if base:
+            candidates.append(Path(base) / "recently-used.xbel")
+    candidates.append(Path.home() / ".recently-used.xbel")
+    for xbel in candidates:
         try:
             root = ET.parse(str(xbel)).getroot()
         except (OSError, ET.ParseError):
@@ -792,21 +795,26 @@ def opened_history():
             if not href.startswith("file:"):
                 continue
             try:
-                p = Gio.File.new_for_uri(href).get_path()
+                p = urllib.request.url2pathname(urllib.parse.urlsplit(href).path)
             except Exception:
-                p = urllib.parse.unquote(href[7:] if href.startswith("file://") else href)
+                continue
             if not p or p in seen:
                 continue
-            stamp = bm.get("visited") or bm.get("modified") or bm.get("added") or ""
             ts = 0
-            if stamp:
+            for attr in ("visited", "modified", "added"):
+                stamp = bm.get(attr) or ""
+                if not stamp:
+                    continue
                 try:
                     ts = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
                 except ValueError:
                     try:
-                        ts = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+                        ts = datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                            tzinfo=__import__("datetime").timezone.utc).timestamp()
                     except ValueError:
                         ts = 0
+                if ts:
+                    break
             if not ts:
                 try:
                     ts = os.path.getmtime(p)
@@ -844,6 +852,17 @@ def recent_activity(days=30, limit=300):
             if len(out) >= limit:
                 break
     return out
+
+
+def recent_rows():
+    """Rows for the Recent files list. One file that vanished or can't be read only drops that file."""
+    rows = []
+    for ts, p in recent_activity():
+        try:
+            rows.append(stat_row(str(p), ts))
+        except Exception:
+            continue
+    return rows
 
 
 def build_sessions(items, gap=45 * 60):
@@ -4008,7 +4027,7 @@ class FilePane(Gtk.Box):
     def load_base(self):
         loc, hidden = self.location, self.win.cfg["show_hidden"]
         if loc == "recent":
-            self._load("recent", lambda: [stat_row(str(p), ts) for ts, p in recent_activity()])
+            self._load("recent", recent_rows)
         elif loc == "notes":
             self._load("notes", lambda: [stat_row(p) for p in TAG_STORE.with_notes()])
         elif loc.startswith("tag:"):
@@ -4170,6 +4189,9 @@ class FilePane(Gtk.Box):
                 rows, err = producer(), None
             except OSError as ex:
                 rows, err = [], ex.strerror or str(ex)
+            except Exception as ex:
+                traceback.print_exc()
+                rows, err = [], f"{type(ex).__name__}: {ex}"
             GLib.idle_add(self.finish_load, gen, rows, err)
         threading.Thread(target=work, daemon=True).start()
 
@@ -4620,109 +4642,56 @@ class FilePane(Gtk.Box):
             self.go(parent)
 
     def start_inline_rename(self):
-        """Start in-place rename of the single selected item (list view preferred).
-        Returns True if the floating editor was shown, False to fall back to dialog."""
+        """Rename the single selected item in place, in the Name cell itself (list view).
+        Returns True if the editor started, False to fall back to the rename dialog.
+        (A separate pop-up window can't take typing on Linux, so the list's own cell editor is used.)"""
         paths = self.selected_paths()
-        if len(paths) != 1 or self.view_mode != "list":
+        if len(paths) != 1 or self.view_mode != "list" or self.mode == "search":
             return False
         path = paths[0]
-        sel = self.tree.get_selection()
-        model, rows = sel.get_selected_rows()
+        _model, rows = self.tree.get_selection().get_selected_rows()
         if not rows:
             return False
         treepath = rows[0]
-        # Make sure the row is visible
-        self.tree.scroll_to_cell(treepath, self.name_column, False, 0, 0)
-        # Get cell area in tree coordinates
-        area = self.tree.get_cell_area(treepath, self.name_column)
-        if area.width < 20:
-            return False
-        # Convert to widget coordinates (account for header + bin window)
-        ox, oy = self.tree.convert_bin_window_to_widget_coords(area.x, area.y)
-        # Build floating entry
-        if getattr(self, "_rename_entry", None):
-            self._rename_entry.destroy()
-        entry = Gtk.Entry()
-        entry.set_text(os.path.basename(path))
-        entry.set_size_request(max(area.width + 8, 120), max(area.height, 22))
-        entry.set_width_chars(0)
-        # Select stem (everything before last dot) for files
+        rend = self.name_renderer
         name = os.path.basename(path)
-        if os.path.isfile(path) and "." in name and not name.startswith("."):
-            stem_len = name.rfind(".")
-            entry.select_region(0, stem_len)
-        else:
-            entry.select_region(0, -1)
-        # Overlay on the scrolled window / tree parent
-        parent = self.tree.get_parent()
-        if parent is None:
-            return False
-        # Use an overlay if available, otherwise absolute positioning via fixed
-        if not hasattr(self, "_rename_fixed"):
-            # Put a Gtk.Fixed on top of the list scrolled window for the entry
-            self._rename_fixed = Gtk.Fixed()
-            self._rename_fixed.set_has_window(False)
-            # Re-parent carefully: many layouts already have the scrolled window
-            # Simplest reliable approach for GTK3: put entry in a popup window
-            pass
-        # Use a short-lived undecorated window positioned over the cell
-        win = Gtk.Window(type=Gtk.WindowType.POPUP)
-        win.set_transient_for(self.get_toplevel())
-        win.set_type_hint(Gdk.WindowTypeHint.POPUP_MENU)
-        win.set_decorated(False)
-        win.set_resizable(False)
-        win.add(entry)
-        win.show_all()
-        # Position the popup exactly over the name cell
-        try:
-            gdk_win = self.tree.get_bin_window() or self.tree.get_window()
-            if gdk_win:
-                ox2, oy2 = gdk_win.get_root_coords(area.x, area.y)
-                win.move(int(ox2), int(oy2))
-            else:
-                win.move(int(ox), int(oy))
-        except Exception:
-            try:
-                wx, wy = self.tree.get_window().get_origin()[1:3]
-                win.move(int(wx + ox), int(wy + oy))
-            except Exception:
-                pass
-        entry.grab_focus()
-        self._rename_entry = entry
-        self._rename_popup = win
         self._rename_path = path
+        self._rename_done = False
 
-        def finish(ok):
-            if not getattr(self, "_rename_popup", None):
-                return
-            new_name = entry.get_text().strip()
-            popup = self._rename_popup
-            self._rename_popup = None
-            self._rename_entry = None
-            try:
-                popup.destroy()
-            except Exception:
-                pass
-            if not ok or not new_name or new_name == os.path.basename(self._rename_path):
-                return
-            self._apply_rename(self._rename_path, new_name)
+        def stop():
+            rend.set_property("editable", False)          # a plain click on a selected row must not start editing
+            for key in ("_rn_started", "_rn_edited", "_rn_cancel"):
+                hid = getattr(self, key, None)
+                if hid:
+                    try:
+                        rend.disconnect(hid)
+                    except Exception:
+                        pass
+                setattr(self, key, None)
 
-        def on_key(e, event):
-            if event.keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-                finish(True)
-                return True
-            if event.keyval == Gdk.KEY_Escape:
-                finish(False)
-                return True
-            return False
+        def on_started(_r, editable, _p):
+            if os.path.isfile(path) and "." in name and not name.startswith("."):
+                editable.select_region(0, name.rfind("."))      # change the name, keep the type
+            else:
+                editable.select_region(0, -1)
 
-        def on_focus_out(*_):
-            # Small delay so a click on OK-style focus doesn't cancel immediately
-            GLib.timeout_add(80, lambda: (finish(True) or False))
-            return False
+        def on_edited(_r, _p, new_text):
+            stop()
+            new_text = (new_text or "").strip()
+            if new_text and new_text != name:
+                self._apply_rename(path, new_text)
 
-        entry.connect("key-press-event", on_key)
-        entry.connect("focus-out-event", on_focus_out)
+        def on_cancel(*_):
+            stop()
+
+        stop()
+        self._rn_started = rend.connect("editing-started", on_started)
+        self._rn_edited = rend.connect("edited", on_edited)
+        self._rn_cancel = rend.connect("editing-canceled", on_cancel)
+        rend.set_property("editable", True)
+        self.tree.grab_focus()
+        self.tree.scroll_to_cell(treepath, self.name_column, False, 0, 0)
+        self.tree.set_cursor(treepath, self.name_column, True)
         return True
 
     def _apply_rename(self, old_path, new_name):
