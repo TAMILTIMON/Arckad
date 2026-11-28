@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.66.1"
+APP_VERSION = "3.67.0"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3708,8 +3708,23 @@ class FilePane(Gtk.Box):
                     self.icons.set_cursor(hit, None, False)
         return False
 
+    def _dnd_layer_off(self):
+        """GTK3 refuses to deliver drags to anything under a full-window Gtk.Overlay child (the animation layer),
+        so it is hidden while a drag is running and shown again afterwards."""
+        layer = getattr(self.win, "anim_layer", None)
+        if layer is not None and layer.get_visible():
+            self._dnd_layer_hidden = layer
+            layer.hide()
+
+    def _dnd_layer_on(self):
+        layer = getattr(self, "_dnd_layer_hidden", None)
+        self._dnd_layer_hidden = None
+        if layer is not None:
+            layer.show()
+
     def _on_drag_end(self, _view, _context):
         _dnd_log("drag-end")
+        self._dnd_layer_on()
         self._drag_press = None
         self._keep_sel = None
         self._dnd_motion_seen = False
@@ -3719,6 +3734,7 @@ class FilePane(Gtk.Box):
 
     def _on_drag_failed(self, _view, _context, result):
         _dnd_log(f"drag-failed result={result}")
+        self._dnd_layer_on()
         self._drag_press = None
         self._keep_sel = None
         self._dnd_motion_seen = False
@@ -3798,6 +3814,7 @@ class FilePane(Gtk.Box):
     def on_drag_begin(self, view, context):
         """A small picture while dragging: the item's icon, plus a count badge for several (not the whole row)."""
         self._keep_sel = None
+        self._dnd_layer_off()
         _dnd_log(f"drag-begin view={'tree' if view is self.tree else 'icons'} paths={self.selected_paths()}")
         paths = self.selected_paths()
         n = len(paths)
