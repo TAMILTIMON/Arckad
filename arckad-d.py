@@ -229,7 +229,7 @@ except Exception:                       # also broken installs, not just missing
 
 APP_NAME = "Arckad-D"
 APP_SLUG = "arckad-d"
-APP_VERSION = "3.66.2"
+APP_VERSION = "3.66.4"
 APP_ID = "io.github.arckadd"
 UPDATE_REPO = "TAMILTIMON/Arckad"                  # GitHub repository whose Releases hold the installers
 IS_WIN = sys.platform == "win32"
@@ -3369,6 +3369,11 @@ def root_label(p):
     return p.name or (p.drive or str(p) if IS_WIN else "Computer")
 
 
+def _dnd_log(msg):
+    if os.environ.get("ARCKAD_DEBUG_DND") or "--debug-dnd" in sys.argv:
+        print(f"[DND] {msg}", file=sys.stderr, flush=True)
+
+
 def _drop_action(context):
     """Choose MOVE for internal drags (COPY with Ctrl) and COPY for external drags (MOVE with Shift)."""
     internal = Gtk.drag_get_source_widget(context) is not None
@@ -3656,9 +3661,9 @@ class FilePane(Gtk.Box):
         # Source: GTK starts the drag when the user drags a selected row/icon.
         # Dest: accept drops from Arckad and other apps.
         self.tree.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.tree.enable_model_drag_dest(targets, actions)
+        self.tree.drag_dest_set(0, targets, actions)
         self.icons.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, targets, actions)
-        self.icons.enable_model_drag_dest(targets, actions)
+        self.icons.drag_dest_set(0, targets, actions)
         for view in (self.tree, self.icons):
             view.add_events(Gdk.EventMask.BUTTON1_MOTION_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK)
             view.connect("motion-notify-event", self._on_drag_motion, targets, actions)
@@ -3695,7 +3700,8 @@ class FilePane(Gtk.Box):
             self._drop_highlight = False
             self.queue_draw()
 
-    def _on_drag_failed(self, _view, _context, _result):
+    def _on_drag_failed(self, _view, _context, result):
+        _dnd_log(f"drag-failed result={result}")
         self._drag_press = None
         return False
 
@@ -3716,6 +3722,7 @@ class FilePane(Gtk.Box):
         self._drag_press = None
         if not self.selected_paths():
             return False
+        _dnd_log(f"manual drag_begin on {'tree' if view is self.tree else 'icons'} paths={self.selected_paths()}")
         tl = Gtk.TargetList.new(targets)
         tl.add_uri_targets(0)
         tl.add_text_targets(1)
@@ -3734,7 +3741,7 @@ class FilePane(Gtk.Box):
             path = hit[0] if hit else None
         else:
             hit = self.icons.get_dest_item_at_pos(int(x), int(y))
-            path = hit[0] if (hit and hit[1] == Gtk.IconViewDropPosition.DROP_INTO) else None
+            path = hit[0] if hit else None
         if path is not None and self.sorted[path][C_ISDIR]:
             return path
         return None
@@ -3795,6 +3802,7 @@ class FilePane(Gtk.Box):
     def on_drag_get(self, view, context, selection, info, time_):
         view.stop_emission_by_name("drag-data-get")
         paths = self.selected_paths()
+        _dnd_log(f"drag-data-get target={selection.get_target().name()} info={info} paths={paths}")
         if not paths:
             return
         if info == 0 or selection.get_target().name() == "text/uri-list":
@@ -3816,10 +3824,12 @@ class FilePane(Gtk.Box):
     def on_drag_drop(self, view, context, x, y, time_):
         # Must request the data ourselves; otherwise the drop is rejected and the icon snaps back
         view.stop_emission_by_name("drag-drop")
-        if not self.drop_target(view, x, y):
+        dest = self.drop_target(view, x, y)
+        target = view.drag_dest_find_target(context, None)
+        _dnd_log(f"drag-drop view={'tree' if view is self.tree else 'icons'} xy=({x},{y}) dest={dest} target={target.name() if target else None}")
+        if not dest:
             Gtk.drag_finish(context, False, False, time_)
             return True
-        target = view.drag_dest_find_target(context, None)
         if target is None or target.name() == "NONE":
             target = Gdk.Atom.intern("text/uri-list", False)
         view.drag_get_data(context, target, time_)
@@ -3830,11 +3840,13 @@ class FilePane(Gtk.Box):
         dest = self.drop_target(view, x, y)
         self.on_drag_leave(view, context, time_)
         paths = _drop_paths(selection)
+        internal, ctrl, shift = _drop_flags(context)
+        _dnd_log(f"drag-data-received dest={dest} paths={paths} internal={internal} ctrl={ctrl} shift={shift} sel_action={context.get_selected_action()}")
         if not paths:
             Gtk.drag_finish(context, False, False, time_)
             return
-        internal, ctrl, shift = _drop_flags(context)
         ok = self.win.handle_drop(paths, dest, internal, ctrl, shift)
+        _dnd_log(f"handle_drop ok={ok}")
         Gtk.drag_finish(context, bool(ok), False, time_)
 
     def apply_icon_style(self):
